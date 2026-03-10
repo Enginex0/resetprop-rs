@@ -106,8 +106,11 @@ mod tests {
         let ok = area.hexpatch_delete("ro.lineage.version").unwrap();
         assert!(ok);
 
-        // original name should be gone
         assert!(area.get("ro.lineage.version").is_none());
+
+        let mut found = None;
+        area.foreach(|_, v| found = Some(v.to_string()));
+        assert_eq!(found.unwrap(), "0");
     }
 
     #[test]
@@ -228,5 +231,294 @@ mod tests {
         std::fs::write(&path, b"not a property area").unwrap();
 
         assert!(PropArea::open(&path).is_err());
+    }
+
+    #[test]
+    fn hexpatch_name_consistency() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.custom.feature", "enabled").unwrap();
+        area.hexpatch_delete("ro.custom.feature").unwrap();
+
+        // foreach should find exactly one renamed prop
+        let mut props = Vec::new();
+        area.foreach(|n, v| props.push((n.to_string(), v.to_string())));
+        assert_eq!(props.len(), 1);
+
+        let (mangled_name, _) = &props[0];
+        assert_ne!(mangled_name, "ro.custom.feature");
+
+        // trie lookup for the mangled name should resolve (trie and prop_info agree)
+        let val = area.get(mangled_name);
+        assert!(val.is_some(), "trie lookup for mangled name '{}' failed", mangled_name);
+    }
+
+    #[test]
+    fn hexpatch_plausible_value() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.test.stealth", "secret").unwrap();
+        area.hexpatch_delete("ro.test.stealth").unwrap();
+
+        let mut found_value = None;
+        area.foreach(|_, v| found_value = Some(v.to_string()));
+
+        assert_eq!(found_value.unwrap(), "0");
+    }
+
+    #[test]
+    fn harvest_pool_picks_from_area() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("vendor.thermal.monitor", "1").unwrap();
+        area.set("vendor.display.config", "0").unwrap();
+
+        let pool = crate::harvest::SegmentPool::from_area(&area);
+        let used = std::collections::HashSet::new();
+
+        let pick = pool.pick(7, &used);
+        assert!(pick.is_some());
+        let word = pick.unwrap();
+        assert_eq!(word.len(), 7);
+        // should be one of the 7-char segments from our area: "thermal", "display", "monitor", "config" (6 != 7)
+        let valid = [b"thermal".to_vec(), b"display".to_vec(), b"monitor".to_vec()];
+        assert!(valid.contains(&word), "unexpected pick: {:?}", String::from_utf8_lossy(&word));
+    }
+
+    #[test]
+    fn compound_exact_length() {
+        let used = std::collections::HashSet::new();
+        for target_len in [1, 2, 3, 5, 10, 13, 15, 20, 25, 30, 50] {
+            let result = crate::harvest::compound_generate(target_len, &used);
+            assert_eq!(
+                result.len(),
+                target_len,
+                "compound_generate({}) produced {} bytes: {:?}",
+                target_len,
+                result.len(),
+                String::from_utf8_lossy(&result),
+            );
+        }
+    }
+
+    #[test]
+    fn hexpatch_sequential_multiple_props() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.build.type", "user").unwrap();
+        area.set("ro.lineage.version", "18.1").unwrap();
+        area.set("ro.custom.romname", "test").unwrap();
+        area.set("ro.debuggable", "1").unwrap();
+
+        let before_count = {
+            let mut c = 0;
+            area.foreach(|_, _| c += 1);
+            c
+        };
+
+        area.hexpatch_delete("ro.lineage.version").unwrap();
+        area.hexpatch_delete("ro.custom.romname").unwrap();
+        area.hexpatch_delete("ro.debuggable").unwrap();
+
+        assert_eq!(area.get("ro.build.type").unwrap(), "user");
+        assert!(area.get("ro.lineage.version").is_none());
+        assert!(area.get("ro.custom.romname").is_none());
+        assert!(area.get("ro.debuggable").is_none());
+
+        let after_count = {
+            let mut c = 0;
+            area.foreach(|_, _| c += 1);
+            c
+        };
+        assert_eq!(before_count, after_count, "prop count changed after hexpatch");
+    }
+
+    #[test]
+    fn hexpatch_lone_prop_in_area() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.single.prop", "alone").unwrap();
+        let ok = area.hexpatch_delete("ro.single.prop").unwrap();
+        assert!(ok);
+        assert!(area.get("ro.single.prop").is_none());
+
+        let mut props = Vec::new();
+        area.foreach(|n, v| props.push((n.to_string(), v.to_string())));
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].1, "0");
+
+        // trie must still resolve the mangled name
+        assert!(area.get(&props[0].0).is_some());
+    }
+
+    #[test]
+    fn hexpatch_deep_path() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("a.bb.ccc.dddd.eeeee", "deep").unwrap();
+        area.hexpatch_delete("a.bb.ccc.dddd.eeeee").unwrap();
+
+        assert!(area.get("a.bb.ccc.dddd.eeeee").is_none());
+
+        let mut props = Vec::new();
+        area.foreach(|n, v| props.push((n.to_string(), v.to_string())));
+        assert_eq!(props.len(), 1);
+
+        let segments: Vec<&str> = props[0].0.split('.').collect();
+        assert_eq!(segments.len(), 5);
+        assert_eq!(segments[0].len(), 1);
+        assert_eq!(segments[1].len(), 2);
+        assert_eq!(segments[2].len(), 3);
+        assert_eq!(segments[3].len(), 4);
+        assert_eq!(segments[4].len(), 5);
+
+        assert!(area.get(&props[0].0).is_some());
+    }
+
+    #[test]
+    fn hexpatch_very_long_segment() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.customromverylongsegment.x", "v").unwrap();
+        area.hexpatch_delete("ro.customromverylongsegment.x").unwrap();
+
+        let mut props = Vec::new();
+        area.foreach(|n, _| props.push(n.to_string()));
+        assert_eq!(props.len(), 1);
+
+        let segments: Vec<&str> = props[0].split('.').collect();
+        // "customromverylongsegment" is 24 chars — tests compound generator territory
+        assert_eq!(segments[1].len(), 24);
+        assert!(area.get(&props[0]).is_some());
+    }
+
+    #[test]
+    fn hexpatch_same_prop_twice() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.test.prop", "val").unwrap();
+        assert!(area.hexpatch_delete("ro.test.prop").unwrap());
+        assert!(!area.hexpatch_delete("ro.test.prop").unwrap());
+    }
+
+    #[test]
+    fn hexpatch_duplicate_length_segments() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        // all leaf segments are 4 chars — tests collision avoidance within same path
+        area.set("ro.abcd.efgh.ijkl", "val").unwrap();
+        area.hexpatch_delete("ro.abcd.efgh.ijkl").unwrap();
+
+        let mut props = Vec::new();
+        area.foreach(|n, _| props.push(n.to_string()));
+        assert_eq!(props.len(), 1);
+
+        let segments: Vec<&str> = props[0].split('.').collect();
+        // all non-shared 4-char segments must be different from each other
+        let mut seen = std::collections::HashSet::new();
+        for seg in &segments[1..] {
+            assert_eq!(seg.len(), 4);
+            assert!(seen.insert(*seg), "duplicate segment '{}' in mangled name", seg);
+        }
+
+        assert!(area.get(&props[0]).is_some());
+    }
+
+    #[test]
+    fn hexpatch_serial_preserved() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.serial.test", "original").unwrap();
+
+        // read raw serial before hexpatch via a get (serial encodes length in top byte)
+        let (pi_off, _) = crate::trie::find(&area, "ro.serial.test").unwrap();
+        let serial_before = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        // counter bits (1-15, 17-23) should be 0 for a freshly created prop
+        let counter_before = serial_before & 0x00FE_FFFE;
+        assert_eq!(counter_before, 0, "counter non-zero before hexpatch");
+
+        area.hexpatch_delete("ro.serial.test").unwrap();
+
+        // find the prop by its new name
+        let mut mangled = String::new();
+        area.foreach(|n, _| mangled = n.to_string());
+
+        let (pi_off_after, _) = crate::trie::find(&area, &mangled).unwrap();
+        assert_eq!(pi_off, pi_off_after, "prop_info moved after hexpatch");
+
+        let serial_after = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let counter_after = serial_after & 0x00FE_FFFE;
+        assert_eq!(counter_after, 0, "counter bumped by stealth_write_value");
+
+        let length_byte = (serial_after >> 24) & 0xFF;
+        assert_eq!(length_byte, 1, "length byte should be 1 for value '0'");
+
+        let dirty = serial_after & 1;
+        assert_eq!(dirty, 0, "dirty bit set after stealth_write_value");
+
+        let long_flag = serial_after & (1 << 16);
+        assert_eq!(long_flag, 0, "kLongFlag set after stealth_write_value");
+    }
+
+    #[test]
+    fn hexpatch_many_siblings_bst_integrity() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        let siblings = [
+            "ro.build.type", "ro.build.tags", "ro.build.date",
+            "ro.build.host", "ro.build.user", "ro.build.keys",
+            "ro.lineage.version", "ro.custom.rom",
+        ];
+        for &prop in &siblings {
+            area.set(prop, "test").unwrap();
+        }
+
+        area.hexpatch_delete("ro.lineage.version").unwrap();
+        area.hexpatch_delete("ro.custom.rom").unwrap();
+
+        // ALL ro.build.* siblings must still be accessible via trie lookup
+        for &prop in &siblings[..6] {
+            assert_eq!(
+                area.get(prop).unwrap(), "test",
+                "BST corrupted: {} not found after hexpatch", prop
+            );
+        }
+
+        let mut count = 0;
+        area.foreach(|_, _| count += 1);
+        assert_eq!(count, siblings.len());
+    }
+
+    #[test]
+    fn hexpatch_all_names_valid_ascii() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.test.stealth", "val").unwrap();
+        area.set("ro.vendor.camera", "1").unwrap();
+        area.hexpatch_delete("ro.test.stealth").unwrap();
+
+        area.foreach(|name, _| {
+            for b in name.bytes() {
+                assert!(
+                    b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-',
+                    "invalid byte 0x{:02x} in mangled name '{}'", b, name,
+                );
+            }
+            assert!(!name.starts_with('.'));
+            assert!(!name.ends_with('.'));
+            assert!(!name.contains(".."));
+        });
     }
 }
