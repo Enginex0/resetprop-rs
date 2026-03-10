@@ -51,7 +51,7 @@ impl<'a> TrieNode<'a> {
     }
 
     pub(crate) fn name_bytes(&self) -> &[u8] {
-        let len = self.namelen() as usize;
+        let len = (self.namelen() as usize).min(self.area.len().saturating_sub(self.offset + TRIE_NODE_FIXED));
         let start = self.offset + TRIE_NODE_FIXED;
         unsafe { std::slice::from_raw_parts(self.area.base().add(start), len) }
     }
