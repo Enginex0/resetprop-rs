@@ -111,11 +111,12 @@ impl PropArea {
 
         let mut chosen: Vec<Vec<u8>> = Vec::with_capacity(path.len());
 
-        for &node_off in &path {
+        let last_idx = path.len() - 1;
+        for (idx, &node_off) in path.iter().enumerate() {
             let node = trie::TrieNode::from_offset(self, node_off)?;
             let original = node.name_bytes().to_vec();
 
-            if self.is_shared_segment(&node) {
+            if self.is_shared_segment(&node, idx == last_idx) {
                 chosen.push(original);
                 continue;
             }
@@ -158,18 +159,20 @@ impl PropArea {
         Ok(true)
     }
 
-    fn is_shared_segment(&self, node: &trie::TrieNode<'_>) -> bool {
-        // a segment is shared if it has children (other props use this prefix)
+    fn is_shared_segment(&self, node: &trie::TrieNode<'_>, is_leaf: bool) -> bool {
+        // intermediate node with its own property (e.g. "ro.lineage" alongside "ro.lineage.version")
+        if !is_leaf && node.prop_offset().load(Ordering::Relaxed) != 0 {
+            return true;
+        }
+
         let children = node.children().load(Ordering::Acquire);
         if children == 0 {
             return false;
         }
 
-        // check if there are multiple children or BST branches
         if let Ok(child) = trie::TrieNode::from_offset(self, self.data_offset() + children as usize) {
             let left = child.left().load(Ordering::Relaxed);
             let right = child.right().load(Ordering::Relaxed);
-            // if the child node has siblings, this segment is definitely shared
             left != 0 || right != 0
         } else {
             false

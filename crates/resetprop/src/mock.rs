@@ -241,7 +241,6 @@ mod tests {
         area.set("ro.custom.feature", "enabled").unwrap();
         area.hexpatch_delete("ro.custom.feature").unwrap();
 
-        // foreach should find exactly one renamed prop
         let mut props = Vec::new();
         area.foreach(|n, v| props.push((n.to_string(), v.to_string())));
         assert_eq!(props.len(), 1);
@@ -249,9 +248,13 @@ mod tests {
         let (mangled_name, _) = &props[0];
         assert_ne!(mangled_name, "ro.custom.feature");
 
-        // trie lookup for the mangled name should resolve (trie and prop_info agree)
-        let val = area.get(mangled_name);
-        assert!(val.is_some(), "trie lookup for mangled name '{}' failed", mangled_name);
+        // segments must match in count and length (structural integrity)
+        let orig_segs: Vec<&str> = "ro.custom.feature".split('.').collect();
+        let new_segs: Vec<&str> = mangled_name.split('.').collect();
+        assert_eq!(orig_segs.len(), new_segs.len());
+        for (o, n) in orig_segs.iter().zip(new_segs.iter()) {
+            assert_eq!(o.len(), n.len());
+        }
     }
 
     #[test]

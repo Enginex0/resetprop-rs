@@ -34,7 +34,7 @@ impl<'a> TrieNode<'a> {
         self.area.read_u32(self.offset)
     }
 
-    fn prop_offset(&self) -> &AtomicU32 {
+    pub(crate) fn prop_offset(&self) -> &AtomicU32 {
         self.area.atomic_u32(self.offset + 4)
     }
 
