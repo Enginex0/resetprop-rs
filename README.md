@@ -163,6 +163,8 @@ Outputs stripped binaries to `out/`:
 
 The build uses `opt-level=s`, LTO, `panic=abort`, strip, and single codegen unit for minimal binary size.
 
+**No NDK?** Fork the repo and go to **Actions → Build → Run workflow** — GitHub builds both binaries for you. Download them from the workflow artifacts.
+
 ---
 
 ## 🧠 How It Works
