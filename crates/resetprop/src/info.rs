@@ -200,8 +200,8 @@ impl<'a> PropInfo<'a> {
             }
         }
 
-        // set length to 0, keep other flags, don't bump serial (stealth)
-        let new_serial = serial & 0x00FFFF00;
+        // zero length byte, preserve counter + flags (stealth: no serial bump)
+        let new_serial = serial & 0x00FFFFFE;
         self.serial_atomic().store(new_serial, Ordering::Release);
 
         Ok(())

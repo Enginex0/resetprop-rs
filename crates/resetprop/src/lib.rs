@@ -211,8 +211,9 @@ impl PropSystem {
             if path.file_name().map(|n| n == "property_info").unwrap_or(false) {
                 continue;
             }
-            match PropArea::open(&path) {
-                Ok(area) => areas.push((path, area)),
+            let area = PropArea::open(&path).or_else(|_| PropArea::open_ro(&path));
+            match area {
+                Ok(a) => areas.push((path, a)),
                 Err(_) => continue,
             }
         }
