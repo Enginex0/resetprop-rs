@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            artifact: resetprop-arm64-v8a
+          - target: armv7-linux-androideabi
+            artifact: resetprop-armeabi-v7a
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+
+      - name: Configure NDK toolchain
+        run: |
+          NDK=${{ steps.ndk.outputs.ndk-path }}
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$BIN/aarch64-linux-android26-clang" >> $GITHUB_ENV
+          echo "AR_aarch64_linux_android=$BIN/llvm-ar" >> $GITHUB_ENV
+          echo "CC_armv7_linux_androideabi=$BIN/armv7a-linux-androideabi26-clang" >> $GITHUB_ENV
+          echo "AR_armv7_linux_androideabi=$BIN/llvm-ar" >> $GITHUB_ENV
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/resetprop ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: false
