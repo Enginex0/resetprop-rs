@@ -14,6 +14,7 @@ pub struct PropArea {
 }
 
 unsafe impl Send for PropArea {}
+// single-writer only — matches AOSP's property_service threading model
 unsafe impl Sync for PropArea {}
 
 impl PropArea {

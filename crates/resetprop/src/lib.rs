@@ -3,6 +3,7 @@ mod area;
 mod trie;
 mod info;
 mod dict;
+mod harvest;
 #[cfg(test)]
 mod mock;
 
@@ -100,78 +101,78 @@ impl PropArea {
         };
 
         let (pi_offset, _) = trie::find(self, name)?;
-
+        let pool = harvest::SegmentPool::from_area(self);
         let mut used: HashSet<Vec<u8>> = HashSet::new();
 
-        // collect existing names at each level to avoid collisions
         for &node_off in &path {
             let node = trie::TrieNode::from_offset(self, node_off)?;
             used.insert(node.name_bytes().to_vec());
         }
 
-        // rename each trie segment in the path
-        for &node_off in &path {
+        let mut chosen: Vec<Vec<u8>> = Vec::with_capacity(path.len());
+
+        let last_idx = path.len() - 1;
+        for (idx, &node_off) in path.iter().enumerate() {
             let node = trie::TrieNode::from_offset(self, node_off)?;
             let original = node.name_bytes().to_vec();
 
-            // skip segments shared with other properties (like "ro", "persist")
-            // heuristic: if node has children beyond our target, it's shared
-            if self.is_shared_segment(&node) {
+            if self.is_shared_segment(&node, idx == last_idx) {
+                chosen.push(original);
                 continue;
             }
 
-            let replacement = dict::replacement(&original, &used);
+            let replacement = harvest::replacement(&original, &used, &pool);
             used.insert(replacement.clone());
 
-            let ptr = node.name_ptr();
             unsafe {
-                std::ptr::copy_nonoverlapping(replacement.as_ptr(), ptr, replacement.len());
+                std::ptr::copy_nonoverlapping(
+                    replacement.as_ptr(),
+                    node.name_ptr(),
+                    replacement.len(),
+                );
             }
+
+            chosen.push(replacement);
         }
 
-        // zero the prop_info value
-        let pi = info::PropInfo::at(self, pi_offset)?;
-        pi.zero_value()?;
-
-        // also mangle the full name stored in prop_info
+        // write mangled name to prop_info using the SAME segments chosen for the trie
         let name_start = pi_offset + 96;
         if let Some(ptr) = self.ptr_at(name_start) {
-            let name_bytes = name.as_bytes();
-            let mut mangled_used = HashSet::new();
+            let old_len = name.len();
             unsafe {
+                std::ptr::write_bytes(ptr, 0, old_len + 1);
                 let mut i = 0;
-                for segment in name.split('.') {
-                    if i > 0 {
-                        i += 1; // skip the dot (keep it)
+                for (idx, seg) in chosen.iter().enumerate() {
+                    if idx > 0 {
+                        *ptr.add(i) = b'.';
+                        i += 1;
                     }
-                    let seg_bytes = segment.as_bytes();
-                    let replacement = dict::replacement(seg_bytes, &mangled_used);
-                    mangled_used.insert(replacement.clone());
-                    std::ptr::copy_nonoverlapping(
-                        replacement.as_ptr(),
-                        ptr.add(i),
-                        replacement.len().min(name_bytes.len() - i),
-                    );
-                    i += seg_bytes.len();
+                    std::ptr::copy_nonoverlapping(seg.as_ptr(), ptr.add(i), seg.len());
+                    i += seg.len();
                 }
             }
         }
 
+        let pi = info::PropInfo::at(self, pi_offset)?;
+        pi.stealth_write_value()?;
+
         Ok(true)
     }
 
-    fn is_shared_segment(&self, node: &trie::TrieNode<'_>) -> bool {
-        // a segment is shared if it has children (other props use this prefix)
+    fn is_shared_segment(&self, node: &trie::TrieNode<'_>, is_leaf: bool) -> bool {
+        // intermediate node with its own property (e.g. "ro.lineage" alongside "ro.lineage.version")
+        if !is_leaf && node.prop_offset().load(Ordering::Relaxed) != 0 {
+            return true;
+        }
+
         let children = node.children().load(Ordering::Acquire);
         if children == 0 {
             return false;
         }
 
-        // check if there are multiple children or BST branches
         if let Ok(child) = trie::TrieNode::from_offset(self, self.data_offset() + children as usize) {
             let left = child.left().load(Ordering::Relaxed);
             let right = child.right().load(Ordering::Relaxed);
-            // if the child node has siblings, this segment is definitely shared
             left != 0 || right != 0
         } else {
             false

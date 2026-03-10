@@ -207,6 +207,41 @@ impl<'a> PropInfo<'a> {
         Ok(())
     }
 
+    pub(crate) fn stealth_write_value(&self) -> Result<()> {
+        if !self.area.writable() {
+            return Err(Error::PermissionDenied(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "area opened read-only",
+            )));
+        }
+
+        let serial = self.read_serial_stable();
+
+        if self.is_long(serial) {
+            let long_offset_pos = self.offset + 4 + LONG_PROP_ERROR_SIZE;
+            let rel_offset = self.area.read_u32(long_offset_pos) as usize;
+            let abs = self.offset + rel_offset;
+            if abs < self.area.len() {
+                unsafe {
+                    let ptr = self.area.base().add(abs);
+                    *ptr = 0;
+                }
+            }
+        }
+
+        unsafe {
+            let ptr = self.area.base().add(self.offset + 4);
+            std::ptr::write_bytes(ptr, 0, PROP_VALUE_MAX);
+            *ptr = b'0';
+        }
+
+        // length=1 in top byte, clear dirty (bit 0) + kLongFlag (bit 16), preserve counter
+        let new_serial = (1u32 << 24) | (serial & 0x00FE_FFFE);
+        self.serial_atomic().store(new_serial, Ordering::Release);
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn offset(&self) -> usize {
         self.offset
