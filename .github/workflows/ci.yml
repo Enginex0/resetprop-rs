@@ -46,10 +46,7 @@ jobs:
         run: |
           NDK=${{ steps.ndk.outputs.ndk-path }}
           BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "CC_aarch64_linux_android=$BIN/aarch64-linux-android26-clang" >> $GITHUB_ENV
-          echo "AR_aarch64_linux_android=$BIN/llvm-ar" >> $GITHUB_ENV
-          echo "CC_armv7_linux_androideabi=$BIN/armv7a-linux-androideabi26-clang" >> $GITHUB_ENV
-          echo "AR_armv7_linux_androideabi=$BIN/llvm-ar" >> $GITHUB_ENV
+          echo "$BIN" >> $GITHUB_PATH
 
       - name: Build ${{ matrix.target }}
         run: cargo build --release --target ${{ matrix.target }}
