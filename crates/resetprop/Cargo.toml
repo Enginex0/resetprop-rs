@@ -1,0 +1,9 @@
+[package]
+name = "resetprop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure Rust Android property area manipulation — get, set, delete, hexpatch-delete"
+
+[dependencies]
+libc = "0.2"
