@@ -3,7 +3,7 @@
   <p align="center"><b>Pure Rust Android Property Manipulation</b></p>
   <p align="center">Get. Set. Delete. Hexpatch. No Magisk required.</p>
   <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.1.0-blue?style=for-the-badge" alt="v0.1.0">
+    <img src="https://img.shields.io/badge/version-v0.2.0-blue?style=for-the-badge" alt="v0.2.0">
     <img src="https://img.shields.io/badge/Android-10%2B-green?style=for-the-badge&logo=android" alt="Android 10+">
     <img src="https://img.shields.io/badge/Rust-stable-orange?style=for-the-badge&logo=rust" alt="Rust">
     <img src="https://img.shields.io/badge/Telegram-community-blue?style=for-the-badge&logo=telegram" alt="Telegram">
@@ -39,7 +39,7 @@ It also introduces `--hexpatch-delete` — a stealth operation that no existing 
 
 ⚡ **Tiny Footprint** — ~320KB ARM64, ~240KB ARMv7. Hand-rolled CLI parser, `panic=abort`, LTO, single codegen unit. Only dependency: `libc`.
 
-🧪 **Tested Off-Device** — 16 unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, trie integrity, boundary conditions.
+🧪 **Tested Off-Device** — 29 unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, trie integrity, serial preservation, name consistency, boundary conditions.
 
 ---
 
@@ -65,11 +65,14 @@ It also introduces `--hexpatch-delete` — a stealth operation that no existing 
 - [x] **Length-first comparison** — matches AOSP's `cmp_prop_name` exactly
 
 **Stealth**
-- [x] **Dictionary replacement** — 50+ realistic Android segments (thermal, display, sensor, codec, etc.)
+- [x] **Runtime harvest** — replacement segments drawn from the device's own property vocabulary (unfingerprintable)
+- [x] **Randomized selection** — OS-seeded entropy picks different names each run
+- [x] **3-tier fallback** — harvest pool → static dictionary (~95 words) → dot-split compound generation
+- [x] **Plausible value** — mangled properties show value `0` instead of empty string
+- [x] **Name consistency** — trie segments and prop_info name written from same source (no cross-validation mismatch)
 - [x] **Length-bucketed** — replacement is always exact same byte length as original
-- [x] **Collision avoidance** — checks existing property names before committing rename
-- [x] **Shared segment detection** — skips renaming prefixes used by other properties (ro, persist, etc.)
-- [x] **No serial bump** — zero_value preserves counter bits, avoiding NativeTest detection
+- [x] **Shared segment detection** — skips renaming prefixes used by other properties
+- [x] **No serial bump** — preserves counter bits, avoiding NativeTest detection
 
 ---
 
@@ -197,16 +200,16 @@ Standard delete detaches the trie node — but apps enumerating properties can d
 
 ```
 Before: ro.lineage.version = "18.1"
-After:  ro.thermal.surface = ""
+After:  ro.codec.charger = "0"
 ```
 
-1. Walk the trie path, collecting each segment's node offset
-2. For each non-shared segment, pick a same-length word from the dictionary
-3. Overwrite the name bytes in-place (pointer copy, no allocation)
-4. Zero the prop_info value bytes
-5. **Do not bump the serial counter** — avoids NativeTest serial-monitoring detection
-
-The dictionary contains 50+ realistic Android property segments grouped by byte length (3-9 chars): `sys`, `wifi`, `audio`, `sensor`, `thermal`, `graphics`, `telephony`, etc.
+1. Harvest all property segments from the device into a length-bucketed pool
+2. Walk the trie path, collecting each segment's node offset
+3. For each non-shared segment, pick a same-length replacement (harvest → dict → dot-split compound)
+4. Overwrite name bytes in-place, randomized selection each run
+5. Write mangled name to prop_info from the same chosen segments (single source of truth)
+6. Set value to `0` with correct serial encoding — indistinguishable from a boot-time property
+7. **Do not bump the serial counter** — avoids NativeTest serial-monitoring detection
 
 ---
 
@@ -235,8 +238,13 @@ The dictionary contains 50+ realistic Android property segments grouped by byte 
 
 - **[hiking90/rsproperties](https://github.com/nicetynio/rsproperties)** — Rust property area parser that proved the approach viable (Apache-2.0)
 - **[topjohnwu/Magisk](https://github.com/topjohnwu/Magisk)** — original `resetprop` and the forked bionic approach
-- **[silvzr/sensitive-props-crontabs](https://github.com/nicetynio/sensitive-props-crontabs)** — shell-based hexpatch approach that inspired `--hexpatch-delete`
+- **[Pixel-Props/sensitive-props](https://github.com/Pixel-Props/sensitive-props?tab=readme-ov-file)** — property spoofing reference that informed the target property list
 - **[AOSP bionic](https://android.googlesource.com/platform/bionic/)** — canonical property area format specification
+- **[frknkrc44](https://github.com/frknkrc44)** — aspiration, proposed building this project
+
+### Contributors
+
+- **[fatalcoder524](https://github.com/fatalcoder524)** — stealth strategy design and testing
 
 ---
 
