@@ -1,92 +1,165 @@
-use anyhow::{bail, Context, Result};
-use clap::Parser;
+use std::path::Path;
+use std::process::ExitCode;
+
 use resetprop::PropSystem;
 
-#[derive(Parser)]
-#[command(name = "resetprop", about = "Android system property manipulation tool")]
-struct Cli {
-    /// Bypass property_service, write directly to mmap
-    #[arg(short = 'n')]
-    skip_svc: bool,
-
-    /// Verbose output
-    #[arg(short = 'v')]
-    verbose: bool,
-
-    /// Delete property
-    #[arg(short = 'd', long = "delete", value_name = "NAME")]
-    delete: Option<String>,
-
-    /// Hexpatch-delete property (stealth name destruction)
-    #[arg(long = "hexpatch-delete", value_name = "NAME")]
-    hexpatch_delete: Option<String>,
-
-    /// Property directory (default: /dev/__properties__)
-    #[arg(long = "dir", value_name = "PATH")]
-    dir: Option<String>,
-
-    /// Positional args: NAME [VALUE]
-    #[arg(trailing_var_arg = true)]
-    args: Vec<String>,
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("resetprop: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut verbose = false;
+    let mut dir: Option<String> = None;
+    let mut delete: Option<String> = None;
+    let mut hexpatch: Option<String> = None;
+    let mut file: Option<String> = None;
+    let mut positional = Vec::new();
 
-    let sys = match &cli.dir {
-        Some(d) => PropSystem::open_dir(std::path::Path::new(d)),
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-v" => verbose = true,
+            "-n" => {} // accepted for compat, all writes are direct mmap
+            "-d" | "--delete" => {
+                i += 1;
+                delete = Some(arg_val(&args, i, "-d")?);
+            }
+            "--hexpatch-delete" => {
+                i += 1;
+                hexpatch = Some(arg_val(&args, i, "--hexpatch-delete")?);
+            }
+            "--dir" => {
+                i += 1;
+                dir = Some(arg_val(&args, i, "--dir")?);
+            }
+            "-f" => {
+                i += 1;
+                file = Some(arg_val(&args, i, "-f")?);
+            }
+            "-h" | "--help" => {
+                print_usage();
+                return Ok(());
+            }
+            s if s.starts_with('-') => return Err(format!("unknown flag: {s}")),
+            _ => positional.push(args[i].clone()),
+        }
+        i += 1;
+    }
+
+    let sys = match &dir {
+        Some(d) => PropSystem::open_dir(Path::new(d)),
         None => PropSystem::open(),
     }
-    .context("failed to open property system")?;
+    .map_err(|e| format!("failed to open property system: {e}"))?;
 
-    if let Some(name) = &cli.hexpatch_delete {
-        let ok = sys
-            .hexpatch_delete(name)
-            .context("hexpatch-delete failed")?;
-        if !ok {
-            bail!("property not found: {name}");
-        }
-        if cli.verbose {
-            eprintln!("hexpatch: {name}");
-        }
-        return Ok(());
+    if let Some(name) = hexpatch {
+        return bool_op(sys.hexpatch_delete(&name), &name, "hexpatch", verbose);
     }
 
-    if let Some(name) = &cli.delete {
-        let ok = sys.delete(name).context("delete failed")?;
-        if !ok {
-            bail!("property not found: {name}");
-        }
-        if cli.verbose {
-            eprintln!("deleted: {name}");
-        }
-        return Ok(());
+    if let Some(name) = delete {
+        return bool_op(sys.delete(&name), &name, "deleted", verbose);
     }
 
-    match cli.args.len() {
+    if let Some(path) = file {
+        return load_file(&sys, &path, verbose);
+    }
+
+    match positional.len() {
         0 => {
             for (name, value) in sys.list() {
                 println!("[{name}]: [{value}]");
             }
         }
-        1 => {
-            let name = &cli.args[0];
-            match sys.get(name) {
-                Some(val) => println!("{val}"),
-                None => bail!("property not found: {name}"),
-            }
-        }
+        1 => match sys.get(&positional[0]) {
+            Some(val) => println!("{val}"),
+            None => return Err(format!("property not found: {}", positional[0])),
+        },
         2 => {
-            let name = &cli.args[0];
-            let value = &cli.args[1];
-            sys.set(name, value)
-                .context(format!("failed to set {name}"))?;
-            if cli.verbose {
-                eprintln!("set: [{name}]=[{value}]");
+            sys.set(&positional[0], &positional[1])
+                .map_err(|e| format!("failed to set {}: {e}", positional[0]))?;
+            if verbose {
+                eprintln!("set: [{}]=[{}]", positional[0], positional[1]);
             }
         }
-        _ => bail!("too many arguments"),
+        _ => return Err("too many arguments".into()),
     }
 
     Ok(())
+}
+
+fn arg_val(args: &[String], i: usize, flag: &str) -> Result<String, String> {
+    args.get(i)
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn bool_op(
+    result: resetprop::Result<bool>,
+    name: &str,
+    label: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    match result {
+        Ok(true) => {
+            if verbose {
+                eprintln!("{label}: {name}");
+            }
+            Ok(())
+        }
+        Ok(false) => Err(format!("property not found: {name}")),
+        Err(e) => Err(format!("{label} failed: {e}")),
+    }
+}
+
+fn load_file(sys: &PropSystem, path: &str, verbose: bool) -> Result<(), String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+
+    let mut count = 0u32;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("bad line (no '='): {line}"))?;
+        let name = name.trim();
+        let value = value.trim();
+        sys.set(name, value)
+            .map_err(|e| format!("failed to set {name}: {e}"))?;
+        count += 1;
+        if verbose {
+            eprintln!("set: [{name}]=[{value}]");
+        }
+    }
+
+    eprintln!("{count} properties loaded from {path}");
+    Ok(())
+}
+
+fn print_usage() {
+    eprintln!(
+        "resetprop — Android property manipulation tool
+
+Usage:
+  resetprop                          List all properties
+  resetprop NAME                     Get property value
+  resetprop [-n] NAME VALUE          Set property (direct mmap)
+  resetprop -d NAME                  Delete property
+  resetprop --hexpatch-delete NAME   Stealth delete (name destruction)
+  resetprop -f FILE                  Load properties from file (name=value)
+  resetprop --dir PATH               Use custom property directory
+
+Options:
+  -v          Verbose output
+  -h, --help  Show this help"
+    );
 }

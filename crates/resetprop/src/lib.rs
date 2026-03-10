@@ -3,6 +3,8 @@ mod area;
 mod trie;
 mod info;
 mod dict;
+#[cfg(test)]
+mod mock;
 
 pub use error::{Error, Result};
 pub use area::PropArea;

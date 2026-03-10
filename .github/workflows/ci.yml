@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Host check (library crate only)
+        run: cargo check -p resetprop
+
+      - name: Tests
+        run: cargo test -p resetprop
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [aarch64-linux-android, armv7-linux-androideabi]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+
+      - name: Configure NDK toolchain
+        run: |
+          NDK=${{ steps.ndk.outputs.ndk-path }}
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$BIN/aarch64-linux-android26-clang" >> $GITHUB_ENV
+          echo "AR_aarch64_linux_android=$BIN/llvm-ar" >> $GITHUB_ENV
+          echo "CC_armv7_linux_androideabi=$BIN/armv7a-linux-androideabi26-clang" >> $GITHUB_ENV
+          echo "AR_armv7_linux_androideabi=$BIN/llvm-ar" >> $GITHUB_ENV
+
+      - name: Build ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy (library)
+        run: cargo clippy -p resetprop -- -D warnings
