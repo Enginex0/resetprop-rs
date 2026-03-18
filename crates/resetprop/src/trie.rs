@@ -108,8 +108,14 @@ pub(crate) fn find(area: &PropArea, name: &str) -> Result<(usize, usize)> {
 }
 
 fn bst_find<'a>(area: &'a PropArea, offset: usize, name: &[u8]) -> Result<TrieNode<'a>> {
+    let max_steps = area.len() / TRIE_NODE_FIXED;
+    let mut steps = 0usize;
     let mut node = TrieNode::from_offset(area, offset)?;
     loop {
+        if steps >= max_steps {
+            return Err(Error::AreaCorrupt("BST cycle detected".into()));
+        }
+        steps += 1;
         match cmp_prop_name(name, node.name_bytes()) {
             Ordering::Equal => return Ok(node),
             Ordering::Less => {
@@ -135,33 +141,39 @@ pub(crate) fn foreach<F>(area: &PropArea, mut cb: F)
 where
     F: FnMut(usize),
 {
-    walk_node(area, &TrieNode::root(area), &mut cb);
-}
+    use std::collections::HashSet;
 
-fn walk_node<F: FnMut(usize)>(area: &PropArea, node: &TrieNode<'_>, cb: &mut F) {
-    let prop_off = node.prop_offset().load(AO::Acquire);
-    if prop_off != 0 {
-        cb(area.data_offset() + prop_off as usize);
-    }
+    let mut stack = vec![TrieNode::root(area).offset()];
+    let mut visited = HashSet::new();
 
-    let left = node.left().load(AO::Acquire);
-    if left != 0 {
-        if let Ok(n) = TrieNode::from_offset(area, area.data_offset() + left as usize) {
-            walk_node(area, &n, cb);
+    while let Some(off) = stack.pop() {
+        if !visited.insert(off) {
+            continue;
         }
-    }
 
-    let right = node.right().load(AO::Acquire);
-    if right != 0 {
-        if let Ok(n) = TrieNode::from_offset(area, area.data_offset() + right as usize) {
-            walk_node(area, &n, cb);
+        let node = match TrieNode::from_offset(area, off) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        let prop_off = node.prop_offset().load(AO::Acquire);
+        if prop_off != 0 {
+            cb(area.data_offset() + prop_off as usize);
         }
-    }
 
-    let children = node.children().load(AO::Acquire);
-    if children != 0 {
-        if let Ok(n) = TrieNode::from_offset(area, area.data_offset() + children as usize) {
-            walk_node(area, &n, cb);
+        let children = node.children().load(AO::Acquire);
+        if children != 0 {
+            stack.push(area.data_offset() + children as usize);
+        }
+
+        let right = node.right().load(AO::Acquire);
+        if right != 0 {
+            stack.push(area.data_offset() + right as usize);
+        }
+
+        let left = node.left().load(AO::Acquire);
+        if left != 0 {
+            stack.push(area.data_offset() + left as usize);
         }
     }
 }

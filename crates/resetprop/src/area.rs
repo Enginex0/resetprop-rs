@@ -87,6 +87,20 @@ impl PropArea {
         if version != PROP_AREA_VERSION {
             return Err(Error::AreaCorrupt(format!("bad version: {version:#x}")));
         }
+
+        let bytes_used = self.read_u32(0) as usize;
+        let data_size = self.len.saturating_sub(HEADER_SIZE);
+        if bytes_used < 20 {
+            return Err(Error::AreaCorrupt(format!(
+                "bytes_used too small: {bytes_used} (min 20)"
+            )));
+        }
+        if bytes_used > data_size {
+            return Err(Error::AreaCorrupt(format!(
+                "bytes_used {bytes_used} exceeds data size {data_size}"
+            )));
+        }
+
         Ok(())
     }
 
@@ -111,9 +125,16 @@ impl PropArea {
         unsafe { (self.base.add(offset) as *const u32).read_unaligned() }
     }
 
+    pub(crate) fn try_read_u32(&self, offset: usize) -> Option<u32> {
+        if offset + 4 > self.len {
+            return None;
+        }
+        Some(unsafe { (self.base.add(offset) as *const u32).read_unaligned() })
+    }
+
     pub(crate) fn atomic_u32(&self, offset: usize) -> &AtomicU32 {
         assert!(offset + 4 <= self.len);
-        // prop_area is always 4-byte aligned
+        assert!(offset.is_multiple_of(4), "AtomicU32 requires 4-byte alignment, got offset {offset}");
         unsafe { AtomicU32::from_ptr(self.base.add(offset) as *mut u32) }
     }
 
@@ -121,7 +142,6 @@ impl PropArea {
         self.atomic_u32(0)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn serial(&self) -> &AtomicU32 {
         self.atomic_u32(4)
     }
@@ -132,6 +152,25 @@ impl PropArea {
         } else {
             None
         }
+    }
+
+    pub(crate) fn futex_wake(&self, offset: usize) {
+        unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                self.base.add(offset) as *const u32,
+                libc::FUTEX_WAKE,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+            );
+        }
+    }
+
+    pub fn bump_serial_and_wake(&self) {
+        let s = self.serial();
+        let old = s.load(Ordering::Acquire);
+        s.store(old.wrapping_add(2), Ordering::Release);
+        self.futex_wake(4);
     }
 
     /// Bump-allocate `size` bytes in the arena. Returns offset from base.

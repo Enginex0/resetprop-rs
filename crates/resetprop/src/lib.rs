@@ -34,7 +34,15 @@ impl PropArea {
         }
     }
 
+    fn validate_key(name: &str) -> Result<()> {
+        if name.is_empty() || name.starts_with('.') || name.ends_with('.') || name.contains("..") {
+            return Err(Error::InvalidKey);
+        }
+        Ok(())
+    }
+
     fn add(&self, name: &str, value: &str) -> Result<()> {
+        Self::validate_key(name)?;
         let mut remaining = name;
         // root trie node's children field is at data_offset + 16
         let mut children_offset = self.data_offset() + 16;
@@ -192,8 +200,12 @@ impl PropArea {
     }
 }
 
+const SERIAL_FILE: &str = "properties_serial";
+const SKIP_FILES: &[&str] = &["property_info", SERIAL_FILE];
+
 pub struct PropSystem {
     areas: Vec<(PathBuf, PropArea)>,
+    serial_area: Option<PropArea>,
 }
 
 impl PropSystem {
@@ -210,8 +222,8 @@ impl PropSystem {
             if !path.is_file() {
                 continue;
             }
-            // skip property_info (context mapping file, not a prop area)
-            if path.file_name().map(|n| n == "property_info").unwrap_or(false) {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if SKIP_FILES.contains(&name) {
                 continue;
             }
             let area = PropArea::open(&path).or_else(|_| PropArea::open_ro(&path));
@@ -228,7 +240,15 @@ impl PropSystem {
             )));
         }
 
-        Ok(Self { areas })
+        let serial_area = PropArea::open(&dir.join(SERIAL_FILE)).ok();
+
+        Ok(Self { areas, serial_area })
+    }
+
+    fn notify(&self) {
+        if let Some(ref sa) = self.serial_area {
+            sa.bump_serial_and_wake();
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<String> {
@@ -241,16 +261,18 @@ impl PropSystem {
     }
 
     pub fn set(&self, name: &str, value: &str) -> Result<()> {
-        // try existing areas first
         for (_, area) in &self.areas {
             if area.get(name).is_some() {
-                return area.set(name, value);
+                area.set(name, value)?;
+                self.notify();
+                return Ok(());
             }
         }
-        // property doesn't exist yet — add to first writable area
         for (_, area) in &self.areas {
             if area.writable() {
-                return area.set(name, value);
+                area.set(name, value)?;
+                self.notify();
+                return Ok(());
             }
         }
         Err(Error::PermissionDenied(std::io::Error::new(
@@ -262,7 +284,10 @@ impl PropSystem {
     pub fn delete(&self, name: &str) -> Result<bool> {
         for (_, area) in &self.areas {
             match area.delete(name) {
-                Ok(true) => return Ok(true),
+                Ok(true) => {
+                    self.notify();
+                    return Ok(true);
+                }
                 Ok(false) => continue,
                 Err(e) => return Err(e),
             }

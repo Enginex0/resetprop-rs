@@ -64,6 +64,9 @@ impl<'a> PropInfo<'a> {
     fn read_short_value(&self, serial: u32) -> String {
         let len = self.value_len(serial).min(PROP_VALUE_MAX - 1);
         let value_start = self.offset + 4;
+        if value_start + len > self.area.len() {
+            return String::new();
+        }
         unsafe {
             let ptr = self.area.base().add(value_start);
             let bytes = std::slice::from_raw_parts(ptr, len);
@@ -72,11 +75,36 @@ impl<'a> PropInfo<'a> {
     }
 
     fn read_long_value(&self) -> String {
-        // long_property layout within value[92]:
-        //   error_message[56] + offset(u32) at byte 56
         let long_offset_pos = self.offset + 4 + LONG_PROP_ERROR_SIZE;
-        let rel_offset = self.area.read_u32(long_offset_pos) as usize;
-        let abs = self.offset + rel_offset;
+        let rel_offset = match self.area.try_read_u32(long_offset_pos) {
+            Some(v) => v as usize,
+            None => return String::new(),
+        };
+
+        let abs = match self.offset.checked_add(rel_offset) {
+            Some(v) => v,
+            None => return String::new(),
+        };
+
+        // must point past the prop_info record to avoid reading header bytes as value
+        let name_start = self.offset + PROP_INFO_FIXED;
+        let name_len = {
+            let mut n = 0usize;
+            if name_start < self.area.len() {
+                unsafe {
+                    let ptr = self.area.base().add(name_start);
+                    let max = self.area.len() - name_start;
+                    while n < max && *ptr.add(n) != 0 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let min_abs = (self.offset + PROP_INFO_FIXED + name_len + 1 + 3) & !3;
+        if abs < min_abs {
+            return String::new();
+        }
 
         if abs >= self.area.len() {
             return String::new();
@@ -142,6 +170,7 @@ impl<'a> PropInfo<'a> {
         let new_serial = (serial + 2) & 0x00FFFFFF | ((value.len() as u32) << 24);
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
+        self.area.futex_wake(self.offset);
 
         Ok(())
     }
@@ -165,10 +194,10 @@ impl<'a> PropInfo<'a> {
             *ptr.add(value.len()) = 0;
         }
 
-        // keep LONG_FLAG, update length in top byte, bump serial
         let new_serial = ((serial + 2) & 0x00FFFFFF) | LONG_FLAG | ((value.len() as u32 & 0xFF) << 24);
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
+        self.area.futex_wake(self.offset);
 
         Ok(())
     }
