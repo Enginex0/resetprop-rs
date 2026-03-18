@@ -205,7 +205,7 @@ const SKIP_FILES: &[&str] = &["property_info", SERIAL_FILE];
 
 pub struct PropSystem {
     areas: Vec<(PathBuf, PropArea)>,
-    serial_area: Option<PropArea>,
+    serial_area: Option<(PathBuf, PropArea)>,
 }
 
 impl PropSystem {
@@ -240,13 +240,14 @@ impl PropSystem {
             )));
         }
 
-        let serial_area = PropArea::open(&dir.join(SERIAL_FILE)).ok();
+        let serial_path = dir.join(SERIAL_FILE);
+        let serial_area = PropArea::open(&serial_path).ok().map(|a| (serial_path, a));
 
         Ok(Self { areas, serial_area })
     }
 
     fn notify(&self) {
-        if let Some(ref sa) = self.serial_area {
+        if let Some((_, ref sa)) = self.serial_area {
             sa.bump_serial_and_wake();
         }
     }
@@ -315,5 +316,25 @@ impl PropSystem {
         }
         result.sort_by(|a, b| a.0.cmp(&b.0));
         result
+    }
+
+    pub fn privatize(&mut self) -> Result<()> {
+        for (path, area) in &mut self.areas {
+            area.privatize(path)?;
+        }
+        if let Some((path, area)) = &mut self.serial_area {
+            area.privatize(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn leak(self) {
+        let mut sys = self;
+        for (_, area) in &mut sys.areas {
+            area.leak();
+        }
+        if let Some((_, ref mut area)) = sys.serial_area {
+            area.leak();
+        }
     }
 }

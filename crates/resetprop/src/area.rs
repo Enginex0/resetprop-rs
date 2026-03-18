@@ -11,6 +11,7 @@ pub struct PropArea {
     base: *mut u8,
     len: usize,
     writable: bool,
+    leaked: bool,
 }
 
 unsafe impl Send for PropArea {}
@@ -71,6 +72,7 @@ impl PropArea {
             base: ptr as *mut u8,
             len: file_size,
             writable,
+            leaked: false,
         };
 
         area.validate_header()?;
@@ -200,8 +202,49 @@ impl PropArea {
     }
 }
 
+impl PropArea {
+    pub fn privatize(&mut self, path: &Path) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path")))?;
+
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let ptr = unsafe {
+            libc::mmap(
+                self.base as *mut libc::c_void,
+                self.len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                fd,
+                0,
+            )
+        };
+        unsafe { libc::close(fd) };
+
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        self.writable = true;
+        Ok(())
+    }
+
+    pub fn leak(&mut self) {
+        self.leaked = true;
+    }
+}
+
 impl Drop for PropArea {
     fn drop(&mut self) {
+        if self.leaked {
+            return;
+        }
         unsafe {
             libc::munmap(self.base as *mut libc::c_void, self.len);
         }
