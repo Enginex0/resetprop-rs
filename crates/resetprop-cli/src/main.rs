@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use resetprop::PropSystem;
+use resetprop::{PropSystem, PersistStore};
 
 fn main() -> ExitCode {
     match run() {
@@ -17,6 +17,8 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut verbose = false;
     let mut init = false;
+    let mut persist = false;
+    let mut persist_read = false;
     let mut dir: Option<String> = None;
     let mut delete: Option<String> = None;
     let mut hexpatch: Option<String> = None;
@@ -28,6 +30,8 @@ fn run() -> Result<(), String> {
         match args[i].as_str() {
             "-v" => verbose = true,
             "--init" => init = true,
+            "-p" => persist = true,
+            "-P" => persist_read = true,
             "-n" => {}
             "-d" | "--delete" => {
                 i += 1;
@@ -55,6 +59,10 @@ fn run() -> Result<(), String> {
         i += 1;
     }
 
+    if persist_read {
+        return persist_read_op(&positional);
+    }
+
     let sys = match &dir {
         Some(d) => PropSystem::open_dir(Path::new(d)),
         None => PropSystem::open(),
@@ -65,8 +73,11 @@ fn run() -> Result<(), String> {
         return bool_op(sys.hexpatch_delete(&name), &name, "hexpatch", verbose);
     }
 
-    if let Some(name) = delete {
-        return bool_op(sys.delete(&name), &name, "deleted", verbose);
+    if let Some(ref name) = delete {
+        if persist {
+            return bool_op(sys.delete_persist(name), name, "deleted(persist)", verbose);
+        }
+        return bool_op(sys.delete(name), name, "deleted", verbose);
     }
 
     if let Some(path) = file {
@@ -84,14 +95,17 @@ fn run() -> Result<(), String> {
             None => return Err(format!("property not found: {}", positional[0])),
         },
         2 => {
-            if init {
+            if persist {
+                sys.set_persist(&positional[0], &positional[1])
+            } else if init {
                 sys.set_init(&positional[0], &positional[1])
             } else {
                 sys.set(&positional[0], &positional[1])
             }
             .map_err(|e| format!("failed to set {}: {e}", positional[0]))?;
             if verbose {
-                eprintln!("set{}: [{}]=[{}]", if init { "(init)" } else { "" }, positional[0], positional[1]);
+                let mode = if persist { "(persist)" } else if init { "(init)" } else { "" };
+                eprintln!("set{mode}: [{}]=[{}]", positional[0], positional[1]);
             }
         }
         _ => return Err("too many arguments".into()),
@@ -122,6 +136,23 @@ fn bool_op(
         Ok(false) => Err(format!("property not found: {name}")),
         Err(e) => Err(format!("{label} failed: {e}")),
     }
+}
+
+fn persist_read_op(positional: &[String]) -> Result<(), String> {
+    let store = PersistStore::load().map_err(|e| format!("failed to load persist store: {e}"))?;
+    match positional.len() {
+        0 => {
+            for r in store.list() {
+                println!("[{}]: [{}]", r.name, r.value);
+            }
+        }
+        1 => match store.get(&positional[0]) {
+            Some(val) => println!("{val}"),
+            None => return Err(format!("persist property not found: {}", positional[0])),
+        },
+        _ => return Err("-P supports 0 args (list) or 1 arg (get)".into()),
+    }
+    Ok(())
 }
 
 fn load_file(sys: &PropSystem, path: &str, init: bool, verbose: bool) -> Result<(), String> {
@@ -164,12 +195,18 @@ Usage:
   resetprop NAME                     Get property value
   resetprop [-n] NAME VALUE          Set property (direct mmap)
   resetprop --init NAME VALUE        Set property with zeroed serial counter
+  resetprop -p NAME VALUE            Set in both prop_area and persist file
   resetprop -d NAME                  Delete property
+  resetprop -p -d NAME               Delete from both prop_area and persist file
+  resetprop -P                       List persist properties from disk
+  resetprop -P NAME                  Get persist property from disk
   resetprop --hexpatch-delete NAME   Stealth delete (name destruction)
   resetprop -f FILE                  Load properties from file (name=value)
   resetprop --dir PATH               Use custom property directory
 
 Options:
+  -p          Persist mode (write to both prop_area and disk)
+  -P          Disk-only read (read from persist file, not prop_area)
   --init      Zero the serial counter (mimics init for ro.* props)
   -v          Verbose output
   -h, --help  Show this help"

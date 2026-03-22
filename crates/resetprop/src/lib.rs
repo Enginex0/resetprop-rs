@@ -4,11 +4,13 @@ mod trie;
 mod info;
 mod dict;
 mod harvest;
+mod persist;
 #[cfg(test)]
 mod mock;
 
 pub use error::{Error, Result};
 pub use area::PropArea;
+pub use persist::PersistStore;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -326,6 +328,19 @@ impl PropSystem {
             }
         }
         Ok(false)
+    }
+
+    pub fn set_persist(&self, name: &str, value: &str) -> Result<()> {
+        self.set(name, value)?;
+        let mut store = PersistStore::load()?;
+        store.set(name, value)
+    }
+
+    pub fn delete_persist(&self, name: &str) -> Result<bool> {
+        let mem = self.delete(name)?;
+        let mut store = PersistStore::load()?;
+        let disk = store.delete(name)?;
+        Ok(mem || disk)
     }
 
     pub fn hexpatch_delete(&self, name: &str) -> Result<bool> {

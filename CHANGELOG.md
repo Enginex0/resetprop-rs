@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.0
+
+- Persistent property support via `-p` and `-P` flags
+- `-p` writes to both prop_area (memory) and `/data/property/persistent_properties` (disk)
+- `-P` reads directly from the persist file without requiring prop_area access
+- Hand-rolled proto2 encode/decode matching AOSP's `PersistentProperties` schema
+- Atomic write with SELinux xattr preservation, matching AOSP's temp+rename+fsync pattern
+- Legacy format read support for pre-Android 9 devices (one file per property)
+- `PersistStore` public API: load, get, set, delete, list
+- `PropSystem::set_persist()` and `PropSystem::delete_persist()` for dual memory+disk writes
+
 ## v0.2.1
 
 - Add `set_init()` API for init-style serial writes on ro.* properties

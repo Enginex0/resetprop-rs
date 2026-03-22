@@ -9,6 +9,7 @@ pub enum Error {
     Io(std::io::Error),
     ValueTooLong { len: usize },
     InvalidKey,
+    PersistCorrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -23,6 +24,7 @@ impl fmt::Display for Error {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::ValueTooLong { len } => write!(f, "value too long: {len} bytes"),
             Self::InvalidKey => write!(f, "invalid property key"),
+            Self::PersistCorrupt(msg) => write!(f, "corrupt persist file: {msg}"),
         }
     }
 }
