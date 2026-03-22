@@ -138,12 +138,25 @@ fn skip_field(data: &[u8], mut pos: usize, wire_type: u8) -> Result<usize> {
             }
             Ok(pos + 1)
         }
-        1 => Ok(pos + 8),
+        1 => {
+            if pos + 8 > data.len() {
+                return Err(Error::PersistCorrupt("truncated 64-bit field".into()));
+            }
+            Ok(pos + 8)
+        }
         2 => {
             let len = read_varint(data, &mut pos)? as usize;
+            if pos + len > data.len() {
+                return Err(Error::PersistCorrupt("truncated length-delimited field".into()));
+            }
             Ok(pos + len)
         }
-        5 => Ok(pos + 4),
+        5 => {
+            if pos + 4 > data.len() {
+                return Err(Error::PersistCorrupt("truncated 32-bit field".into()));
+            }
+            Ok(pos + 4)
+        }
         _ => Err(Error::PersistCorrupt(format!("unknown wire type {wire_type}"))),
     }
 }
