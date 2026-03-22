@@ -70,7 +70,7 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(path) = file {
-        return load_file(&sys, &path, verbose);
+        return load_file(&sys, &path, init, verbose);
     }
 
     match positional.len() {
@@ -124,7 +124,7 @@ fn bool_op(
     }
 }
 
-fn load_file(sys: &PropSystem, path: &str, verbose: bool) -> Result<(), String> {
+fn load_file(sys: &PropSystem, path: &str, init: bool, verbose: bool) -> Result<(), String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
 
@@ -139,11 +139,15 @@ fn load_file(sys: &PropSystem, path: &str, verbose: bool) -> Result<(), String> 
             .ok_or_else(|| format!("bad line (no '='): {line}"))?;
         let name = name.trim();
         let value = value.trim();
-        sys.set(name, value)
-            .map_err(|e| format!("failed to set {name}: {e}"))?;
+        if init {
+            sys.set_init(name, value)
+        } else {
+            sys.set(name, value)
+        }
+        .map_err(|e| format!("failed to set {name}: {e}"))?;
         count += 1;
         if verbose {
-            eprintln!("set: [{name}]=[{value}]");
+            eprintln!("set{}: [{name}]=[{value}]", if init { "(init)" } else { "" });
         }
     }
 
@@ -153,7 +157,7 @@ fn load_file(sys: &PropSystem, path: &str, verbose: bool) -> Result<(), String> 
 
 fn print_usage() {
     eprintln!(
-        "resetprop — Android property manipulation tool
+        "resetprop - Android property manipulation tool
 
 Usage:
   resetprop                          List all properties
