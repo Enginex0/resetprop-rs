@@ -16,6 +16,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut verbose = false;
+    let mut init = false;
     let mut dir: Option<String> = None;
     let mut delete: Option<String> = None;
     let mut hexpatch: Option<String> = None;
@@ -26,7 +27,8 @@ fn run() -> Result<(), String> {
     while i < args.len() {
         match args[i].as_str() {
             "-v" => verbose = true,
-            "-n" => {} // accepted for compat, all writes are direct mmap
+            "--init" => init = true,
+            "-n" => {}
             "-d" | "--delete" => {
                 i += 1;
                 delete = Some(arg_val(&args, i, "-d")?);
@@ -82,10 +84,14 @@ fn run() -> Result<(), String> {
             None => return Err(format!("property not found: {}", positional[0])),
         },
         2 => {
-            sys.set(&positional[0], &positional[1])
-                .map_err(|e| format!("failed to set {}: {e}", positional[0]))?;
+            if init {
+                sys.set_init(&positional[0], &positional[1])
+            } else {
+                sys.set(&positional[0], &positional[1])
+            }
+            .map_err(|e| format!("failed to set {}: {e}", positional[0]))?;
             if verbose {
-                eprintln!("set: [{}]=[{}]", positional[0], positional[1]);
+                eprintln!("set{}: [{}]=[{}]", if init { "(init)" } else { "" }, positional[0], positional[1]);
             }
         }
         _ => return Err("too many arguments".into()),
@@ -153,12 +159,14 @@ Usage:
   resetprop                          List all properties
   resetprop NAME                     Get property value
   resetprop [-n] NAME VALUE          Set property (direct mmap)
+  resetprop --init NAME VALUE        Set property with zeroed serial counter
   resetprop -d NAME                  Delete property
   resetprop --hexpatch-delete NAME   Stealth delete (name destruction)
   resetprop -f FILE                  Load properties from file (name=value)
   resetprop --dir PATH               Use custom property directory
 
 Options:
+  --init      Zero the serial counter (mimics init for ro.* props)
   -v          Verbose output
   -h, --help  Show this help"
     );
