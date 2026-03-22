@@ -175,6 +175,41 @@ impl<'a> PropInfo<'a> {
         Ok(())
     }
 
+    pub(crate) fn write_value_init(&self, value: &str) -> Result<()> {
+        if !self.area.writable() {
+            return Err(Error::PermissionDenied(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "area opened read-only",
+            )));
+        }
+
+        let serial = self.read_serial_stable();
+        if self.is_long(serial) {
+            return self.write_long_value_init(value, serial);
+        }
+
+        if value.len() >= PROP_VALUE_MAX {
+            return Err(Error::ValueTooLong { len: value.len() });
+        }
+
+        let sa = self.serial_atomic();
+        sa.store(serial | 1, Ordering::Release);
+        std::sync::atomic::fence(Ordering::Release);
+
+        unsafe {
+            let ptr = self.area.base().add(self.offset + 4);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
+            *ptr.add(value.len()) = 0;
+        }
+
+        let new_serial = (value.len() as u32) << 24;
+        std::sync::atomic::fence(Ordering::Release);
+        sa.store(new_serial, Ordering::Release);
+        self.area.futex_wake(self.offset);
+
+        Ok(())
+    }
+
     fn write_long_value(&self, value: &str, serial: u32) -> Result<()> {
         let long_offset_pos = self.offset + 4 + LONG_PROP_ERROR_SIZE;
         let rel_offset = self.area.read_u32(long_offset_pos) as usize;
@@ -195,6 +230,33 @@ impl<'a> PropInfo<'a> {
         }
 
         let new_serial = ((serial + 2) & 0x00FFFFFF) | LONG_FLAG | ((value.len() as u32 & 0xFF) << 24);
+        std::sync::atomic::fence(Ordering::Release);
+        sa.store(new_serial, Ordering::Release);
+        self.area.futex_wake(self.offset);
+
+        Ok(())
+    }
+
+    fn write_long_value_init(&self, value: &str, serial: u32) -> Result<()> {
+        let long_offset_pos = self.offset + 4 + LONG_PROP_ERROR_SIZE;
+        let rel_offset = self.area.read_u32(long_offset_pos) as usize;
+        let abs = self.offset + rel_offset;
+
+        if abs + value.len() + 1 > self.area.len() {
+            return Err(Error::ValueTooLong { len: value.len() });
+        }
+
+        let sa = self.serial_atomic();
+        sa.store(serial | 1, Ordering::Release);
+        std::sync::atomic::fence(Ordering::Release);
+
+        unsafe {
+            let ptr = self.area.base().add(abs);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
+            *ptr.add(value.len()) = 0;
+        }
+
+        let new_serial = ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
         self.area.futex_wake(self.offset);

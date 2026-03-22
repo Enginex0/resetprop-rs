@@ -34,6 +34,17 @@ impl PropArea {
         }
     }
 
+    pub fn set_init(&self, name: &str, value: &str) -> Result<()> {
+        match trie::find(self, name) {
+            Ok((pi_offset, _)) => {
+                let pi = info::PropInfo::at(self, pi_offset)?;
+                pi.write_value_init(value)
+            }
+            Err(Error::NotFound) => self.add(name, value),
+            Err(e) => Err(e),
+        }
+    }
+
     fn validate_key(name: &str) -> Result<()> {
         if name.is_empty() || name.starts_with('.') || name.ends_with('.') || name.contains("..") {
             return Err(Error::InvalidKey);
@@ -272,6 +283,27 @@ impl PropSystem {
         for (_, area) in &self.areas {
             if area.writable() {
                 area.set(name, value)?;
+                self.notify();
+                return Ok(());
+            }
+        }
+        Err(Error::PermissionDenied(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no writable property area",
+        )))
+    }
+
+    pub fn set_init(&self, name: &str, value: &str) -> Result<()> {
+        for (_, area) in &self.areas {
+            if area.get(name).is_some() {
+                area.set_init(name, value)?;
+                self.notify();
+                return Ok(());
+            }
+        }
+        for (_, area) in &self.areas {
+            if area.writable() {
+                area.set_init(name, value)?;
                 self.notify();
                 return Ok(());
             }
