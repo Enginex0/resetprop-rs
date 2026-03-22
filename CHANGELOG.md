@@ -6,6 +6,8 @@
 - `write_value_init()` zeroes the low-24 counter bits instead of incrementing by 2
 - Handles both short and long (kLongFlag) property values
 - Exposed at `PropArea::set_init()` and `PropSystem::set_init()`
+- CLI: `--init` flag for init-style writes (`resetprop --init ro.build.fingerprint "..."`)
+- CLI: `--init` works with `-f` file load (`resetprop --init -f props.txt`)
 
 ## v0.2.0
 
