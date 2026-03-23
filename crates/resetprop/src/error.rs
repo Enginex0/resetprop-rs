@@ -1,5 +1,6 @@
 use std::fmt;
 
+/// Errors returned by property operations.
 #[derive(Debug)]
 pub enum Error {
     NotFound,

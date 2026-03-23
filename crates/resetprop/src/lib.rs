@@ -1,3 +1,23 @@
+//! Pure Rust Android system property manipulation.
+//!
+//! Directly reads and writes the mmap'd property areas at `/dev/__properties__/`
+//! without depending on Magisk, forked bionic, or any custom symbols.
+//!
+//! # Quick start
+//!
+//! ```rust,no_run
+//! use resetprop::PropSystem;
+//!
+//! let sys = PropSystem::open()?;
+//! sys.set("ro.build.type", "user")?;
+//! sys.hexpatch_delete("ro.lineage.version")?;
+//! # Ok::<(), resetprop::Error>(())
+//! ```
+//!
+//! Use [`PropSystem`] for multi-file operations across the full property directory.
+//! Use [`PropArea`] for single-file, low-level access.
+//! Use [`PersistStore`] for the on-disk persistent property store.
+
 mod error;
 mod area;
 mod trie;
@@ -10,7 +30,7 @@ mod mock;
 
 pub use error::{Error, Result};
 pub use area::PropArea;
-pub use persist::PersistStore;
+pub use persist::{PersistStore, Record};
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -19,12 +39,14 @@ use std::sync::atomic::Ordering;
 const PROP_DIR: &str = "/dev/__properties__";
 
 impl PropArea {
+    /// Returns the value of a property, or `None` if it doesn't exist in this area.
     pub fn get(&self, name: &str) -> Option<String> {
         let (pi_offset, _) = trie::find(self, name).ok()?;
         let pi = info::PropInfo::at(self, pi_offset).ok()?;
         Some(pi.read_value())
     }
 
+    /// Sets a property value via direct mmap write. Creates the property if it doesn't exist.
     pub fn set(&self, name: &str, value: &str) -> Result<()> {
         match trie::find(self, name) {
             Ok((pi_offset, _)) => {
@@ -36,6 +58,7 @@ impl PropArea {
         }
     }
 
+    /// Like [`set`](Self::set), but zeros the serial counter to mimic init-time writes.
     pub fn set_init(&self, name: &str, value: &str) -> Result<()> {
         match trie::find(self, name) {
             Ok((pi_offset, _)) => {
@@ -85,6 +108,8 @@ impl PropArea {
         }
     }
 
+    /// Deletes a property by detaching its trie node and zeroing its value and name.
+    /// Returns `Ok(false)` if the property was not found.
     pub fn delete(&self, name: &str) -> Result<bool> {
         let (pi_offset, node_offset) = match trie::find(self, name) {
             Ok(v) => v,
@@ -114,6 +139,10 @@ impl PropArea {
         Ok(true)
     }
 
+    /// Stealth-deletes a property by replacing name segments with plausible dictionary
+    /// words and setting the value to `"0"`. Trie structure stays intact, making the
+    /// deletion invisible to `__system_property_foreach`.
+    /// Returns `Ok(false)` if the property was not found.
     pub fn hexpatch_delete(&self, name: &str) -> Result<bool> {
         let path = match trie::find_path(self, name) {
             Ok(v) => v,
@@ -200,6 +229,7 @@ impl PropArea {
         }
     }
 
+    /// Iterates over all properties in this area, calling `cb(name, value)` for each.
     pub fn foreach<F: FnMut(&str, &str)>(&self, mut cb: F) {
         trie::foreach(self, |pi_offset| {
             if let Ok(pi) = info::PropInfo::at(self, pi_offset) {
@@ -216,16 +246,28 @@ impl PropArea {
 const SERIAL_FILE: &str = "properties_serial";
 const SKIP_FILES: &[&str] = &["property_info", SERIAL_FILE];
 
+/// High-level interface that scans all property files in `/dev/__properties__/`.
+///
+/// This is the primary entry point for most consumers. It searches across all
+/// property areas for reads and picks the correct area for writes.
+///
+/// ```rust,no_run
+/// let sys = resetprop::PropSystem::open()?;
+/// sys.set("persist.sys.timezone", "UTC")?;
+/// # Ok::<(), resetprop::Error>(())
+/// ```
 pub struct PropSystem {
     areas: Vec<(PathBuf, PropArea)>,
     serial_area: Option<(PathBuf, PropArea)>,
 }
 
 impl PropSystem {
+    /// Opens the default property directory at `/dev/__properties__/`.
     pub fn open() -> Result<Self> {
         Self::open_dir(Path::new(PROP_DIR))
     }
 
+    /// Opens a custom property directory (useful for testing or alternate roots).
     pub fn open_dir(dir: &Path) -> Result<Self> {
         let mut areas = Vec::new();
         let entries = std::fs::read_dir(dir).map_err(|e| -> Error { e.into() })?;
@@ -330,12 +372,14 @@ impl PropSystem {
         Ok(false)
     }
 
+    /// Sets a property in both the mmap'd area and the on-disk persist store.
     pub fn set_persist(&self, name: &str, value: &str) -> Result<()> {
         self.set(name, value)?;
         let mut store = PersistStore::load()?;
         store.set(name, value)
     }
 
+    /// Deletes a property from both the mmap'd area and the on-disk persist store.
     pub fn delete_persist(&self, name: &str) -> Result<bool> {
         let mem = self.delete(name)?;
         let mut store = PersistStore::load()?;
@@ -354,6 +398,7 @@ impl PropSystem {
         Ok(false)
     }
 
+    /// Returns all properties across all areas, sorted by name.
     pub fn list(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
         for (_, area) in &self.areas {
@@ -365,6 +410,7 @@ impl PropSystem {
         result
     }
 
+    /// Remaps all areas as `MAP_PRIVATE` so writes don't propagate to other processes.
     pub fn privatize(&mut self) -> Result<()> {
         for (path, area) in &mut self.areas {
             area.privatize(path)?;
@@ -375,6 +421,7 @@ impl PropSystem {
         Ok(())
     }
 
+    /// Prevents `munmap` on drop. Use when the mappings must outlive this struct.
     pub fn leak(self) {
         let mut sys = self;
         for (_, area) in &mut sys.areas {

@@ -1,5 +1,6 @@
 use crate::{Error, Result};
 
+/// A single persistent property entry (name-value pair).
 pub struct Record {
     pub name: String,
     pub value: String,

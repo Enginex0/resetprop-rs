@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.1
+
+- Library crate now publishable to crates.io with full metadata (repository, keywords, categories)
+- Crate-level README for the library, focused on API usage and dependency setup
+- Public API doc comments on all exported types and methods for docs.rs
+- Re-export `Record` from crate root so consumers can use `resetprop::Record` directly
+- CLI crate also carries crates.io metadata for independent publishing
+- Version bump from 0.2.0 to 0.3.1 to align Cargo.toml with tag history
+
 ## v0.3.0
 
 - Persistent property support via `-p` and `-P` flags

@@ -1,8 +1,12 @@
 [package]
 name = "resetprop-cli"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2021"
 license = "MIT"
+description = "CLI for Android property manipulation — standalone resetprop in pure Rust"
+repository = "https://github.com/Enginex0/resetprop-rs"
+keywords = ["android", "properties", "resetprop"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "resetprop"

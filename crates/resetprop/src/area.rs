@@ -7,6 +7,11 @@ const PROP_AREA_MAGIC: u32 = 0x504f5250;
 const PROP_AREA_VERSION: u32 = 0xfc6ed0ab;
 pub(crate) const HEADER_SIZE: usize = 128;
 
+/// A single mmap'd Android property file (128KB arena with prefix trie).
+///
+/// For most uses, prefer [`PropSystem`](crate::PropSystem) which scans the
+/// entire `/dev/__properties__/` directory. Use `PropArea` directly when you
+/// need control over individual property files.
 pub struct PropArea {
     base: *mut u8,
     len: usize,
@@ -19,10 +24,12 @@ unsafe impl Send for PropArea {}
 unsafe impl Sync for PropArea {}
 
 impl PropArea {
+    /// Opens a property file for reading and writing.
     pub fn open(path: &Path) -> Result<Self> {
         Self::mmap(path, true)
     }
 
+    /// Opens a property file read-only.
     pub fn open_ro(path: &Path) -> Result<Self> {
         Self::mmap(path, false)
     }

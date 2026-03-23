@@ -8,6 +8,9 @@ pub use proto::Record;
 
 const DEFAULT_DIR: &str = "/data/property";
 
+/// Reads and writes Android's on-disk persistent property store at `/data/property/`.
+///
+/// Supports both the modern protobuf format and the legacy one-file-per-property layout.
 pub struct PersistStore {
     dir: PathBuf,
     records: Vec<Record>,
