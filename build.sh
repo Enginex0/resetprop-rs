@@ -7,6 +7,8 @@ OUT_DIR="$SCRIPT_DIR/out"
 declare -A ABI_TARGET=(
     [arm64-v8a]=aarch64-linux-android
     [armeabi-v7a]=armv7-linux-androideabi
+    [x86_64]=x86_64-linux-android
+    [x86]=i686-linux-android
 )
 
 find_ndk() {
@@ -47,8 +49,12 @@ NDK_BIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 export PATH="$NDK_BIN:$PATH"
 export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
 export CC_armv7_linux_androideabi="$NDK_BIN/armv7a-linux-androideabi26-clang"
+export CC_x86_64_linux_android="$NDK_BIN/x86_64-linux-android26-clang"
+export CC_i686_linux_android="$NDK_BIN/i686-linux-android26-clang"
 export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
 export AR_armv7_linux_androideabi="$NDK_BIN/llvm-ar"
+export AR_x86_64_linux_android="$NDK_BIN/llvm-ar"
+export AR_i686_linux_android="$NDK_BIN/llvm-ar"
 
 echo "NDK: $NDK_HOME"
 

@@ -20,6 +20,10 @@ jobs:
             artifact: resetprop-arm64-v8a
           - target: armv7-linux-androideabi
             artifact: resetprop-armeabi-v7a
+          - target: x86_64-linux-android
+            artifact: resetprop-x86_64
+          - target: i686-linux-android
+            artifact: resetprop-x86
     steps:
       - uses: actions/checkout@v4
 

@@ -84,7 +84,7 @@ It also introduces `--hexpatch-delete` — a stealth operation that no existing 
 **You need:**
 1. Android 10 or above
 2. Root access (KernelSU, Magisk, APatch, or equivalent)
-3. ARM64 or ARMv7 device
+3. ARM64, ARMv7, x86_64, or x86 device/emulator
 
 ---
 
@@ -162,10 +162,12 @@ export ANDROID_NDK_HOME=/path/to/ndk
 
 Outputs stripped binaries to `out/`:
 
-| ABI | Binary | Size |
-|-----|--------|------|
-| arm64-v8a | `resetprop-arm64-v8a` | ~320KB |
-| armeabi-v7a | `resetprop-armeabi-v7a` | ~240KB |
+| ABI | Binary |
+|-----|--------|
+| arm64-v8a | `resetprop-arm64-v8a` |
+| armeabi-v7a | `resetprop-armeabi-v7a` |
+| x86_64 | `resetprop-x86_64` |
+| x86 | `resetprop-x86` |
 
 The build uses `opt-level=s`, LTO, `panic=abort`, strip, and single codegen unit for minimal binary size.
 
@@ -226,7 +228,7 @@ After:  ro.codec.charger = "0"
 | | Status |
 |---|---|
 | **Android** | 10 – 15 |
-| **Architecture** | ARM64, ARMv7 |
+| **Architecture** | ARM64, ARMv7, x86_64, x86 |
 | **Value format** | Short (≤91B) + Long (Android 12+, >92B) |
 | **Root** | KernelSU, Magisk, APatch, any `su` |
 
