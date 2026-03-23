@@ -48,14 +48,18 @@ It also introduces `--hexpatch-delete` — a stealth operation that no existing 
 **Property Operations**
 - [x] **Get** — single property or list all
 - [x] **Set** — direct mmap write, bypasses `property_service`
+- [x] **Set (init-style)** — `--init` zeros the serial counter, mimicking how `init` writes `ro.*` props at boot
 - [x] **Delete** — trie node detach + value/name wipe
 - [x] **Hexpatch Delete** — dictionary-based name destruction, serial-preserving
+- [x] **Persistent Properties** — `-p` writes to both memory and `/data/property/persistent_properties` on disk; `-P` reads directly from the persist file
 - [x] **Batch Load** — `-f` flag loads `name=value` pairs from file
+- [x] **Privatize** — remap areas as `MAP_PRIVATE` for per-process COW isolation
 
 **Library API**
 - [x] **`PropArea`** — single property file: open, get, set, delete, hexpatch, foreach
 - [x] **`PropSystem`** — multi-file scan across `/dev/__properties__/`
-- [x] **Typed errors** — `NotFound`, `AreaCorrupt`, `PermissionDenied`, `AreaFull`, `Io`, `ValueTooLong`
+- [x] **`PersistStore`** — read/write the on-disk persistent property store (protobuf + legacy format)
+- [x] **Typed errors** — `NotFound`, `AreaCorrupt`, `PermissionDenied`, `AreaFull`, `Io`, `ValueTooLong`, `PersistCorrupt`
 - [x] **RO fallback** — automatically falls back to read-only when write access is denied
 
 **Format Support**
@@ -90,30 +94,107 @@ It also introduces `--hexpatch-delete` — a stealth operation that no existing 
 
 ## 🚀 Quick Start
 
-1. **Download** the latest binary from [Releases](https://github.com/Enginex0/resetprop-rs/releases)
-2. **Push to device** — `adb push resetprop-arm64-v8a /data/local/tmp/resetprop`
-3. **Set executable** — `adb shell chmod +x /data/local/tmp/resetprop`
-4. **Run with root** — `adb shell su -c /data/local/tmp/resetprop`
+### Setup
+
+1. **Download** the binary for your architecture from [Releases](https://github.com/Enginex0/resetprop-rs/releases)
+2. **Push to device:**
+   ```sh
+   adb push resetprop-arm64-v8a /data/local/tmp/resetprop-rs
+   adb shell chmod +x /data/local/tmp/resetprop-rs
+   ```
+3. **Run with root:**
+   ```sh
+   adb shell su -c /data/local/tmp/resetprop-rs
+   ```
+
+> [!WARNING]
+> **Do NOT name the binary `resetprop`** if you're on KernelSU or Magisk. Both ship their own `resetprop` in `/data/adb/ksu/bin/` or `/sbin/`, and your shell will resolve to theirs instead of this one. Either:
+> - Name it `resetprop-rs` (recommended)
+> - Use the full path: `/data/local/tmp/resetprop-rs`
+> - Place it earlier in `$PATH` than the KSU/Magisk binary
+
+### For shell scripts and modules
+
+If you bundle this binary in a KSU module or boot script, always call it by **full path**:
+
+```sh
+RESETPROP="/data/adb/modules/mymodule/resetprop-rs"
+$RESETPROP -n ro.build.type user
+$RESETPROP --hexpatch-delete ro.lineage.version
+```
+
+Do **not** rely on bare `resetprop` in scripts. It will silently use KSU/Magisk's version, which lacks `--hexpatch-delete`, `--init`, `-p`, and `-P`.
+
+---
+
+## 📖 CLI Reference
+
+```
+resetprop-rs [OPTIONS] [NAME] [VALUE]
+```
+
+### Reading properties
 
 ```sh
 # List all properties
-resetprop
+resetprop-rs
 
 # Get a single property
-resetprop ro.build.type
+resetprop-rs ro.build.type
 
-# Set a property (direct mmap, no init notification)
-resetprop -n ro.build.type user
+# List persistent properties from disk (/data/property/)
+resetprop-rs -P
 
-# Delete a property
-resetprop -d ro.debuggable
-
-# Stealth delete — name bytes replaced with dictionary words
-resetprop --hexpatch-delete ro.lineage.version
-
-# Batch set from file
-resetprop -f props.txt
+# Get a single persistent property from disk
+resetprop-rs -P persist.sys.timezone
 ```
+
+### Writing properties
+
+```sh
+# Set a property (direct mmap write, bypasses property_service)
+resetprop-rs -n ro.build.type user
+
+# Set with zeroed serial counter (mimics how init writes ro.* at boot)
+resetprop-rs --init ro.build.fingerprint "google/raven/raven:14/..."
+
+# Set and persist to disk (survives reboot)
+resetprop-rs -p persist.sys.timezone UTC
+
+# Batch set from file (one name=value per line, # comments allowed)
+resetprop-rs -f props.txt
+
+# Batch set with init-style serial
+resetprop-rs --init -f props.txt
+```
+
+### Deleting properties
+
+```sh
+# Delete (detaches trie node, zeroes value and name)
+resetprop-rs -d ro.debuggable
+
+# Delete from both memory and persist file
+resetprop-rs -p -d persist.sys.timezone
+
+# Stealth delete (replaces name with dictionary words, keeps trie intact)
+resetprop-rs --hexpatch-delete ro.lineage.version
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `-n` | No-op (compatibility with Magisk's resetprop) |
+| `--init` | Zero the serial counter when writing (mimics init for `ro.*` properties) |
+| `-p` | Persist mode: write/delete affects both memory and `/data/property/` on disk |
+| `-P` | Read from the persist file on disk, not from the mmap'd property area |
+| `-d NAME` | Delete a property |
+| `--hexpatch-delete NAME` | Stealth delete with dictionary-based name replacement |
+| `-f FILE` | Load `name=value` pairs from a file |
+| `--dir PATH` | Use a custom property directory instead of `/dev/__properties__/` |
+| `-v` | Verbose output |
+| `-h, --help` | Show help |
 
 ---
 
@@ -132,20 +213,40 @@ resetprop = { git = "https://github.com/Enginex0/resetprop-rs" }
 ```
 
 ```rust
-use resetprop::PropSystem;
+use resetprop::{PropSystem, PersistStore};
 
 let sys = PropSystem::open()?;
 
+// read
 if let Some(val) = sys.get("ro.build.type") {
     println!("{val}");
 }
 
+// write (direct mmap, bypasses property_service)
 sys.set("ro.build.type", "user")?;
+
+// write with zeroed serial (mimics init for ro.* props)
+sys.set_init("ro.build.fingerprint", "google/raven/...")?;
+
+// write to both memory and disk
+sys.set_persist("persist.sys.timezone", "UTC")?;
+
+// delete
 sys.delete("ro.debuggable")?;
+sys.delete_persist("persist.sys.timezone")?;
+
+// stealth delete
 sys.hexpatch_delete("ro.lineage.version")?;
 
+// enumerate
 for (name, value) in sys.list() {
     println!("[{name}]: [{value}]");
+}
+
+// read persist file directly
+let store = PersistStore::load()?;
+for record in store.list() {
+    println!("{}: {}", record.name, record.value);
 }
 ```
 
@@ -171,7 +272,7 @@ Outputs stripped binaries to `out/`:
 
 The build uses `opt-level=s`, LTO, `panic=abort`, strip, and single codegen unit for minimal binary size.
 
-**No NDK?** Fork the repo and go to **Actions → Build → Run workflow** — GitHub builds both binaries for you. Download them from the workflow artifacts.
+**No NDK?** Fork the repo and go to **Actions → Build → Run workflow** — GitHub builds all four ABIs for you. Download them from the workflow artifacts.
 
 ---
 
