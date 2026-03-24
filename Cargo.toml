@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/resetprop", "crates/resetprop-cli"]
+members = ["crates/resetprop", "crates/resetprop-cli", "crates/propdetect", "crates/propdetect-bionic"]
+exclude = ["propdetect-app/native"]
 
 [profile.release]
 opt-level = "s"
