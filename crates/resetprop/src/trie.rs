@@ -30,7 +30,7 @@ impl<'a> TrieNode<'a> {
         Ok(Self { area, offset })
     }
 
-    fn namelen(&self) -> u32 {
+    pub(crate) fn namelen(&self) -> u32 {
         self.area.read_u32(self.offset)
     }
 
@@ -267,4 +267,59 @@ pub(crate) fn find_path(area: &PropArea, name: &str) -> Result<Vec<usize>> {
     }
 
     Ok(path)
+}
+
+pub(crate) fn prune(area: &PropArea) {
+    let _ = prune_subtree(area, area.data_offset());
+}
+
+fn prune_subtree(area: &PropArea, abs_offset: usize) -> bool {
+    let node = match TrieNode::from_offset(area, abs_offset) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+
+    let mut is_leaf = true;
+
+    let children = node.children().load(AO::Acquire);
+    if children != 0 {
+        if prune_subtree(area, area.data_offset() + children as usize) {
+            node.children().store(0, AO::Release);
+        } else {
+            is_leaf = false;
+        }
+    }
+
+    let left = node.left().load(AO::Acquire);
+    if left != 0 {
+        if prune_subtree(area, area.data_offset() + left as usize) {
+            node.left().store(0, AO::Release);
+        } else {
+            is_leaf = false;
+        }
+    }
+
+    let right = node.right().load(AO::Acquire);
+    if right != 0 {
+        if prune_subtree(area, area.data_offset() + right as usize) {
+            node.right().store(0, AO::Release);
+        } else {
+            is_leaf = false;
+        }
+    }
+
+    if !is_leaf || node.prop_offset().load(AO::Acquire) != 0 {
+        return false;
+    }
+
+    let namelen = node.namelen() as usize;
+    unsafe {
+        if namelen > 0 {
+            std::ptr::write_bytes(node.name_ptr(), 0, namelen);
+        }
+        if let Some(ptr) = area.ptr_at(abs_offset) {
+            std::ptr::write_bytes(ptr, 0, TRIE_NODE_FIXED);
+        }
+    }
+    true
 }
