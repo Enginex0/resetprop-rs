@@ -26,6 +26,9 @@ fn run() -> Result<(), String> {
     let mut hexpatch: Option<String> = None;
     let mut nuke: Option<String> = None;
     let mut file: Option<String> = None;
+    let mut wait_name: Option<String> = None;
+    let mut wait_value: Option<String> = None;
+    let mut timeout_secs: Option<u64> = None;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -57,6 +60,19 @@ fn run() -> Result<(), String> {
             "-f" => {
                 i += 1;
                 file = Some(arg_val(&args, i, "-f")?);
+            }
+            "--wait" => {
+                i += 1;
+                wait_name = Some(arg_val(&args, i, "--wait")?);
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    wait_value = Some(args[i].clone());
+                }
+            }
+            "--timeout" => {
+                i += 1;
+                let s = arg_val(&args, i, "--timeout")?;
+                timeout_secs = Some(s.parse::<u64>().map_err(|_| "--timeout requires a number".to_string())?);
             }
             "-h" | "--help" => {
                 print_usage();
@@ -106,6 +122,17 @@ fn run() -> Result<(), String> {
 
     if let Some(path) = file {
         return load_file(&sys, &path, init, verbose);
+    }
+
+    if let Some(ref name) = wait_name {
+        let timeout = timeout_secs.map(std::time::Duration::from_secs);
+        match sys.wait(name, wait_value.as_deref(), timeout) {
+            Some(val) => {
+                println!("{val}");
+                return Ok(());
+            }
+            None => return Err(format!("timeout waiting for {name}")),
+        }
     }
 
     match positional.len() {
@@ -245,6 +272,8 @@ Usage:
   resetprop -p --nuke|-nk NAME       Nuke from both prop_area and persist file
   resetprop --compact                Defragment arenas after deletes
   resetprop -f FILE                  Load properties from file (name=value)
+  resetprop --wait NAME [VALUE]      Wait for property to exist or equal VALUE
+  resetprop --timeout SECS           Timeout for --wait (default: forever)
   resetprop --dir PATH               Use custom property directory
 
 Options:

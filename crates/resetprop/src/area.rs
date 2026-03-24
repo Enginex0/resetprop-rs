@@ -175,6 +175,23 @@ impl PropArea {
         }
     }
 
+    pub(crate) fn futex_wait(
+        &self,
+        offset: usize,
+        expected: u32,
+        timeout: Option<&libc::timespec>,
+    ) -> i32 {
+        unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                self.base.add(offset) as *const u32,
+                libc::FUTEX_WAIT,
+                expected as i32,
+                timeout.map_or(std::ptr::null(), |t| t as *const _),
+            ) as i32
+        }
+    }
+
     pub fn bump_serial_and_wake(&self) {
         let s = self.serial();
         let old = s.load(Ordering::Acquire);

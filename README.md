@@ -25,7 +25,7 @@ Magisk's `resetprop` can manipulate these, but it's locked into Magisk's build s
 
 **resetprop-rs reimplements the entire property area format in pure Rust.** No bionic symbols. No Magisk dependency. Ships as a ~320KB static binary and an embeddable library crate.
 
-It also introduces operations no existing tool provides: `--stealth` for detection-resistant writes, `--nuke` for count-preserving stealth deletes, and `--hexpatch-delete` for dictionary-based name destruction.
+It also introduces operations no existing tool provides: `--stealth` for detection-resistant writes, `--nuke` for count-preserving stealth deletes, `--hexpatch-delete` for dictionary-based name destruction, and `--wait` for blocking property watches. Under the hood, it parses the `property_info` binary trie for O(depth) area resolution and dual-writes to Android 14+ `appcompat_override` areas automatically.
 
 ---
 
@@ -43,7 +43,7 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 
 ⚡ **Tiny Footprint** — ~320KB ARM64, ~240KB ARMv7. Hand-rolled CLI parser, `panic=abort`, LTO, single codegen unit. Only dependency: `libc`.
 
-🧪 **Tested Off-Device** — 50+ unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, stealth, nuke, compaction, trie integrity, serial preservation, name consistency, boundary conditions.
+🧪 **Tested Off-Device** — 60 unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, stealth, nuke, compaction, context parsing, trie integrity, serial preservation, name consistency, boundary conditions.
 
 ---
 
@@ -60,6 +60,7 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 - [x] **Compact** — `--compact` defragments arenas after deletes, reclaiming space
 - [x] **Persistent Properties** — `-p` writes to both memory and `/data/property/persistent_properties` on disk; `-P` reads directly from the persist file
 - [x] **Batch Load** — `-f` flag loads `name=value` pairs from file
+- [x] **Wait** — `--wait NAME [VALUE]` blocks until a property exists or matches, with optional `--timeout`
 - [x] **Privatize** — remap areas as `MAP_PRIVATE` for per-process COW isolation
 
 **Library API**
@@ -68,6 +69,10 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 - [x] **`PersistStore`** — read/write the on-disk persistent property store (protobuf + legacy format)
 - [x] **Typed errors** — `NotFound`, `AreaCorrupt`, `PermissionDenied`, `AreaFull`, `Io`, `ValueTooLong`, `PersistCorrupt`
 - [x] **RO fallback** — automatically falls back to read-only when write access is denied
+- [x] **Context-aware routing** — parses `property_info` binary trie for O(depth) area lookup instead of O(n) scan
+- [x] **appcompat_override** — dual-writes to Android 14+ override areas, preserving write mode (stealth, init, etc.)
+- [x] **Bionic fallback** — falls back to `__system_property_*` via dlsym when mmap reads are unavailable
+- [x] **Wait** — `PropSystem::wait()` blocks on property changes via bionic or futex
 
 **Format Support**
 - [x] **Short values** — ≤91 bytes, inline in prop_info
@@ -209,6 +214,19 @@ resetprop-rs --hexpatch-delete ro.lineage.version
 resetprop-rs --compact
 ```
 
+### Waiting for properties
+
+```sh
+# Wait for a property to exist (blocks until set by any process)
+resetprop-rs --wait sys.boot_completed
+
+# Wait for a property to equal a specific value
+resetprop-rs --wait sys.boot_completed 1
+
+# Wait with a timeout (exits with error if not met in time)
+resetprop-rs --wait ro.crypto.state encrypted --timeout 30
+```
+
 ### Options
 
 | Flag | Description |
@@ -223,6 +241,8 @@ resetprop-rs --compact
 | `--hexpatch-delete NAME` | Stealth delete with dictionary-based name replacement |
 | `--compact` | Defragment arenas after deletes |
 | `-f FILE` | Load `name=value` pairs from a file |
+| `--wait NAME [VALUE]` | Wait for property to exist or equal VALUE. Prints the value on success |
+| `--timeout SECS` | Timeout for `--wait` in seconds (default: no timeout, waits forever) |
 | `--dir PATH` | Use a custom property directory instead of `/dev/__properties__/` |
 | `-v` | Verbose output |
 | `-h, --help` | Show help |
@@ -234,7 +254,7 @@ resetprop-rs --compact
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-resetprop = "0.3"
+resetprop = "0.4"
 ```
 
 Or from git:
@@ -281,6 +301,12 @@ sys.hexpatch_delete("ro.custom.prop")?;
 
 // compact arenas after deletes
 sys.compact()?;
+
+// wait for a property to equal a value (30s timeout)
+use std::time::Duration;
+if let Some(val) = sys.wait("sys.boot_completed", Some("1"), Some(Duration::from_secs(30))) {
+    println!("boot completed: {val}");
+}
 
 // enumerate
 for (name, value) in sys.list() {
@@ -396,6 +422,26 @@ After:  ro.codec.charger = "0"
 5. Write mangled name to prop_info from the same chosen segments (single source of truth)
 6. Set value to `0` with correct serial encoding
 7. No serial bump, no futex wake
+
+### Context-Aware Area Resolution
+
+Android stores properties across multiple files in `/dev/__properties__/`, one per SELinux context. The file `property_info` is a binary trie that maps property name prefixes to the correct area file.
+
+resetprop-rs parses this trie on startup, enabling O(depth) lookup by property name instead of scanning every area file linearly. The algorithm walks the trie segment-by-segment (split on `.`), checking node contexts, prefix entries, child nodes, and exact matches at each level.
+
+On Android 8-9 (pre-serialized format), it falls back to parsing text `property_contexts` files. If neither is available, it falls back to the original linear scan.
+
+### appcompat_override (Android 14+)
+
+Android 14 introduced `/dev/__properties__/appcompat_override/`, a mirror directory containing duplicate property areas for app compatibility. When a property is set or deleted, the system writes to both the main area and the corresponding override file.
+
+resetprop-rs detects this directory and automatically dual-writes to the mirror when performing `set`, `set_init`, `set_stealth`, or `delete` operations. The override write uses the same mode as the main write (stealth for stealth, init for init). Override failures are silently ignored.
+
+### Bionic Fallback
+
+On Android, if a property can't be found via direct mmap (e.g., areas not directly accessible), resetprop-rs falls back to bionic's `__system_property_find` and `__system_property_read_callback` loaded via `dlsym` at runtime. This is a secondary path; the primary pure mmap path is always tried first.
+
+The `--wait` command also uses bionic's `__system_property_wait` when available, falling back to `futex_wait` on the property's serial address (or the global serial for properties that don't exist yet).
 
 ---
 

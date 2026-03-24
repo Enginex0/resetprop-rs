@@ -25,7 +25,11 @@ mod info;
 mod dict;
 mod harvest;
 mod compact;
+mod context;
+mod bionic;
 mod persist;
+mod appcompat;
+mod wait;
 pub mod inspect;
 #[cfg(test)]
 mod mock;
@@ -34,7 +38,7 @@ pub use error::{Error, Result};
 pub use area::PropArea;
 pub use persist::{PersistStore, Record};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -287,6 +291,9 @@ const SKIP_FILES: &[&str] = &["property_info", SERIAL_FILE];
 pub struct PropSystem {
     areas: Vec<(PathBuf, PropArea)>,
     serial_area: Option<(PathBuf, PropArea)>,
+    context: Option<context::PropertyContext>,
+    area_by_name: HashMap<String, usize>,
+    appcompat: Option<appcompat::AppcompatAreas>,
 }
 
 impl PropSystem {
@@ -326,7 +333,29 @@ impl PropSystem {
         let serial_path = dir.join(SERIAL_FILE);
         let serial_area = PropArea::open(&serial_path).ok().map(|a| (serial_path, a));
 
-        Ok(Self { areas, serial_area })
+        let ctx = context::PropertyContext::load(dir);
+
+        let mut area_by_name = HashMap::new();
+        for (i, (path, _)) in areas.iter().enumerate() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                area_by_name.insert(name.to_string(), i);
+            }
+        }
+
+        let override_dir = dir.join("appcompat_override");
+        let appcompat = if override_dir.is_dir() {
+            appcompat::AppcompatAreas::open(&override_dir)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            areas,
+            serial_area,
+            context: ctx,
+            area_by_name,
+            appcompat,
+        })
     }
 
     fn notify(&self) {
@@ -335,29 +364,71 @@ impl PropSystem {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<String> {
-        for (_, area) in &self.areas {
-            if let Some(val) = area.get(name) {
-                return Some(val);
+    fn find_area(&self, name: &str) -> Option<(usize, &PropArea)> {
+        if let Some(ref ctx) = self.context {
+            if let Some(filename) = ctx.resolve(name) {
+                if let Some(&idx) = self.area_by_name.get(filename) {
+                    if self.areas[idx].1.get(name).is_some() {
+                        return Some((idx, &self.areas[idx].1));
+                    }
+                }
+            }
+        }
+        for (i, (_, area)) in self.areas.iter().enumerate() {
+            if area.get(name).is_some() {
+                return Some((i, area));
             }
         }
         None
     }
 
-    pub fn set(&self, name: &str, value: &str) -> Result<()> {
-        for (_, area) in &self.areas {
-            if area.get(name).is_some() {
-                area.set(name, value)?;
-                self.notify();
-                return Ok(());
+    fn find_writable(&self, name: &str) -> Option<(usize, &PropArea)> {
+        if let Some(ref ctx) = self.context {
+            if let Some(filename) = ctx.resolve(name) {
+                if let Some(&idx) = self.area_by_name.get(filename) {
+                    if self.areas[idx].1.writable() {
+                        return Some((idx, &self.areas[idx].1));
+                    }
+                }
             }
         }
-        for (_, area) in &self.areas {
+        for (i, (_, area)) in self.areas.iter().enumerate() {
             if area.writable() {
-                area.set(name, value)?;
-                self.notify();
-                return Ok(());
+                return Some((i, area));
             }
+        }
+        None
+    }
+
+    fn appcompat_write(&self, area_idx: usize, op: impl Fn(&PropArea)) {
+        if let Some(ref compat) = self.appcompat {
+            if let Some(filename) = self.areas[area_idx].0.file_name().and_then(|n| n.to_str()) {
+                if let Some(mirror) = compat.mirror_for(filename) {
+                    op(mirror);
+                }
+            }
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<String> {
+        if let Some((_, area)) = self.find_area(name) {
+            return area.get(name);
+        }
+        bionic::get(name)
+    }
+
+    pub fn set(&self, name: &str, value: &str) -> Result<()> {
+        if let Some((idx, area)) = self.find_area(name) {
+            area.set(name, value)?;
+            self.appcompat_write(idx, |m| { let _ = m.set(name, value); });
+            self.notify();
+            return Ok(());
+        }
+        if let Some((idx, area)) = self.find_writable(name) {
+            area.set(name, value)?;
+            self.appcompat_write(idx, |m| { let _ = m.set(name, value); });
+            self.notify();
+            return Ok(());
         }
         Err(Error::PermissionDenied(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -366,19 +437,17 @@ impl PropSystem {
     }
 
     pub fn set_init(&self, name: &str, value: &str) -> Result<()> {
-        for (_, area) in &self.areas {
-            if area.get(name).is_some() {
-                area.set_init(name, value)?;
-                self.notify();
-                return Ok(());
-            }
+        if let Some((idx, area)) = self.find_area(name) {
+            area.set_init(name, value)?;
+            self.appcompat_write(idx, |m| { let _ = m.set_init(name, value); });
+            self.notify();
+            return Ok(());
         }
-        for (_, area) in &self.areas {
-            if area.writable() {
-                area.set_init(name, value)?;
-                self.notify();
-                return Ok(());
-            }
+        if let Some((idx, area)) = self.find_writable(name) {
+            area.set_init(name, value)?;
+            self.appcompat_write(idx, |m| { let _ = m.set_init(name, value); });
+            self.notify();
+            return Ok(());
         }
         Err(Error::PermissionDenied(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -387,17 +456,15 @@ impl PropSystem {
     }
 
     pub fn set_stealth(&self, name: &str, value: &str) -> Result<()> {
-        for (_, area) in &self.areas {
-            if area.get(name).is_some() {
-                area.set_stealth(name, value)?;
-                return Ok(());
-            }
+        if let Some((idx, area)) = self.find_area(name) {
+            area.set_stealth(name, value)?;
+            self.appcompat_write(idx, |m| { let _ = m.set_stealth(name, value); });
+            return Ok(());
         }
-        for (_, area) in &self.areas {
-            if area.writable() {
-                area.set_stealth(name, value)?;
-                return Ok(());
-            }
+        if let Some((idx, area)) = self.find_writable(name) {
+            area.set_stealth(name, value)?;
+            self.appcompat_write(idx, |m| { let _ = m.set_stealth(name, value); });
+            return Ok(());
         }
         Err(Error::PermissionDenied(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -406,15 +473,13 @@ impl PropSystem {
     }
 
     pub fn delete(&self, name: &str) -> Result<bool> {
-        for (_, area) in &self.areas {
-            match area.delete(name) {
-                Ok(true) => {
-                    self.notify();
-                    return Ok(true);
-                }
-                Ok(false) => continue,
-                Err(e) => return Err(e),
+        if let Some((idx, area)) = self.find_area(name) {
+            let deleted = area.delete(name)?;
+            if deleted {
+                self.appcompat_write(idx, |m| { let _ = m.delete(name); });
+                self.notify();
             }
+            return Ok(deleted);
         }
         Ok(false)
     }
@@ -499,6 +564,9 @@ impl PropSystem {
             area.foreach(|name, value| {
                 result.push((name.to_string(), value.to_string()));
             });
+        }
+        if result.is_empty() && bionic::available() {
+            result = bionic::foreach();
         }
         result.sort_by(|a, b| a.0.cmp(&b.0));
         result
