@@ -24,7 +24,9 @@ mod trie;
 mod info;
 mod dict;
 mod harvest;
+mod compact;
 mod persist;
+pub mod inspect;
 #[cfg(test)]
 mod mock;
 
@@ -70,6 +72,18 @@ impl PropArea {
         }
     }
 
+    /// Like [`set_init`](Self::set_init), but also suppresses the futex wake signal.
+    pub fn set_stealth(&self, name: &str, value: &str) -> Result<()> {
+        match trie::find(self, name) {
+            Ok((pi_offset, _)) => {
+                let pi = info::PropInfo::at(self, pi_offset)?;
+                pi.write_value_quiet(value)
+            }
+            Err(Error::NotFound) => self.add(name, value),
+            Err(e) => Err(e),
+        }
+    }
+
     fn validate_key(name: &str) -> Result<()> {
         if name.is_empty() || name.starts_with('.') || name.ends_with('.') || name.contains("..") {
             return Err(Error::InvalidKey);
@@ -108,8 +122,9 @@ impl PropArea {
         }
     }
 
-    /// Deletes a property by detaching its trie node and zeroing its value and name.
-    /// Returns `Ok(false)` if the property was not found.
+    /// Deletes a property by detaching its trie node, wiping the prop_info
+    /// record (long value, name, and full 96-byte header), then pruning
+    /// orphaned trie leaves. Returns `Ok(false)` if the property was not found.
     pub fn delete(&self, name: &str) -> Result<bool> {
         let (pi_offset, node_offset) = match trie::find(self, name) {
             Ok(v) => v,
@@ -117,24 +132,12 @@ impl PropArea {
             Err(e) => return Err(e),
         };
 
-        // detach prop_info from trie node
         self.atomic_u32(node_offset + 4).store(0, Ordering::Release);
 
-        // wipe prop_info value and name
         let pi = info::PropInfo::at(self, pi_offset)?;
-        pi.zero_value()?;
+        pi.wipe()?;
 
-        // zero the name in prop_info
-        let name_start = pi_offset + 96;
-        if let Some(ptr) = self.ptr_at(name_start) {
-            unsafe {
-                let mut i = 0;
-                while name_start + i < self.len() && *ptr.add(i) != 0 {
-                    *ptr.add(i) = 0;
-                    i += 1;
-                }
-            }
-        }
+        trie::prune(self);
 
         Ok(true)
     }
@@ -227,6 +230,31 @@ impl PropArea {
         } else {
             false
         }
+    }
+
+    /// Defragments the arena by sliding live allocations forward to fill holes
+    /// left by deleted properties. Returns `Ok(true)` if any compaction occurred.
+    pub fn compact(&self) -> Result<bool> {
+        compact::compact(self)
+    }
+
+    /// Count-preserving stealth delete: removes the property, inserts a plausible
+    /// replacement, and compacts the arena. Returns `Ok(false)` if not found.
+    pub fn nuke(&self, name: &str) -> Result<bool> {
+        if !self.delete(name)? {
+            return Ok(false);
+        }
+
+        let mut exclude: HashSet<String> = HashSet::new();
+        self.foreach(|n, _| {
+            exclude.insert(n.to_string());
+        });
+        exclude.insert(name.to_string());
+
+        let replacement = harvest::generate_name(self, &exclude);
+        self.set_stealth(&replacement, "0")?;
+        self.compact()?;
+        Ok(true)
     }
 
     /// Iterates over all properties in this area, calling `cb(name, value)` for each.
@@ -358,6 +386,25 @@ impl PropSystem {
         )))
     }
 
+    pub fn set_stealth(&self, name: &str, value: &str) -> Result<()> {
+        for (_, area) in &self.areas {
+            if area.get(name).is_some() {
+                area.set_stealth(name, value)?;
+                return Ok(());
+            }
+        }
+        for (_, area) in &self.areas {
+            if area.writable() {
+                area.set_stealth(name, value)?;
+                return Ok(());
+            }
+        }
+        Err(Error::PermissionDenied(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no writable property area",
+        )))
+    }
+
     pub fn delete(&self, name: &str) -> Result<bool> {
         for (_, area) in &self.areas {
             match area.delete(name) {
@@ -379,6 +426,15 @@ impl PropSystem {
         store.set(name, value)
     }
 
+    /// Stealth-sets a property in the mmap'd area and writes it to the on-disk persist store.
+    ///
+    /// Combines `set_stealth` (no serial bump or futex wake) with persist-to-disk.
+    pub fn set_stealth_persist(&self, name: &str, value: &str) -> Result<()> {
+        self.set_stealth(name, value)?;
+        let mut store = PersistStore::load()?;
+        store.set(name, value)
+    }
+
     /// Deletes a property from both the mmap'd area and the on-disk persist store.
     pub fn delete_persist(&self, name: &str) -> Result<bool> {
         let mem = self.delete(name)?;
@@ -396,6 +452,37 @@ impl PropSystem {
             }
         }
         Ok(false)
+    }
+
+    /// Count-preserving stealth delete across all areas.
+    pub fn nuke(&self, name: &str) -> Result<bool> {
+        for (_, area) in &self.areas {
+            match area.nuke(name) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Compacts all writable areas, reclaiming space from deleted properties.
+    /// Returns the number of areas that were actually compacted.
+    pub fn compact(&self) -> Result<usize> {
+        let mut count = 0;
+        for (_, area) in &self.areas {
+            if area.writable() && area.compact()? {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.notify();
+        }
+        Ok(count)
+    }
+
+    pub fn areas(&self) -> &[(PathBuf, PropArea)] {
+        &self.areas
     }
 
     /// Returns all properties across all areas, sorted by name.

@@ -36,8 +36,8 @@ impl MockArea {
 fn create_empty_area(path: &Path) {
     let mut buf = vec![0u8; AREA_SIZE];
 
-    // root trie node: namelen=0, 20 fixed bytes + 1 null + 3 pad = 24 bytes
-    let root_size: u32 = 24;
+    // root trie node: namelen=0, 20 fixed bytes (bionic standard)
+    let root_size: u32 = 20;
     buf[0..4].copy_from_slice(&root_size.to_ne_bytes());
     buf[8..12].copy_from_slice(&PROP_AREA_MAGIC.to_ne_bytes());
     buf[12..16].copy_from_slice(&PROP_AREA_VERSION.to_ne_bytes());
@@ -413,6 +413,105 @@ mod tests {
     }
 
     #[test]
+    fn prune_removes_orphan_leaves() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("a.b.c", "val").unwrap();
+        area.delete("a.b.c").unwrap();
+
+        let nodes = area.inspect_trie();
+        let orphans: Vec<_> = nodes.iter()
+            .filter(|n| n.prop_offset == 0 && !n.has_children)
+            .collect();
+        assert!(orphans.is_empty(), "found {} orphan leaves after prune", orphans.len());
+    }
+
+    #[test]
+    fn prune_preserves_siblings() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.build.type", "user").unwrap();
+        area.set("ro.build.tags", "release-keys").unwrap();
+        area.set("ro.lineage.version", "19.1").unwrap();
+
+        area.delete("ro.lineage.version").unwrap();
+
+        assert_eq!(area.get("ro.build.type").unwrap(), "user");
+        assert_eq!(area.get("ro.build.tags").unwrap(), "release-keys");
+        assert!(area.get("ro.lineage.version").is_none());
+    }
+
+    #[test]
+    fn compact_reclaims_space() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("a.b", "1").unwrap();
+        area.set("c.d", "2").unwrap();
+        area.set("e.f", "3").unwrap();
+
+        let before = area.arena_stats().bytes_used;
+
+        area.delete("c.d").unwrap();
+        area.compact().unwrap();
+
+        assert!(area.arena_stats().bytes_used < before,
+            "bytes_used did not decrease after compact");
+        assert_eq!(area.get("a.b").unwrap(), "1");
+        assert_eq!(area.get("e.f").unwrap(), "3");
+        assert!(area.get("c.d").is_none());
+    }
+
+    #[test]
+    fn compact_preserves_all_live_props() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        for i in 0..20 {
+            area.set(&format!("test.prop{i}"), &format!("value{i}")).unwrap();
+        }
+
+        for i in (0..20).step_by(2) {
+            area.delete(&format!("test.prop{i}")).unwrap();
+        }
+
+        area.compact().unwrap();
+
+        for i in (1..20).step_by(2) {
+            assert_eq!(
+                area.get(&format!("test.prop{i}")).unwrap(),
+                format!("value{i}"),
+                "odd prop {i} missing after compact"
+            );
+        }
+        for i in (0..20).step_by(2) {
+            assert!(area.get(&format!("test.prop{i}")).is_none(),
+                "even prop {i} still present after compact");
+        }
+
+        let mut count = 0;
+        area.foreach(|_, _| count += 1);
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn compact_noop_on_clean_arena() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("x.y", "1").unwrap();
+        area.set("z.w", "2").unwrap();
+
+        let before = area.arena_stats().bytes_used;
+        let changed = area.compact().unwrap();
+
+        assert!(!changed, "compact reported change on clean arena");
+        assert_eq!(area.arena_stats().bytes_used, before);
+    }
+
+    #[test]
     fn hexpatch_duplicate_length_segments() {
         let mock = MockArea::new();
         let area = mock.open();
@@ -523,5 +622,173 @@ mod tests {
             assert!(!name.ends_with('.'));
             assert!(!name.contains(".."));
         });
+    }
+
+    #[test]
+    fn nuke_maintains_count() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.build.type", "user").unwrap();
+        area.set("vendor.display.brightness", "128").unwrap();
+        area.set("persist.sys.timezone", "UTC").unwrap();
+        area.set("ro.hardware", "qcom").unwrap();
+        area.set("dalvik.vm.heapsize", "512m").unwrap();
+
+        let before = {
+            let mut c = 0;
+            area.foreach(|_, _| c += 1);
+            c
+        };
+        assert_eq!(before, 5);
+
+        area.nuke("vendor.display.brightness").unwrap();
+
+        let after = {
+            let mut c = 0;
+            area.foreach(|_, _| c += 1);
+            c
+        };
+        assert_eq!(after, 5);
+        assert!(area.get("vendor.display.brightness").is_none());
+    }
+
+    #[test]
+    fn nuke_original_gone() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.lineage.version", "19.1").unwrap();
+        area.nuke("ro.lineage.version").unwrap();
+
+        assert!(area.get("ro.lineage.version").is_none());
+
+        let mut has_old_value = false;
+        area.foreach(|_, v| {
+            if v == "19.1" {
+                has_old_value = true;
+            }
+        });
+        assert!(!has_old_value, "old value '19.1' still present in area");
+    }
+
+    #[test]
+    fn nuke_replacement_readable() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        let originals = ["ro.build.type", "vendor.display.config", "persist.sys.tz"];
+        area.set(originals[0], "user").unwrap();
+        area.set(originals[1], "1").unwrap();
+        area.set(originals[2], "UTC").unwrap();
+
+        area.nuke(originals[1]).unwrap();
+
+        let orig_set: std::collections::HashSet<&str> = originals.iter().copied().collect();
+        let mut replacement_name = None;
+        area.foreach(|n, v| {
+            if !orig_set.contains(n) {
+                replacement_name = Some((n.to_string(), v.to_string()));
+            }
+        });
+
+        let (name, value) = replacement_name.expect("no replacement prop found");
+        assert_eq!(value, "0");
+
+        let (pi_off, _) = crate::trie::find(&area, &name).unwrap();
+        let serial = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(serial, 1u32 << 24, "replacement serial should be (1<<24) for value '0'");
+    }
+
+    #[test]
+    fn nuke_compacted() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        for i in 0..10 {
+            area.set(&format!("test.prop.p{i}"), &format!("val{i}")).unwrap();
+        }
+
+        let before = area.arena_stats().bytes_used;
+
+        area.nuke("test.prop.p2").unwrap();
+        area.nuke("test.prop.p5").unwrap();
+        area.nuke("test.prop.p8").unwrap();
+
+        let after = area.arena_stats().bytes_used;
+        let growth = after.saturating_sub(before);
+        assert!(growth < 512, "bytes_used grew too much: {} -> {} (+{})", before, after, growth);
+
+        let mut count = 0;
+        area.foreach(|n, _| {
+            assert!(area.get(n).is_some(), "prop '{}' not readable", n);
+            count += 1;
+        });
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn nuke_nonexistent_returns_false() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.existing", "val").unwrap();
+        let result = area.nuke("no.such.prop").unwrap();
+        assert!(!result);
+
+        assert_eq!(area.get("ro.existing").unwrap(), "val");
+
+        let mut count = 0;
+        area.foreach(|_, _| count += 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn set_stealth_zeroed_serial() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.test.prop", "hello").unwrap();
+        area.set("ro.test.prop", "hello").unwrap();
+
+        let (pi_off, _) = crate::trie::find(&area, "ro.test.prop").unwrap();
+        let serial_before = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let counter_before = serial_before & 0x00FE_FFFE;
+        assert_ne!(counter_before, 0, "counter should be non-zero after overwrite");
+
+        area.set_stealth("ro.test.prop", "world").unwrap();
+
+        let serial_after = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(serial_after, 5u32 << 24, "serial should be (5<<24) for 'world' with zeroed counter");
+        assert_eq!(area.get("ro.test.prop").unwrap(), "world");
+    }
+
+    #[test]
+    fn set_stealth_creates_new() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set_stealth("vendor.new.prop", "test_val").unwrap();
+
+        assert_eq!(area.get("vendor.new.prop").unwrap(), "test_val");
+
+        let (pi_off, _) = crate::trie::find(&area, "vendor.new.prop").unwrap();
+        let serial = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(serial, 8u32 << 24, "serial should be (8<<24) for 8-char value");
+    }
+
+    #[test]
+    fn set_stealth_overwrites() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("persist.sys.tz", "UTC").unwrap();
+        area.set_stealth("persist.sys.tz", "EST").unwrap();
+
+        assert_eq!(area.get("persist.sys.tz").unwrap(), "EST");
+
+        let mut count = 0;
+        area.foreach(|_, _| count += 1);
+        assert_eq!(count, 1);
     }
 }

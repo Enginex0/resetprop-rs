@@ -115,6 +115,59 @@ pub(crate) fn compound_generate(len: usize, used: &HashSet<Vec<u8>>) -> Vec<u8> 
     buf
 }
 
+pub(crate) fn generate_name(area: &PropArea, exclude: &HashSet<String>) -> String {
+    let mut names = Vec::new();
+    area.foreach(|name, _| names.push(name.to_string()));
+    let existing: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+
+    let mut prefix_counts: HashMap<&str, usize> = HashMap::new();
+    for name in &names {
+        if let Some(pos) = name.rfind('.') {
+            *prefix_counts.entry(&name[..=pos]).or_default() += 1;
+        }
+    }
+
+    let best = prefix_counts
+        .iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(p, _)| *p);
+
+    let fallbacks: &[&str] = &["sys.", "vendor."];
+    let prefixes: Vec<&str> = match best {
+        Some(p) => std::iter::once(p).chain(fallbacks.iter().copied()).collect(),
+        None => fallbacks.to_vec(),
+    };
+
+    let pool = SegmentPool::from_area(area);
+    let empty = HashSet::new();
+
+    for pfx in &prefixes {
+        for len in 4..=7 {
+            let template = vec![b'x'; len];
+            if let Some(leaf) = dict::replacement(&template, &empty) {
+                let full = format!("{pfx}{}", String::from_utf8_lossy(&leaf));
+                if !exclude.contains(&full) && !existing.contains(full.as_str()) {
+                    return full;
+                }
+            }
+            if let Some(leaf) = pool.pick(len, &empty) {
+                let full = format!("{pfx}{}", String::from_utf8_lossy(&leaf));
+                if !exclude.contains(&full) && !existing.contains(full.as_str()) {
+                    return full;
+                }
+            }
+        }
+    }
+
+    for i in 0u32.. {
+        let full = format!("sys.svc{i}");
+        if !exclude.contains(&full) && !existing.contains(full.as_str()) {
+            return full;
+        }
+    }
+    unreachable!()
+}
+
 // join 2/3-char stems with dots to hit exact target length
 fn dot_split(len: usize, used: &HashSet<Vec<u8>>) -> Option<Vec<u8>> {
     // k segments with (k-1) dots: min = 2k+(k-1) = 3k-1, max = 3k+(k-1) = 4k-1
