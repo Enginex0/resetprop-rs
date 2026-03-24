@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">🔧 resetprop-rs</h1>
   <p align="center"><b>Pure Rust Android Property Manipulation</b></p>
-  <p align="center">Get. Set. Delete. Hexpatch. No Magisk required.</p>
+  <p align="center">Get. Set. Delete. Stealth. Nuke. No Magisk required.</p>
   <p align="center">
     <img src="https://img.shields.io/badge/version-v0.3.1-blue?style=for-the-badge" alt="v0.3.1">
     <img src="https://img.shields.io/badge/Android-10%2B-green?style=for-the-badge&logo=android" alt="Android 10+">
@@ -25,7 +25,7 @@ Magisk's `resetprop` can manipulate these, but it's locked into Magisk's build s
 
 **resetprop-rs reimplements the entire property area format in pure Rust.** No bionic symbols. No Magisk dependency. Ships as a ~320KB static binary and an embeddable library crate.
 
-It also introduces `--hexpatch-delete` — a stealth operation that no existing tool provides.
+It also introduces operations no existing tool provides: `--stealth` for detection-resistant writes, `--nuke` for count-preserving stealth deletes, and `--hexpatch-delete` for dictionary-based name destruction.
 
 ---
 
@@ -33,13 +33,17 @@ It also introduces `--hexpatch-delete` — a stealth operation that no existing 
 
 🔓 **Truly Standalone** — Zero runtime dependencies. No Magisk, no forked libc, no JNI. A single static binary that works on any rooted Android device.
 
-🥷 **Hexpatch Delete** — Instead of detaching trie nodes (detectable by enumeration gaps), overwrites property name bytes with realistic dictionary words. Trie structure stays intact. Serial counters preserved. Invisible to `__system_property_foreach`.
+🥷 **Stealth Set** — Writes property values with zeroed serial counter, no global serial bump, and no futex wake. To detection apps, the property looks like it was written by `init` at boot. Combine with `-p` for stealth persist to disk.
+
+💀 **Nuke** — Count-preserving stealth delete. Removes the target property, inserts a plausible replacement (drawn from the device's own property vocabulary), and compacts the arena. Property count stays identical. Zero forensic traces.
+
+🔮 **Hexpatch Delete** — Overwrites property name bytes with realistic dictionary words instead of detaching trie nodes. Trie structure stays intact. Serial counters preserved. Invisible to `__system_property_foreach`.
 
 📦 **Embeddable Library** — `resetprop` crate with typed errors, no `anyhow`. Drop it into your Rust project and manipulate properties programmatically.
 
 ⚡ **Tiny Footprint** — ~320KB ARM64, ~240KB ARMv7. Hand-rolled CLI parser, `panic=abort`, LTO, single codegen unit. Only dependency: `libc`.
 
-🧪 **Tested Off-Device** — 29 unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, trie integrity, serial preservation, name consistency, boundary conditions.
+🧪 **Tested Off-Device** — 50+ unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, stealth, nuke, compaction, trie integrity, serial preservation, name consistency, boundary conditions.
 
 ---
 
@@ -49,14 +53,17 @@ It also introduces `--hexpatch-delete` — a stealth operation that no existing 
 - [x] **Get** — single property or list all
 - [x] **Set** — direct mmap write, bypasses `property_service`
 - [x] **Set (init-style)** — `--init` zeros the serial counter, mimicking how `init` writes `ro.*` props at boot
-- [x] **Delete** — trie node detach + value/name wipe
+- [x] **Stealth Set** — `--stealth` / `-st` suppresses serial bump, global serial, and futex wake. Combine with `-p` for stealth persist
+- [x] **Delete** — trie node detach + value/name wipe + orphan pruning
 - [x] **Hexpatch Delete** — dictionary-based name destruction, serial-preserving
+- [x] **Nuke** — `--nuke` / `-nk` count-preserving stealth delete (delete + replacement + compact in one atomic operation)
+- [x] **Compact** — `--compact` defragments arenas after deletes, reclaiming space
 - [x] **Persistent Properties** — `-p` writes to both memory and `/data/property/persistent_properties` on disk; `-P` reads directly from the persist file
 - [x] **Batch Load** — `-f` flag loads `name=value` pairs from file
 - [x] **Privatize** — remap areas as `MAP_PRIVATE` for per-process COW isolation
 
 **Library API**
-- [x] **`PropArea`** — single property file: open, get, set, delete, hexpatch, foreach
+- [x] **`PropArea`** — single property file: open, get, set, set_stealth, delete, nuke, hexpatch, compact, foreach
 - [x] **`PropSystem`** — multi-file scan across `/dev/__properties__/`
 - [x] **`PersistStore`** — read/write the on-disk persistent property store (protobuf + legacy format)
 - [x] **Typed errors** — `NotFound`, `AreaCorrupt`, `PermissionDenied`, `AreaFull`, `Io`, `ValueTooLong`, `PersistCorrupt`
@@ -69,14 +76,16 @@ It also introduces `--hexpatch-delete` — a stealth operation that no existing 
 - [x] **Length-first comparison** — matches AOSP's `cmp_prop_name` exactly
 
 **Stealth**
-- [x] **Runtime harvest** — replacement segments drawn from the device's own property vocabulary (unfingerprintable)
+- [x] **Three-signal suppression** — stealth writes zero per-prop serial, skip global serial bump, and suppress futex wake
+- [x] **Count-preserving nuke** — delete + plausible replacement + compaction in one operation; enumeration count unchanged
+- [x] **Runtime harvest** — replacement names drawn from the device's own property vocabulary (unfingerprintable)
 - [x] **Randomized selection** — OS-seeded entropy picks different names each run
 - [x] **3-tier fallback** — harvest pool → static dictionary (~95 words) → dot-split compound generation
-- [x] **Plausible value** — mangled properties show value `0` instead of empty string
+- [x] **Plausible value** — replaced/mangled properties show value `0` instead of empty string
 - [x] **Name consistency** — trie segments and prop_info name written from same source (no cross-validation mismatch)
 - [x] **Length-bucketed** — replacement is always exact same byte length as original
 - [x] **Shared segment detection** — skips renaming prefixes used by other properties
-- [x] **No serial bump** — preserves counter bits, avoiding NativeTest detection
+- [x] **Arena compaction** — defragments holes left by deleted properties, eliminating forensic gaps
 
 ---
 
@@ -119,11 +128,12 @@ If you bundle this binary in a KSU module or boot script, always call it by **fu
 
 ```sh
 RESETPROP="/data/adb/modules/mymodule/resetprop-rs"
-$RESETPROP -n ro.build.type user
-$RESETPROP --hexpatch-delete ro.lineage.version
+$RESETPROP -st ro.build.type user        # stealth set
+$RESETPROP -nk ro.lineage.version        # count-preserving delete
+$RESETPROP -st -p persist.sys.timezone UTC  # stealth + persist
 ```
 
-Do **not** rely on bare `resetprop` in scripts. It will silently use KSU/Magisk's version, which lacks `--hexpatch-delete`, `--init`, `-p`, and `-P`.
+Do **not** rely on bare `resetprop` in scripts. It will silently use KSU/Magisk's version, which lacks `--stealth`, `--nuke`, `--hexpatch-delete`, `--init`, `-p`, and `-P`.
 
 ---
 
@@ -161,6 +171,14 @@ resetprop-rs --init ro.build.fingerprint "google/raven/raven:14/..."
 # Set and persist to disk (survives reboot)
 resetprop-rs -p persist.sys.timezone UTC
 
+# Stealth set (zeroed serial, no global serial bump, no futex wake)
+resetprop-rs --stealth ro.build.type user
+resetprop-rs -st ro.build.type user          # short alias
+
+# Stealth set + persist to disk
+resetprop-rs --stealth -p persist.sys.timezone UTC
+resetprop-rs -st -p persist.sys.timezone UTC  # short alias
+
 # Batch set from file (one name=value per line, # comments allowed)
 resetprop-rs -f props.txt
 
@@ -171,14 +189,21 @@ resetprop-rs --init -f props.txt
 ### Deleting properties
 
 ```sh
-# Delete (detaches trie node, zeroes value and name)
+# Delete (detaches trie node, zeroes value and name, prunes orphans)
 resetprop-rs -d ro.debuggable
 
 # Delete from both memory and persist file
 resetprop-rs -p -d persist.sys.timezone
 
-# Stealth delete (replaces name with dictionary words, keeps trie intact)
+# Nuke: count-preserving stealth delete (delete + replacement + compact)
+resetprop-rs --nuke ro.lineage.version
+resetprop-rs -nk ro.lineage.version          # short alias
+
+# Hexpatch delete (replaces name with dictionary words, keeps trie intact)
 resetprop-rs --hexpatch-delete ro.lineage.version
+
+# Compact arenas (reclaim space from deleted properties)
+resetprop-rs --compact
 ```
 
 ### Options
@@ -187,10 +212,13 @@ resetprop-rs --hexpatch-delete ro.lineage.version
 |------|-------------|
 | `-n` | No-op (compatibility with Magisk's resetprop) |
 | `--init` | Zero the serial counter when writing (mimics init for `ro.*` properties) |
+| `--stealth`, `-st` | Stealth set: zeroed serial, no global serial bump, no futex wake |
 | `-p` | Persist mode: write/delete affects both memory and `/data/property/` on disk |
 | `-P` | Read from the persist file on disk, not from the mmap'd property area |
 | `-d NAME` | Delete a property |
+| `--nuke NAME`, `-nk NAME` | Count-preserving stealth delete (delete + replacement + compact) |
 | `--hexpatch-delete NAME` | Stealth delete with dictionary-based name replacement |
+| `--compact` | Defragment arenas after deletes |
 | `-f FILE` | Load `name=value` pairs from a file |
 | `--dir PATH` | Use a custom property directory instead of `/dev/__properties__/` |
 | `-v` | Verbose output |
@@ -228,6 +256,12 @@ sys.set("ro.build.type", "user")?;
 // write with zeroed serial (mimics init for ro.* props)
 sys.set_init("ro.build.fingerprint", "google/raven/...")?;
 
+// stealth write (zeroed serial, no global serial bump, no futex wake)
+sys.set_stealth("ro.build.type", "user")?;
+
+// stealth write + persist to disk
+sys.set_stealth_persist("persist.sys.timezone", "UTC")?;
+
 // write to both memory and disk
 sys.set_persist("persist.sys.timezone", "UTC")?;
 
@@ -235,8 +269,14 @@ sys.set_persist("persist.sys.timezone", "UTC")?;
 sys.delete("ro.debuggable")?;
 sys.delete_persist("persist.sys.timezone")?;
 
-// stealth delete
-sys.hexpatch_delete("ro.lineage.version")?;
+// nuke: count-preserving stealth delete
+sys.nuke("ro.lineage.version")?;
+
+// hexpatch delete (dictionary-based name destruction)
+sys.hexpatch_delete("ro.custom.prop")?;
+
+// compact arenas after deletes
+sys.compact()?;
 
 // enumerate
 for (name, value) in sys.list() {
@@ -305,9 +345,40 @@ Each file in `/dev/__properties__/` is a 128KB mmap'd arena:
 
 Property names split on dots into a prefix trie. Each trie level uses a BST for siblings, compared **length-first then lexicographically** (not standard strcmp).
 
+### Stealth Set
+
+Standard `set()` bumps three detection signals: per-property serial, global serial (via `notify()`), and futex wake. Any monitoring app can observe these. Stealth set suppresses all three:
+
+```
+resetprop-rs --stealth ro.build.type user
+```
+
+1. Write value with zeroed serial counter (`(value.len() << 24)`, same encoding as `init`)
+2. Skip `notify()` entirely (no global serial bump via `bump_serial_and_wake`)
+3. Skip `futex_wake()` on the property's serial address
+4. New properties created via stealth are already silent (the allocation path never wakes)
+
+The result is indistinguishable from a property written by `init` at boot. Combine with `-p` to also persist to `/data/property/persistent_properties`.
+
+### Nuke (Count-Preserving Delete)
+
+Standard delete leaves a gap in the enumeration count. Hexpatch preserves count but leaves renamed trie segments. Nuke achieves both: zero artifacts AND preserved count.
+
+```
+Before: ro.lineage.version = "18.1"  (2389 props total)
+After:  (original gone, plausible replacement added, 2389 props total)
+```
+
+1. Delete the target property (detach trie node, wipe prop_info, prune orphans)
+2. Scan the area for existing property prefixes, pick the busiest prefix (most natural to add a sibling)
+3. Generate a plausible leaf segment (harvest pool → dictionary → compound generation)
+4. Insert the replacement via stealth write with value `"0"` (zeroed serial, no wake)
+5. Compact the arena to eliminate holes from the deletion
+6. Net result: target gone, replacement blends in, count unchanged, no detection signals fired
+
 ### Hexpatch Delete
 
-Standard delete detaches the trie node — but apps enumerating properties can detect the gap. Hexpatch delete takes a different approach:
+An alternative stealth delete that keeps the trie structure intact by overwriting name bytes in-place:
 
 ```
 Before: ro.lineage.version = "18.1"
@@ -319,8 +390,8 @@ After:  ro.codec.charger = "0"
 3. For each non-shared segment, pick a same-length replacement (harvest → dict → dot-split compound)
 4. Overwrite name bytes in-place, randomized selection each run
 5. Write mangled name to prop_info from the same chosen segments (single source of truth)
-6. Set value to `0` with correct serial encoding — indistinguishable from a boot-time property
-7. **Do not bump the serial counter** — avoids NativeTest serial-monitoring detection
+6. Set value to `0` with correct serial encoding
+7. No serial bump, no futex wake
 
 ---
 
