@@ -19,9 +19,12 @@ fn run() -> Result<(), String> {
     let mut init = false;
     let mut persist = false;
     let mut persist_read = false;
+    let mut stealth = false;
+    let mut compact = false;
     let mut dir: Option<String> = None;
     let mut delete: Option<String> = None;
     let mut hexpatch: Option<String> = None;
+    let mut nuke: Option<String> = None;
     let mut file: Option<String> = None;
     let mut positional = Vec::new();
 
@@ -41,6 +44,12 @@ fn run() -> Result<(), String> {
                 i += 1;
                 hexpatch = Some(arg_val(&args, i, "--hexpatch-delete")?);
             }
+            "--nuke" | "-nk" => {
+                i += 1;
+                nuke = Some(arg_val(&args, i, "--nuke")?);
+            }
+            "--stealth" | "-st" => stealth = true,
+            "--compact" => compact = true,
             "--dir" => {
                 i += 1;
                 dir = Some(arg_val(&args, i, "--dir")?);
@@ -73,6 +82,18 @@ fn run() -> Result<(), String> {
         return bool_op(sys.hexpatch_delete(&name), &name, "hexpatch", verbose);
     }
 
+    if let Some(name) = nuke {
+        return bool_op(sys.nuke(&name), &name, "nuked", verbose);
+    }
+
+    if compact {
+        let count = sys.compact().map_err(|e| format!("compact failed: {e}"))?;
+        if verbose {
+            eprintln!("compacted {count} area(s)");
+        }
+        return Ok(());
+    }
+
     if let Some(ref name) = delete {
         if persist {
             return bool_op(sys.delete_persist(name), name, "deleted(persist)", verbose);
@@ -95,8 +116,12 @@ fn run() -> Result<(), String> {
             None => return Err(format!("property not found: {}", positional[0])),
         },
         2 => {
-            if persist {
+            if persist && stealth {
+                sys.set_stealth_persist(&positional[0], &positional[1])
+            } else if persist {
                 sys.set_persist(&positional[0], &positional[1])
+            } else if stealth {
+                sys.set_stealth(&positional[0], &positional[1])
             } else if init {
                 sys.set_init(&positional[0], &positional[1])
             } else {
@@ -104,7 +129,17 @@ fn run() -> Result<(), String> {
             }
             .map_err(|e| format!("failed to set {}: {e}", positional[0]))?;
             if verbose {
-                let mode = if persist { "(persist)" } else if init { "(init)" } else { "" };
+                let mode = if persist && stealth {
+                    "(stealth+persist)"
+                } else if persist {
+                    "(persist)"
+                } else if stealth {
+                    "(stealth)"
+                } else if init {
+                    "(init)"
+                } else {
+                    ""
+                };
                 eprintln!("set{mode}: [{}]=[{}]", positional[0], positional[1]);
             }
         }
@@ -200,7 +235,11 @@ Usage:
   resetprop -p -d NAME               Delete from both prop_area and persist file
   resetprop -P                       List persist properties from disk
   resetprop -P NAME                  Get persist property from disk
+  resetprop --stealth|-st NAME VALUE     Set with zeroed serial, no wake signals
+  resetprop --stealth|-st -p NAME VALUE  Set stealth + persist to disk
   resetprop --hexpatch-delete NAME   Stealth delete (name destruction)
+  resetprop --nuke|-nk NAME          Count-preserving stealth delete
+  resetprop --compact                Defragment arenas after deletes
   resetprop -f FILE                  Load properties from file (name=value)
   resetprop --dir PATH               Use custom property directory
 
@@ -208,6 +247,8 @@ Options:
   -p          Persist mode (write to both prop_area and disk)
   -P          Disk-only read (read from persist file, not prop_area)
   --init      Zero the serial counter (mimics init for ro.* props)
+  --stealth, -st  Suppress serial bump and futex wake (init-time appearance)
+  --compact   Reclaim arena space left by deleted properties
   -v          Verbose output
   -h, --help  Show this help"
     );
