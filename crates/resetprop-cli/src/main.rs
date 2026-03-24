@@ -83,6 +83,9 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(name) = nuke {
+        if persist {
+            return bool_op(sys.nuke_persist(&name), &name, "nuked(persist)", verbose);
+        }
         return bool_op(sys.nuke(&name), &name, "nuked", verbose);
     }
 
@@ -239,6 +242,7 @@ Usage:
   resetprop --stealth|-st -p NAME VALUE  Set stealth + persist to disk
   resetprop --hexpatch-delete NAME   Stealth delete (name destruction)
   resetprop --nuke|-nk NAME          Count-preserving stealth delete
+  resetprop -p --nuke|-nk NAME       Nuke from both prop_area and persist file
   resetprop --compact                Defragment arenas after deletes
   resetprop -f FILE                  Load properties from file (name=value)
   resetprop --dir PATH               Use custom property directory

@@ -199,6 +199,9 @@ resetprop-rs -p -d persist.sys.timezone
 resetprop-rs --nuke ro.lineage.version
 resetprop-rs -nk ro.lineage.version          # short alias
 
+# Nuke from both memory and persist file
+resetprop-rs -p --nuke persist.sys.timezone
+
 # Hexpatch delete (replaces name with dictionary words, keeps trie intact)
 resetprop-rs --hexpatch-delete ro.lineage.version
 
@@ -216,7 +219,7 @@ resetprop-rs --compact
 | `-p` | Persist mode: write/delete affects both memory and `/data/property/` on disk |
 | `-P` | Read from the persist file on disk, not from the mmap'd property area |
 | `-d NAME` | Delete a property |
-| `--nuke NAME`, `-nk NAME` | Count-preserving stealth delete (delete + replacement + compact) |
+| `--nuke NAME`, `-nk NAME` | Count-preserving stealth delete (delete + replacement + compact). Combine with `-p` for persist |
 | `--hexpatch-delete NAME` | Stealth delete with dictionary-based name replacement |
 | `--compact` | Defragment arenas after deletes |
 | `-f FILE` | Load `name=value` pairs from a file |
@@ -271,6 +274,7 @@ sys.delete_persist("persist.sys.timezone")?;
 
 // nuke: count-preserving stealth delete
 sys.nuke("ro.lineage.version")?;
+sys.nuke_persist("persist.sys.timezone")?;
 
 // hexpatch delete (dictionary-based name destruction)
 sys.hexpatch_delete("ro.custom.prop")?;

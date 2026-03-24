@@ -466,6 +466,13 @@ impl PropSystem {
         Ok(false)
     }
 
+    pub fn nuke_persist(&self, name: &str) -> Result<bool> {
+        let mem = self.nuke(name)?;
+        let mut store = PersistStore::load()?;
+        let disk = store.delete(name)?;
+        Ok(mem || disk)
+    }
+
     /// Compacts all writable areas, reclaiming space from deleted properties.
     /// Returns the number of areas that were actually compacted.
     pub fn compact(&self) -> Result<usize> {
