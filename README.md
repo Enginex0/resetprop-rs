@@ -3,7 +3,7 @@
   <p align="center"><b>Pure Rust Android Property Manipulation</b></p>
   <p align="center">Get. Set. Delete. Stealth. Nuke. No Magisk required.</p>
   <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.3.1-blue?style=for-the-badge" alt="v0.3.1">
+    <img src="https://img.shields.io/badge/version-v0.4.0-blue?style=for-the-badge" alt="v0.4.0">
     <img src="https://img.shields.io/badge/Android-10%2B-green?style=for-the-badge&logo=android" alt="Android 10+">
     <img src="https://img.shields.io/badge/Rust-stable-orange?style=for-the-badge&logo=rust" alt="Rust">
     <img src="https://img.shields.io/badge/Telegram-community-blue?style=for-the-badge&logo=telegram" alt="Telegram">

@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.4.0
+
+### Stealth Set
+- `--stealth` / `-st` flag for detection-resistant property writes
+- Suppresses all three detection vectors: per-property serial (zeroed), global serial bump (no `notify()`), and futex wake (skipped)
+- Combine with `-p` for stealth persist: `resetprop -st -p persist.sys.timezone UTC`
+- Library API: `PropSystem::set_stealth()`, `PropSystem::set_stealth_persist()`
+
+### Nuke (Count-Preserving Delete)
+- `--nuke` / `-nk` flag for atomic count-preserving stealth deletion
+- Pipeline: delete target → generate plausible replacement (harvested from device vocabulary) → stealth-insert with value `"0"` → compact arena
+- Property count stays identical after nuke; zero forensic traces
+- Library API: `PropSystem::nuke()`, `PropArea::nuke()`
+
+### Arena Compaction
+- `--compact` flag to defragment arenas after deletes
+- Slides live allocations forward to fill holes, rebuilding trie offsets in-place
+- Library API: `PropSystem::compact()`, `PropArea::compact()`
+
+### Trie Pruning
+- `delete()` now prunes orphaned trie leaves after detaching the property
+- Thorough `wipe()` zeroes the full prop_info record (header, long value, name)
+
+### Detection Test Harness
+- New `propdetect` crate: adversarial validation against real detection heuristics (serial anomalies, count drift, name entropy, enumeration gaps)
+- `propdetect-bionic` variant for on-device validation against libc's `__system_property_*` API
+
+### Testing
+- 50 unit tests + 2 doc-tests (up from 29)
+- On-device stress test script: 10 test cases covering stealth, nuke, rapid cycles, and neighbor preservation
+
 ## v0.3.1
 
 - Library crate now publishable to crates.io with full metadata (repository, keywords, categories)
