@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 /// Errors returned by property operations.
 #[derive(Debug)]
@@ -11,6 +12,13 @@ pub enum Error {
     ValueTooLong { len: usize },
     InvalidKey,
     PersistCorrupt(String),
+    PtraceAttach(std::io::Error),
+    PtraceScope,
+    ArenaAlreadySealed(PathBuf),
+    ArenaNotMapped(PathBuf),
+    ElfParse(String),
+    SymbolNotFound(String),
+    HookInstallFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -26,6 +34,16 @@ impl fmt::Display for Error {
             Self::ValueTooLong { len } => write!(f, "value too long: {len} bytes"),
             Self::InvalidKey => write!(f, "invalid property key"),
             Self::PersistCorrupt(msg) => write!(f, "corrupt persist file: {msg}"),
+            Self::PtraceAttach(e) => write!(f, "ptrace attach failed: {e}"),
+            Self::PtraceScope => write!(
+                f,
+                "ptrace blocked by /proc/sys/kernel/yama/ptrace_scope; root required or echo 0 into the file"
+            ),
+            Self::ArenaAlreadySealed(p) => write!(f, "arena already sealed: {}", p.display()),
+            Self::ArenaNotMapped(p) => write!(f, "arena not mapped in target process: {}", p.display()),
+            Self::ElfParse(msg) => write!(f, "ELF parse error: {msg}"),
+            Self::SymbolNotFound(sym) => write!(f, "symbol not found: {sym}"),
+            Self::HookInstallFailed(msg) => write!(f, "hook install failed: {msg}"),
         }
     }
 }
@@ -34,6 +52,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PermissionDenied(e) | Self::Io(e) => Some(e),
+            Self::PtraceAttach(e) => Some(e),
             _ => None,
         }
     }
