@@ -93,11 +93,13 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 - [x] **Arena compaction** — defragments holes left by deleted properties, eliminating forensic gaps
 
 **Seal**
-- [x] **Two-tier seal** — stealth write + ptrace-driven lock that nothing on the device can revert
+- [x] **Two-tier seal** — stealth write + ptrace-driven lock against init-mediated writers; no `setprop`, `property_service`, or bionic `__system_property_set` caller can revert a sealed prop
 - [x] **Tier B default (`-sl` / `--seal`)** — per-prop hook on `__system_property_update` inside init; only the sealed prop freezes, neighbors continue to update normally
 - [x] **Tier A fallback (`-sla` / `--seal-arena`)** — arena-level `MAP_PRIVATE|MAP_FIXED` remap in init; guaranteed to work but freezes every prop in the same arena as a side-effect
 - [x] **`-st` semantics unchanged** — pure stealth write, no ptrace, no hook, no arena remap; 100% back-compat for existing scripts
+- [x] **Bypass surface — direct-mmap writers** — callers that write `/dev/__properties__/<ctx>` directly route around init and defeat both tiers. Confirmed bypass vectors: KernelSU's `/data/adb/ksu/bin/resetprop` for every `ro.*` key and every `-n` / `--skip-svc` write (its dispatch branch at `sys_prop.rs:580` forces direct-mmap for those paths, landing bytes via `core::ptr::copy_nonoverlapping` at `mmap_prop_area.rs:277`), Magisk's resetprop (same pattern), and `resetprop-rs` itself invoked against a sealed prop. Seal protects against init-mediated reverts, not against another root tool writing the arena inode — the threat model is init-routed writers, not every root process on the device.
 - [x] **In-session only** — `SealRecord` lives in process memory; seals do not persist across reboots, `SystemProperties::Reload`, or init restart — re-run `--seal` / `--seal-arena` after every boot
+- [x] **Attach-window stall** — the first `-sl` / `-sla` call on a process ptrace-attaches to init and installs the trampoline in a 15–40 ms window on modern ARM64 handsets; any thread that blocks on init for a property write during that window waits out the full stall (zygote, system_server, init-launched daemons included). Subsequent calls against the already-installed hook complete in under 5 ms.
 - [x] **Futex waiters stall silently on sealed props** — `__system_property_wait(pi, ...)` waits on init's private serial copy; a sealed prop's serial never bumps in the caller's view, so waiters never wake. Aligned with seal intent (a sealed prop should not notify of spurious updates); downstream test authors must not use waiter-based probes on sealed props.
 
 ---
