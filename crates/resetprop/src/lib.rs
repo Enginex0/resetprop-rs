@@ -30,7 +30,7 @@ mod bionic;
 mod persist;
 mod appcompat;
 mod wait;
-mod seal;
+pub mod seal;
 pub mod inspect;
 #[cfg(test)]
 mod mock;
