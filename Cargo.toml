@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/resetprop", "crates/resetprop-cli", "crates/propdetect", "crates/propdetect-bionic"]
+members = ["crates/resetprop", "crates/resetprop-cli", "crates/propdetect", "crates/propdetect-bionic", "crates/resetprop/tests/fixtures/elf_fixture"]
 exclude = ["propdetect-app/native"]
 
 [profile.release]
