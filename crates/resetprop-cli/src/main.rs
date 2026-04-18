@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use resetprop::{PropSystem, PersistStore};
+use resetprop::{Error, PersistStore, PropSystem};
 
 fn main() -> ExitCode {
     match run() {
@@ -29,6 +29,11 @@ fn run() -> Result<(), String> {
     let mut wait_name: Option<String> = None;
     let mut wait_value: Option<String> = None;
     let mut timeout_secs: Option<u64> = None;
+    let mut seal: Option<String> = None;
+    let mut seal_arena: Option<String> = None;
+    let mut unseal: Option<String> = None;
+    let mut unseal_arena: Option<String> = None;
+    let mut list_seals = false;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -52,6 +57,23 @@ fn run() -> Result<(), String> {
                 nuke = Some(arg_val(&args, i, "--nuke")?);
             }
             "--stealth" | "-st" => stealth = true,
+            "--seal" | "-sl" => {
+                i += 1;
+                seal = Some(arg_val(&args, i, "--seal")?);
+            }
+            "--seal-arena" | "-sla" => {
+                i += 1;
+                seal_arena = Some(arg_val(&args, i, "--seal-arena")?);
+            }
+            "--unseal" => {
+                i += 1;
+                unseal = Some(arg_val(&args, i, "--unseal")?);
+            }
+            "--unseal-arena" => {
+                i += 1;
+                unseal_arena = Some(arg_val(&args, i, "--unseal-arena")?);
+            }
+            "--seals" => list_seals = true,
             "--compact" => compact = true,
             "--dir" => {
                 i += 1;
@@ -133,6 +155,67 @@ fn run() -> Result<(), String> {
             }
             None => return Err(format!("timeout waiting for {name}")),
         }
+    }
+
+    if list_seals {
+        let records = sys.seals().map_err(|e| format!("seals failed: {e}"))?;
+        for r in records {
+            println!("[{}]: [{:?}] {}", r.name, r.tier, r.arena_path.display());
+        }
+        return Ok(());
+    }
+
+    if let Some(ref name) = unseal {
+        return bool_op(sys.unseal(name), name, "unsealed", verbose);
+    }
+
+    if let Some(ref name) = unseal_arena {
+        return bool_op(sys.unseal_arena(name), name, "unsealed(arena)", verbose);
+    }
+
+    if let Some(ref name) = seal {
+        let value = positional
+            .first()
+            .ok_or_else(|| "--seal requires NAME VALUE (VALUE missing)".to_string())?;
+        return match sys.seal(name, value) {
+            Ok(record) => {
+                if verbose {
+                    eprintln!(
+                        "sealed: [{}] tier={:?} arena={}",
+                        record.name,
+                        record.tier,
+                        record.arena_path.display()
+                    );
+                }
+                Ok(())
+            }
+            Err(e @ (Error::HookInstallFailed(_) | Error::ElfParse(_) | Error::SymbolNotFound(_))) => {
+                Err(format!(
+                    "Tier B hook install failed: {e}. Try --seal-arena for Tier A fallback."
+                ))
+            }
+            Err(e) => Err(format!("seal failed: {e}")),
+        };
+    }
+
+    if let Some(ref name) = seal_arena {
+        let value = positional
+            .first()
+            .ok_or_else(|| "--seal-arena requires NAME VALUE (VALUE missing)".to_string())?;
+        return match sys.seal_arena(name, value) {
+            Ok(record) => {
+                if verbose {
+                    eprintln!(
+                        "sealed(arena): [{}] tier={:?} arena={}",
+                        record.name,
+                        record.tier,
+                        record.arena_path.display()
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("seal-arena failed: {e}")),
+        };
     }
 
     match positional.len() {
@@ -267,6 +350,11 @@ Usage:
   resetprop -P NAME                  Get persist property from disk
   resetprop --stealth|-st NAME VALUE     Set with zeroed serial, no wake signals
   resetprop --stealth|-st -p NAME VALUE  Set stealth + persist to disk
+  resetprop --seal|-sl NAME VALUE    Stealth write + Tier B per-prop init hook (default seal)
+  resetprop --seal-arena|-sla NAME VALUE  Stealth write + Tier A arena privatize (fallback)
+  resetprop --unseal NAME            Remove NAME from the Tier B lock list
+  resetprop --unseal-arena NAME      Revert Tier A arena privatization for NAME
+  resetprop --seals                  List active seals (name, tier, arena)
   resetprop --hexpatch-delete NAME   Stealth delete (name destruction)
   resetprop --nuke|-nk NAME          Count-preserving stealth delete
   resetprop -p --nuke|-nk NAME       Nuke from both prop_area and persist file
@@ -281,6 +369,11 @@ Options:
   -P          Disk-only read (read from persist file, not prop_area)
   --init      Zero the serial counter (mimics init for ro.* props)
   --stealth, -st  Suppress serial bump and futex wake (init-time appearance)
+  --seal, -sl     Tier B seal: stealth write + per-prop hook on __system_property_update in init
+  --seal-arena, -sla  Tier A seal: stealth write + remap init's arena as MAP_PRIVATE|MAP_FIXED
+  --unseal NAME   Remove NAME from the in-init Tier B lock list
+  --unseal-arena NAME  Revert Tier A privatization for the arena holding NAME
+  --seals         List currently active seals for this session
   --compact   Reclaim arena space left by deleted properties
   -v          Verbose output
   -h, --help  Show this help"
