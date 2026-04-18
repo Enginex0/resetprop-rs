@@ -88,7 +88,7 @@ One row per segment. Phases without segmentation use a single row with Segment =
 
 | Phase | Segment | Tasks | Status | Branch | Session(s) | Notes |
 |-------|---------|-------|--------|--------|------------|-------|
-| P01 — Foundation: ptrace + maps | — | 5 | NOT_STARTED | feat/P01-foundation | — | — |
+| P01 — Foundation: ptrace + maps | — | 5 | IN_PROGRESS | feat/P01-foundation | S01 (2026-04-18) | T1–T3 complete with self-audit gates filled; T4 (`remote_syscall`) + T5 (integration smoke) + Gate 2 pending next session |
 | P02 — Tier A: arena-level seal | — | 5 | NOT_STARTED | feat/P02-tier-a | — | — |
 | P03 — Tier B pt1: ELF + hook page | — | 5 | NOT_STARTED | feat/P03-tier-b-part1 | — | — |
 | P04 — Tier B pt2: trampoline + lock-list | — | 5 | NOT_STARTED | feat/P04-tier-b-part2 | — | — |
@@ -140,3 +140,4 @@ P05 joins both tracks — requires P02 and P04 both COMPLETE.
 
 | Date | Session | Phase.Segment | Outcome | Artifacts |
 |------|---------|---------------|---------|-----------|
+| 2026-04-18 | S01 — "fire up P01" | P01 / — | IN_PROGRESS (3 of 5 tasks complete) | Branch `feat/P01-foundation` 9 commits ahead of `main`. T1 shipped seal module skeleton + 7 error variants + SealRecord/SealTier (65b5a25, b0917f2, 07d9238). T2 shipped `/proc/pid/maps` parser + 3 unit tests (fa02dc3, 2ad4557). T3 shipped ptrace constants + UserPtRegs (272 B, aarch64-asserted) + ptrace_seize/interrupt/wait_stop/getregset/setregset/ptrace_detach with yama EPERM classification + 6/6 SAFETY pairing (3477933, 0d30d9f). Self-audit gates 1–3 filled with Optimality/Completeness/Correctness notes (6982944, 67b9848, plus this commit). 63 unit tests pass; zero regressions vs T0 baseline 58. Handoff: next session begins at T4 (`remote_syscall` injector) per `phases/seal/SESSION-01-HANDOFF.md`. |
