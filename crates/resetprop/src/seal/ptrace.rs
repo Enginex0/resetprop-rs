@@ -323,11 +323,28 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
 /// return -1, and errno is set appropriately. Since the value returned by a
 /// successful PTRACE_PEEK* request may be -1, the caller must clear errno
 /// before the call, and check it afterward").
+/// Portable handle to the thread-local `errno` slot.
+///
+/// glibc exposes `__errno_location`; bionic exposes `__errno`. This selects
+/// the correct symbol at compile time so the crate builds on both
+/// `x86_64-unknown-linux-gnu` (dev/CI) and `aarch64-linux-android` (target).
+#[inline]
+unsafe fn errno_ptr() -> *mut c_int {
+    #[cfg(target_os = "android")]
+    {
+        libc::__errno()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        libc::__errno_location()
+    }
+}
+
 pub fn ptrace_peektext(pid: Pid, addr: u64) -> Result<u64> {
     // SAFETY: The errno reset is scoped to this call; `libc::ptrace` returns
     // a `c_long` which on LP64 AArch64 is 64 bits wide — exactly one word.
     unsafe {
-        *libc::__errno_location() = 0;
+        *errno_ptr() = 0;
     }
     let word = unsafe {
         libc::ptrace(
@@ -338,7 +355,7 @@ pub fn ptrace_peektext(pid: Pid, addr: u64) -> Result<u64> {
         )
     };
     if word == -1 {
-        let errno = unsafe { *libc::__errno_location() };
+        let errno = unsafe { *errno_ptr() };
         if errno != 0 {
             return Err(last_ptrace_op_err());
         }
