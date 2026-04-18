@@ -37,7 +37,7 @@
 
 - [x] Implementation: `pub fn build_hook_body_bytes(saved_prologue: [u8; 16], lock_list_vaddr: u64, return_addr: u64) -> Vec<u8>` returns encoded instruction bytes: `cbz x0, .fallthrough` → `add x9, x0, #96` → `ldr x10, =LOCK_LIST` → outer loop (`ldrb w11, [x10]` → `cbz w11, .fallthrough` → strcmp stub) → match exit (`movz w0, #0; ret`) → advance (`add x10, x10, #1; b .next_entry`) → fallthrough (4 saved prologue words + `ldr x16, =RESTORE_TARGET; br x16`) → literal `RESTORE_TARGET = return_addr` → literal `LOCK_LIST = lock_list_vaddr`. Body length matches `HOOK_BODY_BYTES` (23 words × 4 = 92 bytes per `arm64-a64-encoding.md §Hook body sketch`). The function operates on a local `Vec<u8>`, takes 3 parameters, is pure (no ptrace, no `process_vm_writev`), and is unit-testable without a tracee — verified at `crates/resetprop/src/seal/hook.rs:617-644` (function body), with `HOOK_BODY_TEMPLATE` const at `hook.rs:556-580` and patch-point consts (`STOLEN_START=13` at `hook.rs:584`, `RESTORE_LIT=19` at `hook.rs:586`, `LOCK_LIST_LIT=21` at `hook.rs:588`). Saved prologue is passed as `[u8; 16]` first argument per the user-locked signature; three-argument public shape preserved.
 - [x] Test: `cargo test -p resetprop --lib seal::hook::build_hook_body_bytes_roundtrip` — round-trips the byte output: word 0 = `0xb400_01a0` (cbz x0, +52), word 1 = `0x9101_8009` (add x9, x0, #96), word 6 = `0x5280_0000` (movz w0, #0), word 7 = `0xd65f_03c0` (ret), STOLEN_START bytes 52..68 mirror `saved_prologue`, RESTORE_TARGET u64 at bytes 76..84 equals `return_addr`, LOCK_LIST u64 at bytes 84..92 equals `lock_list_vaddr` — verified at `crates/resetprop/src/seal/hook.rs:895-953` (21 tests pass, full lib suite 110 passed / 0 failed).
-- [x] Test: `cargo test -p resetprop --lib seal::hook::build_hook_body_bytes_is_pure` confirms the helper is pure via a compile-time `let _: fn([u8; 16], u64, u64) -> Vec<u8> = build_hook_body_bytes;` coercion that binds the exact signature (no hidden `&self` / `&mut self` / tracer-bound parameter) plus a runtime zero-argument call asserting the spec-locked 92-byte length — verified at `crates/resetprop/src/seal/hook.rs:966-972`.
+- [x] Test: `cargo test -p resetprop --lib seal::hook::build_hook_body_bytes_is_pure` confirms the helper is pure via a compile-time `let _: fn([u8; 16], u64, u64) -> Vec<u8> = build_hook_body_bytes;` coercion that binds the exact signature (no hidden `&self` / `&mut self` / tracer-bound parameter) plus a runtime zero-argument call asserting the spec-locked 140-byte length (post-splice per P04.2 T1) — verified at `crates/resetprop/src/seal/hook.rs:1460-1465`.
 
 #### Self-Audit Gate 2 (MANDATORY before Task 3)
 
@@ -48,7 +48,7 @@
 ### Task 3: `install_trampoline` writes hook body + 16-byte trampoline + i-cache sync
 
 - [x] Implementation: `pub fn install_trampoline(handle: &mut HookHandle) -> Result<()>` at `crates/resetprop/src/seal/hook.rs:803` — (1) computes `lock_list_vaddr = handle.hook_page + LOCK_LIST_OFFSET` (hook.rs:805, LOCK_LIST_OFFSET at hook.rs:67), `hook_body_vaddr = handle.hook_page + HOOK_BODY_OFFSET` (hook.rs:806, HOOK_BODY_OFFSET at hook.rs:73), `resume_addr = handle.target_fn + 16` (hook.rs:807); (2) calls `build_hook_body_bytes(handle.saved_prologue, lock_list_vaddr, resume_addr)` (hook.rs:810) and writes the resulting 92-byte `Vec<u8>` at `hook_body_vaddr` via `write_remote` which wraps `process_vm_writev` with a partial-transfer loop (hook.rs:830-831, transport at ptrace.rs:459-487); (3) writes the 16-byte trampoline at `handle.target_fn` via two `PTRACE_POKEDATA` calls — `word_lo = LDR_X16_PC8 | (BR_X16 << 32)` and `word_hi = hook_body_vaddr` — because `process_vm_writev` EFAULTs on the `r-xp` libc.text VMA while POKEDATA bypasses VMA write bits through `ptrace_access_vm` (hook.rs:840-849, ptrace_poketext at ptrace.rs:375-392); (4) i-cache sync primary calls `remote_syscall_via_poke(pid, scratch_pc, NR_MEMBARRIER=283, [MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE=0x80, 0, 0, 0, 0, 0])` (hook.rs:857-865, constants at hook.rs:81/85), decoding `ret >= 0` as success, `ret in {-EINVAL, -EPERM}` as fallback trigger, and `ret in -4095..=-1` as typed `HookInstallFailed("membarrier returned -errno=N")` (hook.rs:870-888); fallback stages `ISB_SY ; BRK_0` at `handle.scratch_pc` via `execute_remote_isb` at hook.rs:698 (~37 lines following `remote_syscall_via_poke`'s skeleton); (5) error surface returns `Error::HookInstallFailed(String)` with stage-prefixed messages on every failure; (6) error cleanup uses a closure-wrapped inner `Result` block (hook.rs:819-889) so any `?`-propagation between the body write and the membarrier return triggers `revert_trampoline(pid, target_fn, &saved_prologue)` (hook.rs:745) before the `attach` guard detaches (hook.rs:891-897); (7) flips `handle.trampoline_installed = true` (hook.rs:900) on success so `HookHandle::Drop` skips `munmap`; (8) explicit `attach.detach()?` (hook.rs:903) surfaces detach failures at the install site. Installer contains zero opcode encoding — all bytes come from `build_hook_body_bytes` and `encoder::{LDR_X16_PC8, BR_X16, ISB_SY, BRK_0}`. Exported `pub fn` (not `pub(crate)`) per T5 requirement (T5's `PropSystem::seal` at `lib.rs` is an external consumer). Verified at `git log -1` commit `b751238`.
-- [ ] Test: `cargo test -p resetprop --test tier_b_child_smoke -- --ignored --test-threads=1` reaches the final assertion block without `Err(Error::SealHookError(_))`; parent's `install_init_hook(...)` + `install_trampoline(...)` both return `Ok` — deferred to T5 (integration-test scope per phase spec §Tasks T5)
+- [ ] ~~Test~~ N/A per P04.2 T3: the original spec called for `cargo test -p resetprop --test tier_b_child_smoke -- --ignored --test-threads=1` to reach the assertion block without `Err(Error::HookInstallFailed(_))`. That integration test was deleted in P04.2 T3 per Gate 2 round-1 critic CRITICAL 2. Tier B installer acceptance moves to P05's aarch64 device-run; T3's host-side coverage is the 29 `seal::hook` unit tests passing via `cargo test -p resetprop --lib`.
 
 #### Self-Audit Gate 3 (MANDATORY before Task 4)
 
@@ -96,16 +96,16 @@
 - [ ] FR-08: `build_hook_body_bytes` loads `&pi->name` via `add x9, x0, #96`, using `PROP_INFO_NAME_OFFSET = 96` (per aosp-property-system.md §1 `static_assert(sizeof(prop_info) == 96)`) — file:line after verification
 - [ ] FR-09: On name match the hook returns `mov w0, #0; ret` (per aosp-property-system.md §3 `Update` returns 0 on success)
 - [ ] FR-10: On fallthrough the hook restores 4 saved prologue words then `ldr x16, =RESTORE_TARGET; br x16` to `target_fn + 16` (per arm64-a64-encoding.md §Hook body sketch install-time patching rules)
-- [ ] FR-11: The `RESTORE_TARGET` literal at words 19..=20 holds `target_fn + 16` as little-endian u64 (per arm64-a64-encoding.md §Hook body sketch)
-- [ ] FR-12: The `LOCK_LIST` literal at words 21..=22 holds `hook_page + LOCK_LIST_OFFSET` as little-endian u64 (per arm64-a64-encoding.md §Hook body sketch)
+- [ ] FR-11: The `RESTORE_TARGET` literal at words 31..=32 (post-splice per P04.2 T1; reference pre-splice layout pins it at 19..=20) holds `target_fn + 16` as little-endian u64 (per arm64-a64-encoding.md §Hook body sketch + P04.2 T1 expansion)
+- [ ] FR-12: The `LOCK_LIST` literal at words 33..=34 (post-splice per P04.2 T1; reference pre-splice layout pins it at 21..=22) holds `hook_page + LOCK_LIST_OFFSET` as little-endian u64 (per arm64-a64-encoding.md §Hook body sketch + P04.2 T1 expansion)
 
 ### Trampoline Installation (per `arm64-a64-encoding.md` §Absolute-target trampoline + `linux-arm64-abi.md` §10)
 
-- [ ] FR-13: `install_trampoline` obtains the hook body from `build_hook_body_bytes(...)` and writes the 92-byte result at `hook_page + HOOK_BODY_OFFSET` BEFORE writing the 16-byte trampoline at `target_fn` (write-order invariant — body ready before init is re-entered via the trampoline)
+- [ ] FR-13: `install_trampoline` obtains the hook body from `build_hook_body_bytes(...)` and writes the 140-byte result (post-STRCMP-splice per P04.2 T1) at `hook_page + HOOK_BODY_OFFSET` BEFORE writing the 16-byte trampoline at `target_fn` (write-order invariant — body ready before init is re-entered via the trampoline)
 - [ ] FR-14: `install_trampoline` writes all bytes of each region via `process_vm_writev`, looping on partial returns (per linux-arm64-abi.md §10 partial-transfer semantics)
 - [ ] FR-15: i-cache sync primary path issues remote `membarrier(0x80, 0, 0)` via `__NR_membarrier = 283` (per linux-arm64-abi.md §1)
 - [ ] FR-16: i-cache sync fallback executes `ISB` in the tracee via register flip when `membarrier` returns `EINVAL`/`EPERM` (per spec §Tasks T3)
-- [ ] FR-17: Any `process_vm_writev` failure is converted to `Error::SealHookError` (per resetprop-rs-integration.md §4 seal error variants)
+- [ ] FR-17: Any `process_vm_writev` failure is converted to `Error::HookInstallFailed` (per REGISTRY §1 row 35 error surface; `SealHookError` in the original spec was a stale variant name that does not exist — P04.2 T4 correction)
 
 ### Lock-List Mechanics (per spec §Tasks T4)
 
@@ -157,7 +157,12 @@
 | Item | Required Value | Verified at |
 |------|----------------|-------------|
 | `PROP_INFO_NAME_OFFSET` | 96 (REGISTRY §1 "prop_info layout — name at offset 96"; aosp-property-system.md §1 `static_assert(sizeof(prop_info) == 96)` at prop_info.h:89) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |
-| `HOOK_BODY_OFFSET` (inside hook_page) | 1024 (P04 spec §Approach item 4 — bytes 0..=1023 reserved for lock-list, body at bytes 1024..=1115, bytes 1116..=4095 spare; corrects the spec's inline `HOOK_BODY_OFFSET = 4` typo which contradicted the same paragraph's "first 1024 bytes for the list" clause and would have left zero lock-list capacity before the body) | `crates/resetprop/src/seal/hook.rs:81` |
+| `HOOK_BODY_OFFSET` (inside hook_page) | 1024 (P04 spec §Approach item 4 — bytes 0..=1023 reserved for lock-list, body at bytes 1024..=1163 post-STRCMP-splice per P04.2 T1, bytes 1164..=4095 spare) | `crates/resetprop/src/seal/hook.rs:81` |
+| Hook body size | 140 bytes (35 words post-STRCMP-splice per P04.2 T1; pre-splice reference template at `arm64-a64-encoding.md:383-407` shows 23 words / 92 bytes) | `crates/resetprop/src/seal/hook.rs:636` |
+| `STOLEN_START` patch-point word index | 25 (post-splice per P04.2 T1; pre-splice reference = 13) | `crates/resetprop/src/seal/hook.rs:643` |
+| `RESTORE_LIT` patch-point word index | 31 (post-splice per P04.2 T1; pre-splice reference = 19) | `crates/resetprop/src/seal/hook.rs:646` |
+| `LOCK_LIST_LIT` patch-point word index | 33 (post-splice per P04.2 T1; pre-splice reference = 21) | `crates/resetprop/src/seal/hook.rs:649` |
+| `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE` | `0x40` (linux/membarrier.h cmd enum; `arm64-a64-encoding.md:422` — "Requires REGISTER registration first; kernel ≥ 4.16"; added in P04.2 T2) | `crates/resetprop/src/seal/hook.rs:101` |
 | `LOCK_LIST_OFFSET` (inside hook_page) | 0 (P04 spec §Approach item 4) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |
 | `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE` | `0x80` (arm64-a64-encoding.md §i-cache invalidation options; linux/membarrier.h cmd enum value) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |
 | `__NR_membarrier` | 283 (linux-arm64-abi.md §1 citations table: `asm-generic/unistd.h:683`) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |
@@ -343,6 +348,52 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   matches post-delete in source trees (only in historical docs +
   REGISTRY log which are append-only).
 
-### Self-Audit Gate T4 — TODO (pending T4 completion)
+### Self-Audit Gate T4 — Spec + checklist doc fixes
+
+- [x] **Optimality**: Considered three approaches to the doc drift.
+  (a) Amend the spec / checklist prose in place, annotating post-splice
+      indices with their pre-splice reference counterparts — chosen.
+  (b) Rewrite the spec to drop the reference-template indices entirely.
+      Rejected — keeping the pre-splice numbers lets future agents
+      cross-reference `arm64-a64-encoding.md` without re-deriving the
+      offset math.
+  (c) Delete the Error-variant mention entirely. Rejected — the error
+      contract belongs in the spec so future agents know which variant
+      to match in integration tests.
+  Approach (a) gives the minimum invasive fix that preserves historical
+  context for each drift (each amended line notes the pre-splice or
+  pre-rename value + "P04.2 T4 correction").
+- [x] **Completeness**: Changes landed — (1) `P04-tier-b-part2.md`
+  §Tasks T3 replaced `Error::SealHookError` with `Error::HookInstallFailed`
+  and `HOOK_BODY_OFFSET = 4` with the correct 1024 explanation;
+  Verifies clause updated to drop the deleted integration test and
+  point at the P05 device-run (folded in from P04.2 T3). §Approach item
+  4 fully rewritten with the 35-word / 140-byte body accounting + the
+  1024 offset. (2) `P04-checklist.md`: FR-11, FR-12, FR-13, FR-17,
+  Task 2 test row, Task 3 test row (from T3) all amended for
+  post-splice indices, 140-byte size, and `HookInstallFailed` variant.
+  Canonical Values table at §Canonical Values gained four rows pinning
+  the post-splice Hook body size, STOLEN_START=25, RESTORE_LIT=31,
+  LOCK_LIST_LIT=33, and the new `MEMBARRIER_CMD_REGISTER_…` const.
+  (3) `references/resetprop-rs-integration.md` §Error variants table
+  renamed `SealHookError` to `HookInstallFailed` with a parenthetical
+  noting the rename. (4) `hook.rs` in-code doc comments were already
+  migrated 92→140 during T1; no further changes required for T4.
+- [x] **Correctness**: Walked drift cases — (i) every surviving
+  reference to `SealHookError` in the authoritative tree (P04 spec,
+  P04 checklist, resetprop-rs-integration.md) now reads
+  `HookInstallFailed`; the audit file (append-only historical) and
+  REGISTRY §7 session log entries (append-only historical) retain the
+  old name because they record what was drafted at the time.
+  (ii) `arm64-a64-encoding.md:374-376` still shows pre-splice indices
+  STOLEN_START=13, RESTORE_LIT=19, LOCK_LIST_LIT=21 — these are the
+  REFERENCE canonical layout, which is correct and intentional; the
+  P04.2-amended checklist rows explicitly cite "pre-splice reference
+  = N" so the two representations coexist without ambiguity.
+  (iii) `arm64-a64-encoding.md:348` still says "23-word (92-byte)"
+  — this describes the reference template pre-splice and is likewise
+  correct and intentional. (iv) `HOOK_BODY_OFFSET = 4` no longer
+  appears anywhere in the authoritative tree except the audit file,
+  which is append-only.
 
 ### Self-Audit Gate T5 — TODO (pending T5 completion)

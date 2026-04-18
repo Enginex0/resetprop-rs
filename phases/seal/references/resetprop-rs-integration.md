@@ -170,7 +170,7 @@
 SealPtraceError(String),       // ptrace attach/detach failure
 SealMapsError(String),         // /proc/pid/maps parsing failure
 SealElfError(String),          // ELF header validation failure
-SealHookError(String),         // hook installation failure
+HookInstallFailed(String),     // hook installation failure (planning doc originally said `SealHookError` — renamed during P03 and confirmed in P04.2 T4)
 SealArenaError(String),        // arena privatization failure
 SealNoProcess(u32),            // target PID not found
 SealRemoteWriteFailed(String), // remote arena write failed
