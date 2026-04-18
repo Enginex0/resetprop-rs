@@ -87,9 +87,12 @@ pub(crate) const ARM64_NOP: u32 = 0xd503_201f;
 /// bootstrap `svc+brk` is trivial, and (c) 8-byte aligned so a two-word
 /// blob writes atomically via a single PTRACE_POKEDATA.
 ///
-/// Returns `None` if no qualifying run exists in `bytes`. The caller surfaces
-/// this as `Error::HookInstallFailed` because the absence of a NOP slide in
-/// init's libc.text is an environment failure, not a programming error.
+/// Returns `None` if no qualifying run exists in `bytes`. Modern bionic
+/// `libc.so` on Android 15 is compiled tightly and does not guarantee a
+/// 4-NOP run anywhere in `.text`; callers should prefer [`find_scratch_slot`]
+/// which falls back to any aligned offset because the save/restore guards
+/// around the POKE window already cover the correctness invariant this
+/// scanner was added to protect.
 pub(crate) fn find_nop_slide(bytes: &[u8]) -> Option<usize> {
     const NOP_BYTES: [u8; 4] = ARM64_NOP.to_le_bytes();
     if bytes.len() < 16 {
@@ -108,6 +111,39 @@ pub(crate) fn find_nop_slide(bytes: &[u8]) -> Option<usize> {
         off += 4; // ARM64 instruction stride; 8-byte alignment filter applied above
     }
     None
+}
+
+/// Minimum scratch offset used by the fallback path — skips past any ELF
+/// entry stubs or PLT-adjacent prologues that might appear right at the
+/// start of `.text`. 64 bytes = 16 ARM64 instructions, well beyond the
+/// largest trampoline bionic emits at section start.
+const SCRATCH_FALLBACK_MIN_OFFSET: usize = 64;
+
+/// Pick an 8-byte-aligned scratch offset inside the libc.text scan window.
+///
+/// Prefers a 4-NOP slide when one exists (defense in depth — if a restore
+/// POKE ever fails mid-flight, NOPs are a safe re-entry for a stray thread).
+/// Falls back to the first aligned offset ≥ [`SCRATCH_FALLBACK_MIN_OFFSET`]
+/// when no NOP run is present, which is the common case on modern bionic.
+///
+/// Safety of the fallback rests on two invariants that P02 already enforces:
+/// 1. `RemoteAttach` SEIZE+INTERRUPT stops the tracee before we POKE, so
+///    no thread executes at `scratch_pc` during the bootstrap window.
+/// 2. Every `?`-propagation after the POKE is wrapped with a best-effort
+///    `ptrace_poketext`-based restore of the original bytes plus register
+///    state, so libc.text is left pristine whether we succeed or unwind.
+///
+/// Returns `None` only when `bytes` is smaller than one scratch slot; the
+/// caller surfaces that as `Error::HookInstallFailed`.
+pub(crate) fn find_scratch_slot(bytes: &[u8]) -> Option<usize> {
+    if let Some(offset) = find_nop_slide(bytes) {
+        return Some(offset);
+    }
+    let min = SCRATCH_FALLBACK_MIN_OFFSET;
+    if bytes.len() < min + 16 {
+        return None;
+    }
+    Some(min.next_multiple_of(8))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -256,8 +292,8 @@ pub(crate) unsafe fn remote_remap_private(
     // is ptrace-stopped for the duration (guarded by `RemoteAttach` above).
     unsafe { super::ptrace::read_remote(pid, libc_text.start, &mut scan_buf)? };
 
-    let slide_offset = find_nop_slide(&scan_buf)
-        .ok_or_else(|| Error::HookInstallFailed("no NOP slide found in libc.text".into()))?;
+    let slide_offset = find_scratch_slot(&scan_buf)
+        .ok_or_else(|| Error::HookInstallFailed("libc.text scan too small for scratch slot".into()))?;
     let scratch_pc = libc_text.start + slide_offset as u64;
 
     // --- Bootstrap: POKEDATA an svc+brk blob at scratch_pc ---------------
@@ -555,6 +591,24 @@ mod tests {
     fn find_nop_slide_returns_none_when_no_run_exists() {
         let buf = vec![0xFFu8; 64];
         assert!(find_nop_slide(&buf).is_none());
+    }
+
+    #[test]
+    fn find_scratch_slot_prefers_nop_slide_when_present() {
+        let buf = with_nop_run(32, 4, 16);
+        assert_eq!(find_scratch_slot(&buf), Some(32));
+    }
+
+    #[test]
+    fn find_scratch_slot_falls_back_to_aligned_offset() {
+        let buf = vec![0xFFu8; 128];
+        assert_eq!(find_scratch_slot(&buf), Some(SCRATCH_FALLBACK_MIN_OFFSET));
+    }
+
+    #[test]
+    fn find_scratch_slot_returns_none_when_buffer_too_small() {
+        let buf = vec![0xFFu8; SCRATCH_FALLBACK_MIN_OFFSET];
+        assert!(find_scratch_slot(&buf).is_none());
     }
 
     #[test]
