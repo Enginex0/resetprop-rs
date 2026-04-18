@@ -740,7 +740,7 @@ pub fn build_hook_body_bytes(
 ) -> Vec<u8> {
     let mut body = HOOK_BODY_TEMPLATE;
 
-    // Patch region 1: stolen prologue (words 13..=16, 16 bytes).
+    // Patch region 1: stolen prologue (words STOLEN_START..=STOLEN_START+3 = 25..=28, 16 bytes post-splice).
     for (i, word) in body[STOLEN_START..STOLEN_START + 4].iter_mut().enumerate() {
         let base = i * 4;
         *word = u32::from_le_bytes([
@@ -751,11 +751,11 @@ pub fn build_hook_body_bytes(
         ]);
     }
 
-    // Patch region 2: RESTORE_TARGET u64 (words 19..=20, LE lo+hi).
+    // Patch region 2: RESTORE_TARGET u64 (words RESTORE_LIT..=RESTORE_LIT+1 = 31..=32, LE lo+hi, post-splice).
     body[RESTORE_LIT] = return_addr as u32;
     body[RESTORE_LIT + 1] = (return_addr >> 32) as u32;
 
-    // Patch region 3: LOCK_LIST u64 (words 21..=22, LE lo+hi).
+    // Patch region 3: LOCK_LIST u64 (words LOCK_LIST_LIT..=LOCK_LIST_LIT+1 = 33..=34, LE lo+hi, post-splice).
     body[LOCK_LIST_LIT] = lock_list_vaddr as u32;
     body[LOCK_LIST_LIT + 1] = (lock_list_vaddr >> 32) as u32;
 
