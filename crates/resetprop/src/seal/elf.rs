@@ -17,7 +17,7 @@
 //! single-dep policy.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::mem;
 use std::ptr;
 
@@ -74,6 +74,14 @@ pub const STT_FUNC: u8 = 2;
 
 /// `st_info` bind field for global symbols. `/usr/include/elf.h:586`.
 pub const STB_GLOBAL: u8 = 1;
+
+/// `st_info` bind field for weak symbols. `/usr/include/elf.h:587`.
+///
+/// Bionic's `is_symbol_global_and_defined` (linker_relocate.h:60-74) accepts
+/// both STB_GLOBAL and STB_WEAK as "resolvable" bindings; the hooking path
+/// must mirror that predicate to avoid returning a local/undefined entry
+/// that happens to hash+name-match.
+pub const STB_WEAK: u8 = 2;
 
 /// Reserved section index meaning "undefined". `/usr/include/elf.h:413`.
 pub const SHN_UNDEF: u16 = 0;
@@ -240,11 +248,17 @@ fn read_struct<T: Copy>(bytes: &[u8], off: usize, what: &str) -> Result<T> {
 /// magic → class → data → machine → type → phentsize.
 pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
     // ---- Load full file ----
+    //
+    // `try_clone` dups the fd and therefore SHARES the POSIX file offset
+    // with the caller's `&File`. If the caller has advanced the offset
+    // (e.g. a prior partial read), `read_to_end` would silently start
+    // mid-file and hand us a truncated buffer. Rewind to 0 first so we
+    // always parse the full ELF regardless of caller state.
     let mut bytes = Vec::new();
     {
-        // `read_to_end` requires &mut File; clone the handle to keep the caller's
-        // &File ergonomic contract. `try_clone` dups the fd cheaply.
         let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::ElfParse(format!("seek to 0: {e}")))?;
         f.read_to_end(&mut bytes)?;
     }
 
@@ -377,6 +391,20 @@ pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
 /// Source: `linker_soinfo.cpp:330`.
 const BLOOM_MASK_BITS: u32 = 64;
 
+/// Bionic's `is_symbol_global_and_defined` predicate.
+///
+/// Mirrors `linker_relocate.h:60-74` verbatim: a symbol is "resolvable" iff
+/// its binding is `STB_GLOBAL` or `STB_WEAK` AND its section index is not
+/// `SHN_UNDEF`. Callers use this after a hash+name match to reject local
+/// or undefined entries that would otherwise yield a wrong `st_value`.
+///
+/// `st_info` packs bind into the high nibble (`bind = st_info >> 4`); see
+/// `/usr/include/elf.h:583-586`.
+fn is_global_or_weak_defined(sym: &Elf64_Sym) -> bool {
+    let bind = sym.st_info >> 4;
+    (bind == STB_GLOBAL || bind == STB_WEAK) && sym.st_shndx != SHN_UNDEF
+}
+
 /// djb2a hash used by GNU_HASH, bionic form.
 ///
 /// `h * 33 + byte`, seeded at `5381`, encoded as
@@ -453,7 +481,11 @@ pub fn gnu_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
     let bloom_size = u32_le(bytes, hash_offset.checked_add(8)?)?;
     let bloom_shift = u32_le(bytes, hash_offset.checked_add(12)?)?;
 
-    if nbuckets == 0 || bloom_size == 0 {
+    // Bionic asserts `powerof2(gnu_maskwords_)` at linker.cpp:2912-2916
+    // before masking with `bloom_size - 1`. Reject non-power-of-two
+    // widths here so a malformed table can never yield a wrong bloom
+    // index via the mask below.
+    if nbuckets == 0 || bloom_size == 0 || !bloom_size.is_power_of_two() {
         return None;
     }
 
@@ -500,7 +532,12 @@ pub fn gnu_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
             let sym: Elf64_Sym = read_struct(bytes, sym_off, "Sym").ok()?;
             let name_off = view.strtab_offset.checked_add(sym.st_name as usize)?;
             let cand = read_cstr_at(bytes, name_off, view.strtab_size)?;
-            if cand == target {
+            // Name match alone is insufficient: bionic's
+            // linker_soinfo.cpp:362-369 also checks binding+shndx via
+            // `is_symbol_global_and_defined`. A local or undefined entry
+            // sharing the same hash+name must NOT terminate the walk —
+            // continue scanning until the chain terminator.
+            if cand == target && is_global_or_weak_defined(&sym) {
                 return Some(sym.st_value);
             }
         }
@@ -552,7 +589,10 @@ pub fn linear_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
             .checked_add(i.checked_mul(mem::size_of::<Elf64_Sym>())?)?;
         let sym: Elf64_Sym = read_struct(bytes, sym_off, "Sym").ok()?;
 
-        if sym.st_shndx == SHN_UNDEF {
+        // Mirror bionic's `is_symbol_global_and_defined`
+        // (linker_relocate.h:60-74) for consistency with `gnu_lookup`.
+        // This subsumes the old SHN_UNDEF-only guard.
+        if !is_global_or_weak_defined(&sym) {
             continue;
         }
 
@@ -570,28 +610,24 @@ pub fn linear_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
     None
 }
 
-/// Resolve `name` against `view`, preferring GNU_HASH and falling through
-/// to the linear `.dynsym` scan on miss.
+/// Resolve `name` against `view` via GNU_HASH when available, else linear.
 ///
-/// Dispatcher order (locked by spec §Approach item 2):
-/// 1. If `view.gnu_hash_offset.is_some()`, call [`gnu_lookup`]; return on hit.
-/// 2. Otherwise (or on GNU_HASH miss), call [`linear_lookup`]; return on hit.
-/// 3. Neither resolved → `Err(Error::SymbolNotFound)`.
+/// Dispatcher order (locked by spec §Approach item 2): linear is a
+/// fallback ONLY when `DT_GNU_HASH` is absent, never when GNU_HASH misses.
+/// Falling through on a GNU_HASH miss would:
 ///
-/// We deliberately do NOT skip linear when GNU_HASH is present but returns
-/// `None`: a malformed GNU_HASH section (bad bloom filter, truncated chain)
-/// should still permit linear to recover, which is the invariant the T4
-/// symbol-patching pipeline relies on.
+/// 1. Hide GNU_HASH corruption bugs — a truncated chain would silently
+///    succeed via linear instead of surfacing as a failure.
+/// 2. Add an O(N) scan to every not-found lookup.
+///
+/// Bionic itself never falls back this way; neither do we.
 pub fn resolve_symbol(view: &LibcElfView, name: &str) -> Result<u64> {
-    if view.gnu_hash_offset.is_some() {
-        if let Some(v) = gnu_lookup(view, name) {
-            return Ok(v);
-        }
-    }
-    if let Some(v) = linear_lookup(view, name) {
-        return Ok(v);
-    }
-    Err(Error::SymbolNotFound(name.into()))
+    let result = if view.gnu_hash_offset.is_some() {
+        gnu_lookup(view, name)
+    } else {
+        linear_lookup(view, name)
+    };
+    result.ok_or_else(|| Error::SymbolNotFound(name.into()))
 }
 
 // -----------------------------------------------------------------------------
@@ -710,6 +746,130 @@ mod tests {
         assert_eq!(gnu_hash(b""), 5381);
         let expected = 5381u32.wrapping_mul(33).wrapping_add(u32::from(b'_'));
         assert_eq!(gnu_hash(b"_"), expected);
+    }
+
+    /// Helper for M1 / M4 synthetic GNU_HASH tests: build a GNU_HASH section
+    /// whose single chain slot matches `target_name` by hash, with the symbol
+    /// entry's `st_info` / `st_shndx` / `st_value` chosen by the caller.
+    ///
+    /// Layout (offsets relative to bytes[0]):
+    ///   * `[0..16]`  GNU_HASH header (nbuckets, symoffset=1, bloom_size,
+    ///                bloom_shift=6).
+    ///   * `[16..16 + 8 * bloom_size]` bloom table (all-ones — never rejects).
+    ///   * `[bucket_base..chain_base]` buckets (single bucket pointing at sym 1).
+    ///   * `[chain_base..chain_base + 4]` one chain slot: `(h & !1) | 1`.
+    ///   * `[symtab_offset..]` two `Elf64_Sym`s — index 0 is the ELF-mandated
+    ///                zero entry; index 1 is the test subject.
+    ///   * `[strtab_offset..]` `target_name` followed by NUL.
+    fn build_synthetic_view(
+        target_name: &str,
+        st_info: u8,
+        st_shndx: u16,
+        bloom_size: u32,
+    ) -> LibcElfView {
+        let h = gnu_hash(target_name.as_bytes());
+        let bloom_bytes = (bloom_size as usize) * 8;
+
+        // GNU_HASH header + bloom + single bucket + single chain word.
+        let header_bytes = 16;
+        let bucket_bytes = 4;
+        let chain_bytes = 4;
+        let hash_section_end = header_bytes + bloom_bytes + bucket_bytes + chain_bytes;
+
+        // Symbol table: two 24-byte Elf64_Syms (index 0 reserved + subject at index 1).
+        let symtab_offset = hash_section_end;
+        let strtab_offset = symtab_offset + 2 * mem::size_of::<Elf64_Sym>();
+        let strtab = {
+            let mut s = target_name.as_bytes().to_vec();
+            s.push(0);
+            s
+        };
+        let strtab_size = strtab.len();
+        let total = strtab_offset + strtab_size;
+
+        let mut bytes = vec![0u8; total];
+
+        // Header.
+        bytes[0..4].copy_from_slice(&1u32.to_le_bytes()); // nbuckets
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes()); // symoffset
+        bytes[8..12].copy_from_slice(&bloom_size.to_le_bytes()); // bloom_size
+        bytes[12..16].copy_from_slice(&6u32.to_le_bytes()); // bloom_shift
+
+        // Bloom: all ones so the filter never rejects.
+        for word in 0..bloom_size as usize {
+            let off = header_bytes + word * 8;
+            bytes[off..off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        }
+
+        // Single bucket → symbol index 1 (matching symoffset).
+        let bucket_base = header_bytes + bloom_bytes;
+        bytes[bucket_base..bucket_base + 4].copy_from_slice(&1u32.to_le_bytes());
+
+        // Chain slot: hash with terminator bit set.
+        let chain_base = bucket_base + bucket_bytes;
+        let chain_word = (h & !1u32) | 1u32;
+        bytes[chain_base..chain_base + 4].copy_from_slice(&chain_word.to_le_bytes());
+
+        // Symbol index 1.
+        let sym1_off = symtab_offset + mem::size_of::<Elf64_Sym>();
+        let st_name_offset = 0u32;
+        bytes[sym1_off..sym1_off + 4].copy_from_slice(&st_name_offset.to_le_bytes());
+        bytes[sym1_off + 4] = st_info;
+        // st_other = 0 (already zero).
+        bytes[sym1_off + 6..sym1_off + 8].copy_from_slice(&st_shndx.to_le_bytes());
+        // st_value = 0xdeadbeef so a wrong pass returns a distinctive value.
+        let st_value = 0xdead_beefu64;
+        bytes[sym1_off + 8..sym1_off + 16].copy_from_slice(&st_value.to_le_bytes());
+        // st_size = 0 (already zero).
+
+        // String table.
+        bytes[strtab_offset..strtab_offset + strtab_size].copy_from_slice(&strtab);
+
+        LibcElfView::from_parts(
+            bytes,
+            symtab_offset,
+            strtab_offset,
+            strtab_size,
+            Some(0),
+        )
+    }
+
+    /// A chain-matching symbol whose binding is `STB_LOCAL` must be skipped,
+    /// not returned — bionic `linker_relocate.h:60-74`.
+    #[test]
+    fn gnu_lookup_rejects_local_symbol() {
+        // bind = STB_LOCAL (0), type = STT_FUNC (2). st_info = (bind << 4) | type.
+        let st_info = (0u8 << 4) | STT_FUNC;
+        let view = build_synthetic_view("target", st_info, 1 /* defined */, 1);
+        assert!(
+            gnu_lookup(&view, "target").is_none(),
+            "STB_LOCAL must not be returned by gnu_lookup"
+        );
+    }
+
+    /// A chain-matching global symbol with `st_shndx == SHN_UNDEF` must be
+    /// skipped — bionic `linker_relocate.h:60-74`.
+    #[test]
+    fn gnu_lookup_rejects_undef_symbol() {
+        let st_info = (STB_GLOBAL << 4) | STT_FUNC;
+        let view = build_synthetic_view("target", st_info, SHN_UNDEF, 1);
+        assert!(
+            gnu_lookup(&view, "target").is_none(),
+            "SHN_UNDEF must not be returned by gnu_lookup"
+        );
+    }
+
+    /// `bloom_size = 3` is non-power-of-two; bionic rejects this at
+    /// `linker.cpp:2912-2916`. Our guard must refuse the table before the
+    /// `bloom_size - 1` mask produces wrong bloom indices.
+    #[test]
+    fn gnu_lookup_rejects_non_power_of_two_bloom() {
+        let st_info = (STB_GLOBAL << 4) | STT_FUNC;
+        let view = build_synthetic_view("target", st_info, 1, 3);
+        assert!(
+            gnu_lookup(&view, "target").is_none(),
+            "bloom_size must be power of two"
+        );
     }
 
     /// Build a minimal GNU_HASH section where the bloom filter is all zeros,
