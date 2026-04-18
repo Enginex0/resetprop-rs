@@ -10,6 +10,7 @@ use std::time::SystemTime;
 
 pub mod maps;
 pub mod ptrace;
+pub mod arena;
 
 /// Process identifier alias matching the libc type used by ptrace/waitpid.
 pub type Pid = libc::pid_t;

@@ -24,19 +24,19 @@
 
 ### Task 1: `find_arena_mapping` in `seal/arena.rs`
 
-- [ ] Implementation: `crates/resetprop/src/seal/arena.rs` exists and exports `pub(crate) fn find_arena_mapping(pid: libc::pid_t, arena_path: &Path) -> Result<MapEntry>`
-- [ ] Implementation: Pure helper `fn find_arena_mapping_in(entries: &[MapEntry], arena_path: &Path) -> Result<MapEntry>` is defined for in-process unit testing (no `/proc` dependency)
-- [ ] Implementation: Returns `Error::ArenaNotMapped(arena_path.to_path_buf())` when no entry matches
-- [ ] Implementation: Rejects read-only matches (`perms` starting with `"r-"`) — only entries with `perms` starting with `"rw"` qualify as init's writable view
-- [ ] Test: `cargo test -p resetprop seal::arena::tests::find_arena_mapping_picks_rw_view` passes
-- [ ] Test: `cargo test -p resetprop seal::arena::tests::find_arena_mapping_rejects_ro_only_fixture` passes
-- [ ] Test: `cargo test -p resetprop seal::arena::tests::find_arena_mapping_returns_not_mapped_on_miss` passes
+- [x] Implementation: `crates/resetprop/src/seal/arena.rs` exists and exports `pub(crate) fn find_arena_mapping(pid: libc::pid_t, arena_path: &Path) -> Result<MapEntry>`
+- [x] Implementation: Pure helper `fn find_arena_mapping_in(entries: &[MapEntry], arena_path: &Path) -> Result<MapEntry>` is defined for in-process unit testing (no `/proc` dependency)
+- [x] Implementation: Returns `Error::ArenaNotMapped(arena_path.to_path_buf())` when no entry matches
+- [x] Implementation: Rejects read-only matches (`perms` starting with `"r-"`) — only entries with `perms` starting with `"rw"` qualify as init's writable view
+- [x] Test: `cargo test -p resetprop seal::arena::tests::find_arena_mapping_picks_rw_view` passes
+- [x] Test: `cargo test -p resetprop seal::arena::tests::find_arena_mapping_rejects_ro_only_fixture` passes
+- [x] Test: `cargo test -p resetprop seal::arena::tests::find_arena_mapping_returns_not_mapped_on_miss` passes
 
 #### Self-Audit Gate 1 (MANDATORY before Task 2)
 
-- [ ] **Optimality** — Considered: (a) inlining the parse call vs. splitting to `find_arena_mapping_in`; (b) accepting `&str` for `perms` vs. enum flags. Chose split helper + `&str` perms because `maps.rs` already returns `MapEntry { perms: String }` per P01 and we should not re-model it here. Notes: ___________________________
-- [ ] **Completeness** — Deliverable meets spec §Tasks T1: function signature matches, `ArenaNotMapped` error surface correct, fixture-driven unit test exists. Notes: ___________________________
-- [ ] **Correctness** — Edge cases walked: empty maps list → `ArenaNotMapped`; multiple matches (same path, both `rw-p`) → first wins with a doc comment; path with trailing `" (deleted)"` suffix → does not match (the arena file is never deleted under init); non-canonical paths (`/dev/__properties__/./foo`) → not seen in practice because kernel canonicalizes, documented. Notes: ___________________________
+- [x] **Optimality** — Considered: (a) inlining the parse call vs. splitting to `find_arena_mapping_in`; (b) accepting `&str` for `perms` vs. enum flags. Chose split helper + `&str` perms because `maps.rs` already returns `MapEntry { perms: String }` per P01 and we should not re-model it here. Notes: The checklist text is out of date — `MapEntry::perms` is actually `[u8; 4]` as shipped by P01 (`seal/maps.rs:20`, amended during P01 S02 hardening); matched via `entry.perms.starts_with(b"rw")` which is zero-alloc and preserves the parser's locked field shape. Additionally rejected deriving `Clone` on `MapEntry` to return an owned value — that would widen the P01 public surface; instead reconstruct a fresh struct literal in `find_arena_mapping_in` and keep the seam explicit. Rejected returning `Result<&MapEntry>` because the public `find_arena_mapping` owns the `Vec<MapEntry>` from `parse_maps` and a borrowed return would force callers to manage that vec's lifetime.
+- [x] **Completeness** — Deliverable meets spec §Tasks T1: function signature matches (`pub(crate) fn find_arena_mapping(pid, arena_path) -> Result<MapEntry>` at `seal/arena.rs:44`), pure helper `find_arena_mapping_in(&[MapEntry], &Path) -> Result<MapEntry>` exists at `seal/arena.rs:27`, `ArenaNotMapped` error surface correct for both miss and ro-only cases (single unified error variant, reuse documented in the doc comment at `seal/arena.rs:14-19`), three fixture-driven unit tests ship with the names required by the checklist (`find_arena_mapping_picks_rw_view`, `find_arena_mapping_rejects_ro_only_fixture`, `find_arena_mapping_returns_not_mapped_on_miss`). `pub mod arena;` added to `seal/mod.rs:13` immediately after `pub mod ptrace;` per brief instruction. T2/T3 surfaces (`remote_remap_private`, `seal_arena`, `unseal_arena`) intentionally absent — they are the next session's work.
+- [x] **Correctness** — Edge cases walked: empty maps list → loop falls through and returns `Err(ArenaNotMapped(path))`; entries with `path: None` → `as_deref() == Some(arena_path)` is false so they are skipped cleanly; multiple `rw-p` matches for the same path → first-match-wins via the `for` loop's natural ordering (documented via the doc comment "Returns the first entry"); path with trailing whitespace → P01's parser preserves interior whitespace verbatim (`seal/maps.rs:91-111`) and strips only the exact `" (deleted)"` suffix, so exact-equality comparison works as-is; ro-only match (`b"r-"`) → rejected in the perms check and caller sees `ArenaNotMapped` (same variant, same payload, documented rationale). Path canonicalization is the kernel's responsibility (it normalizes before writing to `/proc/pid/maps`), so `/dev/__properties__/./foo` style paths are not observed in practice.
 
 ### Task 2: `remote_remap_private` in `seal/arena.rs`
 
