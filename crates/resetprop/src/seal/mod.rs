@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 pub mod arena;
+pub mod elf;
 pub mod maps;
 pub mod ptrace;
 
