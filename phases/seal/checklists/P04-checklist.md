@@ -437,3 +437,45 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   leave it executing in the scratch slot), `poke_res` is dropped. The
   earlier error gets reported, matching the convention in
   `remote_syscall_via_poke` at the P02 fix site.
+
+## P04.3 Fix-Lane Self-Audit Gates
+
+### Self-Audit Gate T1 — Lock-list envelope + stage-A stall docs
+
+- [x] **Optimality**: Considered three homes for the operational
+  constraint prose.
+  (a) Two-page code refactor (split lock-list and body into separate
+      VMAs) — rejected. Would add ~60 lines of ptrace-remote-mmap code
+      to cover a ~37-entry operator-initiated use case that the
+      single-page cap already serves. Cost exceeds benefit for v1.
+  (b) A new REGISTRY §1 "Locked Decisions" row. Rejected — those rows
+      are architectural choices, not operational envelopes; the [LOCKED]
+      tag invites amendment-log churn if the numbers ever need revising.
+  (c) P04 spec § Operational Envelope section + source-level doc
+      comments on the two load-bearing symbols (`LOCK_LIST_CAPACITY`
+      and `install_init_hook`) — chosen. The spec is the place readers
+      of `phases/seal/` go for "what does Tier B promise"; the doc
+      comments carry the same accounting to any caller reading rustdoc.
+- [x] **Completeness**: Two atomic commits cover both MAJORs. `205aafc`
+  (M2) extends the `LOCK_LIST_CAPACITY` doc with the ~37-entry envelope
+  and the two-page salvage path, and adds a new `## Operational
+  Envelope` section to the spec with a `### Lock-list capacity`
+  subsection. `55ecce5` (M7) extends `install_init_hook` with a
+  `# Latency` rustdoc section covering the 15-40 ms attach-window
+  measurement and the callers that block (zygote, system_server,
+  init-launched daemons), and adds a `### Stage-A attach-window
+  stall` subsection to the spec under the same `## Operational
+  Envelope` heading. Both commits build clean; no test changes.
+- [x] **Correctness**: Docs-only task — zero behavioural diff. Verified
+  via (i) `cargo build -p resetprop --lib` clean after each edit; (ii)
+  grep confirms the new anchors (`§Operational Envelope` in the doc
+  comments and `### Lock-list capacity` / `### Stage-A attach-window
+  stall` in the spec) match the cross-references. Envelope numbers
+  traceable to source: `LOCK_LIST_CAPACITY = 1024` at `hook.rs:99`,
+  each entry costs `name_len + 1` per `seal_prop` write-bounds math at
+  `hook.rs:1167-1178`, trailing sentinel per atomic-append invariant
+  at `hook.rs:1123-1130`; 1024 / 27 = 37.9 entries at a 25-byte average
+  name. Latency range 15-40 ms matches the critic's audit measurement
+  at `phases/seal/audits/P04-audit.md:279`. No new MAJOR surface
+  introduced; both notes flag the salvage paths (two-page layout /
+  libc-ELF cache) for any future phase that needs them.
