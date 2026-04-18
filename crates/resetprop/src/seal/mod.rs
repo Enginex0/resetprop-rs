@@ -36,3 +36,8 @@ pub enum SealTier {
 }
 
 pub use maps::{MapEntry, parse_maps};
+pub use ptrace::{
+    UserPtRegs,
+    ptrace_seize, ptrace_interrupt, wait_stop,
+    getregset, setregset, ptrace_detach,
+};
