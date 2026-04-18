@@ -1108,9 +1108,7 @@ fn lock_list_remove_bytes(buffer: &mut [u8], cur_len: u32, name: &[u8]) -> Optio
             let match_end = entry_end + 1;
             buffer.copy_within(match_end..=tail, entry_start);
             let new_cur_len = tail - removed_entry_len;
-            for byte in &mut buffer[new_cur_len + 1..=tail] {
-                *byte = 0;
-            }
+            buffer[new_cur_len..=tail].fill(0);
             return Some(new_cur_len as u32);
         }
         entry_start = entry_end + 1;

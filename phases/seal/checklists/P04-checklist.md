@@ -571,3 +571,46 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   pre-panic state. Stale data is acceptable here: `seals()` is a
   read-only snapshot and the caller is expected to re-query for
   freshness under write contention.
+
+### Self-Audit Gate T4 — `lock_list_remove_bytes` fill simplification
+
+- [x] **Optimality**: Considered three forms.
+  (a) `buffer[new_cur_len..=tail].fill(0)` — chosen. The post-
+      `copy_within` sentinel at `buffer[new_cur_len]` is already 0
+      (copied in from the old sentinel at `tail`), so overwriting it
+      with 0 is a no-op for correctness and lets the range start at
+      `new_cur_len` instead of the fragile `new_cur_len + 1`. Drops
+      one arithmetic step and keeps the zero-fill bounded by the
+      attach-time invariant rather than tracer-side counter state.
+  (b) Leave the `+ 1` arithmetic and wrap it in a debug_assert. Rejected
+      — the assert would fire only in debug builds, and the fragility
+      the critic flagged is precisely that the arithmetic presumes the
+      counter matches the buffer. T2's counter-before-detach fix makes
+      that assumption sound today, but the idiom stays brittle against
+      future edits.
+  (c) Replace the whole compact-then-zero flow with a fresh
+      rebuild-into-scratch-buffer pattern. Rejected — doubles memory
+      use and changes the public byte sequence seen by the hook body
+      reader during the remote write window.
+- [x] **Completeness**: One-line change at `hook.rs:1111` (the
+  3-line `for byte in &mut buffer[new_cur_len + 1..=tail] { *byte
+  = 0; }` loop collapses to a single `.fill(0)` call).
+  All 3 `lock_list_remove_bytes_*` unit tests still pass (middle
+  entry, missing returns None, only-entry resets). No public API
+  change; no new tests needed. 118 lib tests pass; clippy clean
+  (`.fill` is the canonical form per rustc's `needless_range_loop` /
+  `manual_fill` hints).
+- [x] **Correctness**: Walked the three entry shapes under fill.
+  (i) Middle entry removed (e.g. `[a\0bb\0ccc\0\0]` with cur_len=9,
+  removing `bb`): `copy_within(4..=9, 2)` yields bytes
+  `[a\0ccc\0\0\0\0]` at indices 0-8, new_cur_len=6,
+  `fill(0)` over `[6..=9]` re-zeroes the already-zero slot 6 and
+  clears the two stale bytes at 7-8 that copy_within left holding
+  `c\0` from the overlapping source window. Matches the test's
+  expected `[a\0ccc\0\0]` prefix with zeroed tail.
+  (ii) Only entry removed (`[a\0\0]` cur_len=2, removing `a`):
+  `copy_within(2..=2, 0)` copies the single trailing NUL over the
+  first slot; new_cur_len=0; `fill(0)` over `[0..=2]` zeroes all
+  three bytes — handle now sees an empty list.
+  (iii) Name not present — early return via the `position(...)?`
+  propagation; fill is never reached. Buffer unmodified.
