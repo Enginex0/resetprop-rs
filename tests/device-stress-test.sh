@@ -315,6 +315,51 @@ else
     log "Magisk resetprop not found (KSU device?) — skipping comparison"
 fi
 
+# --- Test 21: Seal (Tier B) — sealed prop holds, neighbor updatable ---
+TEL_PROP="ro.telephony.default_network"
+NEIGHBOR_PROP="ro.telephony.call_ring.delay"
+ORIG=$(getprop "$TEL_PROP")
+NEIGHBOR_ORIG=$(getprop "$NEIGHBOR_PROP")
+if $RP -sl "$TEL_PROP" "0" 2>/dev/null; then
+    for i in $(seq 1 50); do
+        setprop "$TEL_PROP" "99" 2>/dev/null
+        sleep 0.05
+    done
+    SEALED_FINAL=$(getprop "$TEL_PROP")
+    setprop "$NEIGHBOR_PROP" "7" 2>/dev/null
+    sleep 0.1
+    NEIGHBOR_FINAL=$(getprop "$NEIGHBOR_PROP")
+    if [ "$SEALED_FINAL" = "0" ] && [ "$NEIGHBOR_FINAL" = "7" ]; then
+        pass "Test 21: seal Tier B — sealed held at '0', neighbor updated to '7'"
+    else
+        fail "Test 21: seal Tier B — sealed='$SEALED_FINAL' neighbor='$NEIGHBOR_FINAL'"
+    fi
+    $RP --unseal "$TEL_PROP" 2>/dev/null
+    setprop "$TEL_PROP" "$ORIG" 2>/dev/null
+    setprop "$NEIGHBOR_PROP" "$NEIGHBOR_ORIG" 2>/dev/null
+else
+    fail "Test 21: seal Tier B — install failed"
+fi
+
+# --- Test 22: Seal (Tier A) — arena privatize holds sealed prop ---
+ORIG=$(getprop "$TEL_PROP")
+if $RP -sla "$TEL_PROP" "0" 2>/dev/null; then
+    for i in $(seq 1 50); do
+        setprop "$TEL_PROP" "99" 2>/dev/null
+        sleep 0.05
+    done
+    ARENA_FINAL=$(getprop "$TEL_PROP")
+    if [ "$ARENA_FINAL" = "0" ]; then
+        pass "Test 22: seal Tier A — sealed held at '0' (arena privatized)"
+    else
+        fail "Test 22: seal Tier A — sealed='$ARENA_FINAL'"
+    fi
+    $RP --unseal-arena "$TEL_PROP" 2>/dev/null
+    setprop "$TEL_PROP" "$ORIG" 2>/dev/null
+else
+    fail "Test 22: seal Tier A — install failed"
+fi
+
 # --- Summary ---
 echo ""
 log "=== RESULTS: $PASS passed, $FAIL failed ==="
