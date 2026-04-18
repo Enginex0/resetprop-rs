@@ -315,25 +315,66 @@ else
     log "Magisk resetprop not found (KSU device?) — skipping comparison"
 fi
 
-# --- Test 21: Seal (Tier B) — sealed prop holds, neighbor updatable ---
+# --- Test 21: Seal (Tier B) — sealed prop holds against init writes, neighbor updatable ---
+# Scope: Tier B hooks init's __system_property_update. Test exercises the init-mediated
+# write path (setprop -> property_service -> init) and verifies the hook blocks sealed
+# writes while neighbors pass through. Also probes KSU's direct-mmap resetprop to
+# document the bypass surface — logged as WARN, not FAIL, since the bypass is an
+# expected scope boundary (see README Seal: Bypass surface).
 TEL_PROP="ro.telephony.default_network"
 NEIGHBOR_PROP="ro.telephony.call_ring.delay"
 ORIG=$(getprop "$TEL_PROP")
 NEIGHBOR_ORIG=$(getprop "$NEIGHBOR_PROP")
+
+# Pre-flight: does this shell context have SELinux permission to write the neighbor?
+# ro.telephony.* is labelled telephony_prop, which many production policies reject for
+# shell/su. Without this guard, Test 21 would report a false FAIL on enforcing devices
+# where the neighbor probe never lands regardless of seal state.
+setprop "$NEIGHBOR_PROP" "SELINUX_PROBE" 2>/dev/null
+sleep 0.1
+NEIGHBOR_WRITABLE=0
+[ "$(getprop "$NEIGHBOR_PROP")" = "SELINUX_PROBE" ] && NEIGHBOR_WRITABLE=1
+setprop "$NEIGHBOR_PROP" "$NEIGHBOR_ORIG" 2>/dev/null
+
 if $RP -sl "$TEL_PROP" "0" 2>/dev/null; then
     for i in $(seq 1 50); do
         setprop "$TEL_PROP" "99" 2>/dev/null
         sleep 0.05
     done
     SEALED_FINAL=$(getprop "$TEL_PROP")
+
     setprop "$NEIGHBOR_PROP" "7" 2>/dev/null
     sleep 0.1
     NEIGHBOR_FINAL=$(getprop "$NEIGHBOR_PROP")
-    if [ "$SEALED_FINAL" = "0" ] && [ "$NEIGHBOR_FINAL" = "7" ]; then
-        pass "Test 21: seal Tier B — sealed held at '0', neighbor updated to '7'"
+
+    if [ "$SEALED_FINAL" = "0" ]; then
+        if [ "$NEIGHBOR_WRITABLE" = "1" ]; then
+            if [ "$NEIGHBOR_FINAL" = "7" ]; then
+                pass "Test 21: seal Tier B — sealed held at '0', neighbor updated to '7'"
+            else
+                fail "Test 21: seal Tier B — sealed='0' but neighbor='$NEIGHBOR_FINAL' (expected '7')"
+            fi
+        else
+            pass "Test 21: seal Tier B — sealed held at '0' (neighbor assertion skipped: SELinux blocks shell writes on '$NEIGHBOR_PROP')"
+        fi
     else
-        fail "Test 21: seal Tier B — sealed='$SEALED_FINAL' neighbor='$NEIGHBOR_FINAL'"
+        fail "Test 21: seal Tier B — sealed='$SEALED_FINAL' (expected '0')"
     fi
+
+    # Bypass-surface probe: ksu_props writes direct-mmap for ro.* keys, bypassing the
+    # Tier B hook. Runs AFTER the primary assertion so SEALED_FINAL is untouched by
+    # KSU's write. Logged as WARN to surface the scope limitation on real devices.
+    if [ -x /data/adb/ksu/bin/resetprop ]; then
+        /data/adb/ksu/bin/resetprop "$TEL_PROP" "99" 2>/dev/null
+        sleep 0.1
+        KSU_FINAL=$(getprop "$TEL_PROP")
+        if [ "$KSU_FINAL" != "0" ]; then
+            log "  WARN Test 21: ksu_props bypassed Tier B — '$TEL_PROP'='$KSU_FINAL' (expected; direct-mmap defeats init hook, see README Seal: Bypass surface)"
+        else
+            log "  INFO Test 21: ksu_props write did not alter sealed prop (unusual; direct-mmap path normally bypasses)"
+        fi
+    fi
+
     $RP --unseal "$TEL_PROP" 2>/dev/null
     setprop "$TEL_PROP" "$ORIG" 2>/dev/null
     setprop "$NEIGHBOR_PROP" "$NEIGHBOR_ORIG" 2>/dev/null
