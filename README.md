@@ -92,6 +92,14 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 - [x] **Shared segment detection** — skips renaming prefixes used by other properties
 - [x] **Arena compaction** — defragments holes left by deleted properties, eliminating forensic gaps
 
+**Seal**
+- [x] **Two-tier seal** — stealth write + ptrace-driven lock that nothing on the device can revert
+- [x] **Tier B default (`-sl` / `--seal`)** — per-prop hook on `__system_property_update` inside init; only the sealed prop freezes, neighbors continue to update normally
+- [x] **Tier A fallback (`-sla` / `--seal-arena`)** — arena-level `MAP_PRIVATE|MAP_FIXED` remap in init; guaranteed to work but freezes every prop in the same arena as a side-effect
+- [x] **`-st` semantics unchanged** — pure stealth write, no ptrace, no hook, no arena remap; 100% back-compat for existing scripts
+- [x] **In-session only** — `SealRecord` lives in process memory; seals do not persist across reboots, `SystemProperties::Reload`, or init restart — re-run `--seal` / `--seal-arena` after every boot
+- [x] **Futex waiters stall silently on sealed props** — `__system_property_wait(pi, ...)` waits on init's private serial copy; a sealed prop's serial never bumps in the caller's view, so waiters never wake. Aligned with seal intent (a sealed prop should not notify of spurious updates); downstream test authors must not use waiter-based probes on sealed props.
+
 ---
 
 ## 📋 Requirements
@@ -234,6 +242,11 @@ resetprop-rs --wait ro.crypto.state encrypted --timeout 30
 | `-n` | No-op (compatibility with Magisk's resetprop) |
 | `--init` | Zero the serial counter when writing (mimics init for `ro.*` properties) |
 | `--stealth`, `-st` | Stealth set: zeroed serial, no global serial bump, no futex wake |
+| `--seal NAME VALUE`, `-sl NAME VALUE` | Tier B seal (default): stealth write + per-prop init hook. Does not persist across reboots. |
+| `--seal-arena NAME VALUE`, `-sla NAME VALUE` | Tier A seal (fallback): stealth write + arena-level `MAP_PRIVATE` in init. Broader blast radius, use when Tier B cannot install. |
+| `--unseal NAME` | Remove NAME from the Tier B in-init lock list. |
+| `--unseal-arena NAME` | Revert Tier A privatization for the arena holding NAME. |
+| `--seals` | List active seals (name, tier, arena). |
 | `-p` | Persist mode: write/delete affects both memory and `/data/property/` on disk |
 | `-P` | Read from the persist file on disk, not from the mmap'd property area |
 | `-d NAME` | Delete a property |
