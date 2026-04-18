@@ -38,10 +38,12 @@ mod mock;
 pub use error::{Error, Result};
 pub use area::PropArea;
 pub use persist::{PersistStore, Record};
+pub use seal::{SealRecord, SealTier};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
 
 const PROP_DIR: &str = "/dev/__properties__";
 
@@ -365,6 +367,26 @@ impl PropSystem {
         }
     }
 
+    /// Resolve the filesystem path of the primary arena that owns `name`.
+    ///
+    /// Prefers `PropertyContext::resolve` when available (matches how
+    /// `find_area` / `find_writable` pick the canonical arena) and falls
+    /// back to a linear scan of loaded areas. Shared by `seal_arena` and
+    /// `unseal_arena`, so the resolution policy lives in one place.
+    fn resolve_arena_path(&self, name: &str) -> Result<PathBuf> {
+        if let Some(ctx) = self.context.as_ref() {
+            if let Some(filename) = ctx.resolve(name) {
+                if let Some(&idx) = self.area_by_name.get(filename) {
+                    return Ok(self.areas[idx].0.clone());
+                }
+            }
+        }
+        if let Some((idx, _)) = self.find_area(name) {
+            return Ok(self.areas[idx].0.clone());
+        }
+        Err(Error::NotFound)
+    }
+
     fn find_area(&self, name: &str) -> Option<(usize, &PropArea)> {
         if let Some(ref ctx) = self.context {
             if let Some(filename) = ctx.resolve(name) {
@@ -501,6 +523,72 @@ impl PropSystem {
         store.set(name, value)
     }
 
+    /// Tier A seal: remap init's writable view of this property's arena file
+    /// as `MAP_PRIVATE|MAP_FIXED`, so subsequent writes from init (PID 1) do
+    /// not propagate to the backing inode or to other processes.
+    ///
+    /// Flow:
+    /// 1. Reject `properties_serial` up front — privatizing the global serial
+    ///    wake channel would break system-wide property-change notifications
+    ///    (REGISTRY §1 "Arenas NOT to touch").
+    /// 2. Resolve the arena filename via `PropertyContext::resolve`, falling
+    ///    back to a linear scan over `self.areas` when no context is loaded.
+    /// 3. `set_stealth(name, value)` — writes the target value with no serial
+    ///    bump, matching the existing `-st` semantics.
+    /// 4. If an appcompat mirror exists for the primary filename, derive the
+    ///    mirror path via the REGISTRY-locked convention and pass both paths
+    ///    to `seal::arena::seal_arena_with_mirror(1, primary, mirror)`.
+    /// 5. Record the operation in the process-wide `seals_registry()`.
+    ///
+    /// Returns the `SealRecord` that was inserted (or refreshed on duplicate).
+    pub fn seal_arena(&self, name: &str, value: &str) -> Result<SealRecord> {
+        let primary_path = self.resolve_arena_path(name)?;
+        let filename = arena_filename(&primary_path)?;
+        if filename == SERIAL_FILE {
+            return Err(Error::InvalidKey);
+        }
+
+        self.set_stealth(name, value)?;
+
+        let mirror_path = self.derive_mirror_path(&primary_path, filename);
+        seal::arena::seal_arena_with_mirror(1, &primary_path, mirror_path.as_deref())?;
+
+        let record = SealRecord {
+            name: name.to_string(),
+            arena_path: primary_path,
+            tier: SealTier::Arena,
+            sealed_at: SystemTime::now(),
+        };
+        Ok(insert_or_refresh_seal(record))
+    }
+
+    /// Reverse of `seal_arena`: restores init's shared view of the arena and
+    /// removes the matching `SealTier::Arena` record from the registry.
+    /// Returns `Ok(true)` if a record was removed, `Ok(false)` otherwise.
+    pub fn unseal_arena(&self, name: &str) -> Result<bool> {
+        let primary_path = self.resolve_arena_path(name)?;
+        let filename = arena_filename(&primary_path)?;
+        if filename == SERIAL_FILE {
+            return Err(Error::InvalidKey);
+        }
+
+        let mirror_path = self.derive_mirror_path(&primary_path, filename);
+        seal::arena::unseal_arena_with_mirror(1, &primary_path, mirror_path.as_deref())?;
+
+        Ok(remove_seal_record(name))
+    }
+
+    /// Returns the appcompat mirror path for `primary_path` when the loaded
+    /// `AppcompatAreas` table has a mirror registered for `filename`.
+    /// The path follows the REGISTRY-locked convention
+    /// `<primary_dir>/appcompat_override/<same filename as primary>`.
+    fn derive_mirror_path(&self, primary_path: &Path, filename: &str) -> Option<PathBuf> {
+        let compat = self.appcompat.as_ref()?;
+        compat.mirror_for(filename)?;
+        let parent = primary_path.parent()?;
+        Some(parent.join("appcompat_override").join(filename))
+    }
+
     /// Deletes a property from both the mmap'd area and the on-disk persist store.
     pub fn delete_persist(&self, name: &str) -> Result<bool> {
         let mem = self.delete(name)?;
@@ -594,4 +682,43 @@ impl PropSystem {
             area.leak();
         }
     }
+}
+
+/// Extracts the UTF-8 filename of an arena path, returning `InvalidKey`
+/// for paths without a valid final component. Kept separate from
+/// `PropSystem` so the seal/unseal methods share one guard-clause helper.
+fn arena_filename(path: &Path) -> Result<&str> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(Error::InvalidKey)
+}
+
+/// Inserts `record` into the process-wide seal registry, or refreshes
+/// `sealed_at` on an existing entry with the same `(name, tier)`. Returns
+/// the canonical record stored in the registry.
+fn insert_or_refresh_seal(record: SealRecord) -> SealRecord {
+    let registry = seal::seals_registry();
+    let mut guard = registry.lock().unwrap_or_else(|poisoned| {
+        eprintln!("resetprop: seals registry mutex was poisoned; recovering");
+        poisoned.into_inner()
+    });
+    if let Some(existing) = guard
+        .iter_mut()
+        .find(|r| r.name == record.name && r.tier == record.tier)
+    {
+        existing.sealed_at = record.sealed_at;
+        return existing.clone();
+    }
+    guard.push(record.clone());
+    record
+}
+
+/// Removes the `SealTier::Arena` entry for `name` from the registry.
+/// Returns `true` if a record was removed, `false` otherwise.
+fn remove_seal_record(name: &str) -> bool {
+    let registry = seal::seals_registry();
+    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let before = guard.len();
+    guard.retain(|r| !(r.name == name && r.tier == SealTier::Arena));
+    guard.len() != before
 }

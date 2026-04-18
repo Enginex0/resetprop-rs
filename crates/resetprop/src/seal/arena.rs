@@ -69,7 +69,6 @@ fn find_arena_mapping_in(entries: &[MapEntry], arena_path: &Path) -> Result<MapE
 }
 
 /// Locate init's writable mapping of `arena_path` in `/proc/<pid>/maps`.
-#[allow(dead_code)] // consumed by T4's `seal_arena` / `unseal_arena` orchestrators
 pub(crate) fn find_arena_mapping(pid: libc::pid_t, arena_path: &Path) -> Result<MapEntry> {
     let entries = parse_maps(pid)?;
     find_arena_mapping_in(&entries, arena_path)
@@ -117,7 +116,6 @@ pub(crate) fn find_nop_slide(bytes: &[u8]) -> Option<usize> {
 
 /// Direction of the arena remap — `Private` seals (blocks writes from
 /// propagating), `Shared` restores init's original view (unseal).
-#[allow(dead_code)] // variants constructed by T4's `seal_arena` / `unseal_arena`
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RemapFlags {
     Private,
@@ -226,7 +224,6 @@ impl Drop for RemoteAttach {
 /// tracee and does not unmap it before detach (see inline comment). A
 /// tracee death mid-sequence is detected as `Error::PtraceOp` via the
 /// existing `last_ptrace_op_err` path in P01's primitives.
-#[allow(dead_code)] // first consumer lives in T4's `seal_arena` / `unseal_arena`
 pub(crate) unsafe fn remote_remap_private(
     pid: super::Pid,
     mapping: &super::maps::MapEntry,
@@ -404,6 +401,59 @@ pub(crate) unsafe fn remote_remap_private(
     // second POKEDATA-staged munmap if leak accumulation becomes visible.
 
     guard.detach()?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tier A orchestrators — thin compositions over find_arena_mapping +
+// remote_remap_private. These are the public seam consumed by
+// `PropSystem::seal_arena` / `::unseal_arena` and by the T5 smoke test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tier A seal: remap init's writable view of `arena_path` as
+/// `MAP_PRIVATE|MAP_FIXED`. Thin composition of `find_arena_mapping` +
+/// `remote_remap_private` with `RemapFlags::Private`.
+pub fn seal_arena(pid: super::Pid, arena_path: &std::path::Path) -> Result<()> {
+    let mapping = find_arena_mapping(pid, arena_path)?;
+    // SAFETY: `pid` and `mapping` are caller-verified; the underlying
+    // primitive handles attach/detach/scratch-restoration internally.
+    unsafe { remote_remap_private(pid, &mapping, arena_path, RemapFlags::Private) }
+}
+
+/// Inverse of `seal_arena`: remap with `MAP_SHARED|MAP_FIXED` to restore
+/// init's original view.
+pub fn unseal_arena(pid: super::Pid, arena_path: &std::path::Path) -> Result<()> {
+    let mapping = find_arena_mapping(pid, arena_path)?;
+    // SAFETY: same rationale as `seal_arena`.
+    unsafe { remote_remap_private(pid, &mapping, arena_path, RemapFlags::Shared) }
+}
+
+/// Apply `seal_arena` to `primary`, then to `mirror` if present.
+/// First-error-wins: if sealing the primary fails, the mirror is not
+/// attempted; if the primary succeeds but the mirror fails, the error
+/// propagates with the primary already sealed.
+pub fn seal_arena_with_mirror(
+    pid: super::Pid,
+    primary: &std::path::Path,
+    mirror: Option<&std::path::Path>,
+) -> Result<()> {
+    seal_arena(pid, primary)?;
+    if let Some(m) = mirror {
+        seal_arena(pid, m)?;
+    }
+    Ok(())
+}
+
+/// Inverse of `seal_arena_with_mirror`.
+pub fn unseal_arena_with_mirror(
+    pid: super::Pid,
+    primary: &std::path::Path,
+    mirror: Option<&std::path::Path>,
+) -> Result<()> {
+    unseal_arena(pid, primary)?;
+    if let Some(m) = mirror {
+        unseal_arena(pid, m)?;
+    }
     Ok(())
 }
 
