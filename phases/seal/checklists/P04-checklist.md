@@ -260,7 +260,42 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   of its X counterpart, so `cbnz w11` after `ldrb w11, [x10], #1`
   reliably detects NUL regardless of prior x11 state.
 
-### Self-Audit Gate T2 — TODO (pending T2 completion)
+### Self-Audit Gate T2 — Membarrier REGISTER pre-call
+
+- [x] **Optimality**: Considered three options for the i-cache sync.
+  (a) REGISTER (0x40) then SYNC_CORE (0x80) — chosen. Minimal delta,
+      preserves the existing ISB fallback, and matches the reference's
+      own recommendation order at `arm64-a64-encoding.md:422`.
+  (b) Switch to `__clear_cache`. Rejected — requires resolving a second
+      libc symbol (`libc.so!__clear_cache`) and setting up a remote call
+      frame, which is out of P04.2 scope. Reference line 425 recommends
+      this as the architecturally correct option; deferring to a future
+      hardening phase.
+  (c) Remove the membarrier path entirely and rely on POKETEXT i-cache
+      maintenance. Rejected — the hook BODY is written via
+      `process_vm_writev` (hook.rs:844), not POKETEXT, and reference
+      line 425 is explicit: "ptrace(PTRACE_POKETEXT) does this on Linux;
+      `process_vm_writev` does not." Dropping the membarrier path would
+      leave the body page's i-cache unflushed.
+- [x] **Completeness**: Added the `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE = 0x40`
+  const adjacent to the existing SYNC_CORE const (hook.rs:92-102 region).
+  Step 6 of `install_trampoline` now issues REGISTER via
+  `remote_syscall_via_poke` first; on -EINVAL / -ENOSYS (kernel lacks
+  the cmd) drops to the staged ISB fallback; on other failures bubbles a
+  `HookInstallFailed` error. Step 7 (formerly second half of Step 6)
+  then issues SYNC_CORE with symmetric error handling. The ISB fallback
+  at `execute_remote_isb` is unchanged (its atomic-restore fix is T5).
+- [x] **Correctness**: Walked cases — (i) kernel ≥ 4.16 and membarrier
+  intact: REGISTER returns 0, SYNC_CORE returns 0, i-cache synced.
+  (ii) Kernel has membarrier but not SYNC_CORE cmd (kernel < 4.16):
+  REGISTER returns -EINVAL, ISB fallback fires. (iii) Kernel lacks
+  membarrier entirely: REGISTER returns -ENOSYS, ISB fallback fires.
+  (iv) REGISTER succeeds but SYNC_CORE reports -EINVAL (theoretical):
+  ISB fallback fires defensively. (v) REGISTER returns an unusual
+  errno: hard error with the raw return value in the message, consistent
+  with the other `HookInstallFailed` error paths in this function.
+  (vi) REGISTER is idempotent per linux/membarrier.h semantics, so
+  repeated trampoline installs on the same init don't accumulate state.
 
 ### Self-Audit Gate T3 — TODO (pending T3 completion)
 

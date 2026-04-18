@@ -89,10 +89,23 @@ pub(crate) const HOOK_BODY_OFFSET: u64 = 1024;
 /// `P04-tier-b-part2.md §Approach item 4`.
 pub(crate) const LOCK_LIST_CAPACITY: u64 = 1024;
 
+/// `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE` — kernel cmd byte
+/// that registers the calling task's intent to later issue
+/// `PRIVATE_EXPEDITED_SYNC_CORE`. Without this registration, the SYNC_CORE
+/// call returns `-EPERM` unconditionally. Init has never registered, so
+/// [`install_trampoline`] issues this cmd on init's behalf inside the
+/// attach window before the SYNC_CORE. Reference:
+/// `references/arm64-a64-encoding.md §i-cache invalidation options` line
+/// 422 ("Requires MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+/// (0x40) registration first; kernel ≥ 4.16").
+pub(crate) const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 0x40;
+
 /// `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE` — kernel cmd byte for
 /// cross-core instruction-cache synchronisation after writing instruction
 /// bytes into another process's VMA. Primary i-cache sync path after the
-/// trampoline write. Reference:
+/// trampoline write; must be preceded by
+/// [`MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE`] to avoid a
+/// guaranteed `-EPERM` return. Reference:
 /// `references/arm64-a64-encoding.md §i-cache invalidation options`
 /// (linux/membarrier.h cmd enum value).
 pub(crate) const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 0x80;
@@ -901,14 +914,58 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
             Error::HookInstallFailed(format!("install_trampoline: poke tramp hi: {e}"))
         })?;
 
-        // Step 6: i-cache sync via remote membarrier (primary path).
+        // Step 6: i-cache sync via remote membarrier — REGISTER then SYNC_CORE.
+        //
+        // SYNC_CORE (0x80) returns -EPERM unconditionally until the calling
+        // task has registered intent via REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+        // (0x40). Init has never registered, so we issue REGISTER on init's
+        // behalf via remote_syscall_via_poke inside this attach window,
+        // then issue SYNC_CORE. If the kernel lacks either cmd
+        // (-EINVAL / -ENOSYS; common on kernel < 4.16), we drop to the
+        // staged ISB fallback.
+        //
+        // Reference: references/arm64-a64-encoding.md line 422.
         //
         // SAFETY: `handle.scratch_pc` is the 8-byte-aligned slot inside
         // libc.text cached at P03 install time (`hook.rs:218`); the tracee
         // is ptrace-stopped via `attach`; `remote_syscall_via_poke` saves
         // and restores both the scratch word and the saved-regs snapshot
         // internally before returning.
-        let membarrier_ret = unsafe {
+        let einval_neg = -(libc::EINVAL as i64);
+        let enosys_neg = -(libc::ENOSYS as i64);
+
+        let register_ret = unsafe {
+            remote_syscall_via_poke(
+                handle.pid,
+                handle.scratch_pc,
+                NR_MEMBARRIER,
+                [
+                    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE,
+                    0, 0, 0, 0, 0,
+                ],
+            )
+        }
+        .map_err(|e| {
+            Error::HookInstallFailed(format!("install_trampoline: membarrier register: {e}"))
+        })?;
+
+        if register_ret == einval_neg || register_ret == enosys_neg {
+            // SAFETY: same invariants as the register call above — `attach`
+            // holds the tracee stopped; `handle.scratch_pc` is the cached
+            // libc.text slot.
+            return unsafe { execute_remote_isb(handle.pid, handle.scratch_pc) };
+        }
+        if register_ret != 0 {
+            return Err(Error::HookInstallFailed(format!(
+                "install_trampoline: membarrier register returned {register_ret}"
+            )));
+        }
+
+        // Step 7: issue SYNC_CORE. Post-register, -EPERM is no longer the
+        // expected "not registered" result, so any non-zero return other
+        // than -EINVAL (which still indicates missing kernel support for
+        // the cmd) is treated as a hard failure.
+        let sync_ret = unsafe {
             remote_syscall_via_poke(
                 handle.pid,
                 handle.scratch_pc,
@@ -916,25 +973,17 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
                 [MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0, 0, 0, 0, 0],
             )
         }
-        .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: membarrier: {e}")))?;
+        .map_err(|e| {
+            Error::HookInstallFailed(format!("install_trampoline: membarrier sync_core: {e}"))
+        })?;
 
-        // Step 7: decode membarrier return, falling back to ISB staging
-        // when the kernel rejects the cmd (EINVAL) or the tracee has not
-        // registered (EPERM).
-        if membarrier_ret >= 0 {
-            return Ok(());
-        }
-        let einval_neg = -(libc::EINVAL as i64);
-        let eperm_neg = -(libc::EPERM as i64);
-        if membarrier_ret == einval_neg || membarrier_ret == eperm_neg {
-            // SAFETY: same invariants as step 6 — `attach` holds the tracee
-            // stopped; `handle.scratch_pc` is the cached libc.text slot.
+        if sync_ret == einval_neg {
+            // SAFETY: same invariants as the register call above.
             return unsafe { execute_remote_isb(handle.pid, handle.scratch_pc) };
         }
-        if (-4095..=-1).contains(&membarrier_ret) {
+        if sync_ret != 0 {
             return Err(Error::HookInstallFailed(format!(
-                "install_trampoline: membarrier returned -errno={}",
-                -membarrier_ret
+                "install_trampoline: membarrier sync_core returned {sync_ret}"
             )));
         }
         Ok(())
