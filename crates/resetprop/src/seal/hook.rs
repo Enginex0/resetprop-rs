@@ -57,11 +57,19 @@ const LIBC_SCAN_LIMIT: usize = 64 * 1024;
 /// Per-prop Tier B hook handle.
 ///
 /// Returned by [`install_init_hook`]. Field layout is locked by the P03 spec —
-/// P04 code (same crate) mutates `lock_list_len` / `saved_prologue`; external
-/// callers only need the type in their signature, so fields are `pub(crate)`.
-/// Stage-B (T5) lands `hook_page` + `saved_prologue`; `lock_list_len` stays
-/// at zero because P03 defines the hook page with an empty lock list (the
-/// first four bytes are the zero sentinel written below).
+/// P04 code (same crate) mutates `lock_list_len` / `saved_prologue` and flips
+/// `trampoline_installed` to `true` after its prologue patch completes.
+/// External callers only need the type in their signature, so fields are
+/// `pub(crate)`.
+///
+/// Cached stage-A context (`libc_base`, `libc_end`, `scratch_pc`) lets
+/// [`HookHandle::drop_best_effort`] reuse the install-time scratch PC
+/// instead of re-parsing `/proc/<pid>/maps` and re-scanning libc.text at
+/// Drop time. This removes a class of TOCTOU bugs (libc hot-swap between
+/// install and drop re-deriving into a different VMA) and simplifies the
+/// Drop body; the remaining stale-scratch edge case (hot-swap AFTER
+/// install) surfaces as EFAULT/ESRCH from `remote_syscall_via_poke`, which
+/// Drop already swallows under best-effort semantics.
 #[allow(dead_code)]
 pub struct HookHandle {
     pub(crate) pid: libc::pid_t,
@@ -69,6 +77,16 @@ pub struct HookHandle {
     pub(crate) lock_list_len: u32,
     pub(crate) target_fn: u64,
     pub(crate) saved_prologue: [u8; 16],
+    pub(crate) libc_base: u64,
+    pub(crate) libc_end: u64,
+    pub(crate) scratch_pc: u64,
+    /// Typestate guard for Drop.
+    ///
+    /// Flipped to `true` by P04 after the trampoline is live at `target_fn`.
+    /// Once true, Drop MUST NOT unmap `hook_page` — init executes inside
+    /// that page. P04 is responsible for reverting the trampoline and
+    /// unmapping the page explicitly before the handle is dropped.
+    pub(crate) trampoline_installed: bool,
 }
 
 /// Predicate picking the executable `libc.so` mapping out of a parsed maps file.
@@ -86,19 +104,24 @@ pub(crate) fn is_libc_row(entry: &MapEntry) -> bool {
             .is_some_and(|s| s.ends_with("/libc.so"))
 }
 
-/// Stage-A of the hook install pipeline.
+/// Stage-A of the hook install pipeline — RUN UNDER ATTACH.
 ///
 /// Returns `(libc_base, libc_end, target_fn)` where `libc_base` / `libc_end`
 /// are the `r-xp` row's `start` / `end` addresses and
 /// `target_fn = libc_base + st_value("__system_property_update")`
 /// (ET_DYN runtime math per references/android-libc-elf.md §7).
 ///
-/// Stage-B consumes `libc_end` to size the libc.text scan window; exposing
-/// it alongside `libc_base` keeps the maps-lookup cost on a single traversal.
+/// This MUST be called while the caller holds a live `RemoteAttach` on
+/// `pid`. Every stage-A observation — `/proc/<pid>/maps`, the libc row,
+/// `/proc/<pid>/map_files/<start>-<end>`, the parsed symbol — is a snapshot
+/// of the tracee's address space, and running outside the attach window
+/// opens a TOCTOU gap (APEX hot-swap / Mainline update) that lets stage-B
+/// consume stale `(libc_base, libc_end, target_fn)` tuples. Mirrors P02's
+/// pattern at `arena.rs:278-304` (attach, then parse maps).
 ///
 /// Step tags preserved in error messages so operators can see exactly which
 /// step failed without enabling debug logging.
-pub(crate) fn install_init_hook_stage_a(pid: libc::pid_t) -> Result<(u64, u64, u64)> {
+fn stage_a_locked(pid: libc::pid_t) -> Result<(u64, u64, u64)> {
     let entries = seal::maps::parse_maps(pid)
         .map_err(|e| Error::HookInstallFailed(format!("stage-A: parse_maps: {e}")))?;
 
@@ -165,83 +188,58 @@ unsafe fn derive_libc_scratch_pc(pid: libc::pid_t, libc_base: u64, libc_end: u64
 
 /// Install the per-prop hook in the target process.
 ///
-/// Stage-A resolves `__system_property_update` in libc; stage-B reserves an
-/// RWX page in the tracee, stamps the zero lock-list sentinel, and snapshots
-/// the 16-byte prologue the P04 trampoline will later patch. The returned
-/// handle owns the remote page via [`HookHandle`]'s `Drop` impl (best-effort
-/// `munmap` via `remote_syscall_via_poke`).
+/// All tracee observations — `/proc/<pid>/maps`, the libc ELF parse, the
+/// symbol resolution, the scratch-PC scan, the remote `mmap`, the sentinel
+/// write, and the prologue snapshot — execute inside a single
+/// `RemoteAttach` window so the tracee's address space cannot shift
+/// (APEX hot-swap, Mainline update) between observation and use. The
+/// returned handle owns the remote page via [`HookHandle`]'s `Drop` impl
+/// (best-effort `munmap` via `remote_syscall_via_poke`).
 ///
-/// # Error cleanup note
+/// # Error cleanup
 ///
-/// If stage-B fails after the `mmap` succeeds, the 4 KiB `hook_page` is
-/// LEAKED in the tracee: we never construct a `HookHandle`, so its `Drop`
-/// never runs, and issuing a second `RemoteAttach`-scoped `munmap` in the
-/// error path would duplicate the P02 round-2 M6 cleanup complexity without
-/// buying safety (a 4 KiB leak on a rare cold-path error is acceptable and
-/// consistent with arena.rs's bootstrap-page leak policy).
+/// Failures after the `mmap` succeeds trigger a best-effort remote
+/// `munmap` of `hook_page` before the error propagates, so the tracee
+/// does not leak a 4 KiB RWX page on cold-path errors. The cleanup runs
+/// under the same attach window that installed the page.
 pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
-    let (libc_base, libc_end, target_fn) = install_init_hook_stage_a(pid)?;
-
     let guard = seal::arena::RemoteAttach::new(pid)
         .map_err(|e| Error::HookInstallFailed(format!("stage-B: attach: {e}")))?;
 
-    // SAFETY: `guard` holds the tracee ptrace-stopped for the duration of
-    // this block; `libc_base..libc_end` is the `r-xp` libc row returned by
-    // stage-A on the same process. `remote_syscall_via_poke`'s contract is
-    // satisfied by the resulting scratch PC (8-byte-aligned, inside an
-    // executable mapping, guarded against concurrent threads by the seize).
+    // C1 fix: stage-A runs INSIDE the attach window — no TOCTOU gap.
+    let (libc_base, libc_end, target_fn) = stage_a_locked(pid)?;
+
+    // SAFETY: `guard` holds the tracee ptrace-stopped for this block;
+    // `libc_base..libc_end` is the `r-xp` libc row just returned by
+    // stage-A on the same process. `remote_syscall_via_poke`'s contract
+    // is satisfied by the resulting scratch PC (8-byte-aligned, inside
+    // an executable mapping, guarded against concurrent threads by the
+    // seize).
     let scratch_pc = unsafe { derive_libc_scratch_pc(pid, libc_base, libc_end) }?;
 
-    // SAFETY: see `derive_libc_scratch_pc` above for the scratch-PC
-    // invariants; `remote_syscall_via_poke` itself saves / restores both
-    // the 8-byte scratch word and the saved-regs snapshot before returning
-    // (see ptrace.rs:669-705), so stage-B does not need an outer restore
-    // wrapper around the mmap call.
-    let ret = unsafe {
-        remote_syscall_via_poke(
-            pid,
-            scratch_pc,
-            NR_MMAP,
-            [0, HOOK_PAGE_SIZE, PROT_RWX, MAP_PRIVATE_ANON, u64::MAX, 0],
-        )
-    }
-    .map_err(|e| Error::HookInstallFailed(format!("stage-B: mmap: {e}")))?;
+    let hook_page = remote_mmap_hook_page(pid, scratch_pc)?;
 
-    // Decode mmap's return: Linux returns -errno in the range [-4095, -1]
-    // and a valid address otherwise (linux-arm64-abi.md §11). Treat any
-    // value in that window as an errno failure regardless of sign bit.
-    if (-4095..=-1).contains(&ret) {
-        return Err(Error::HookInstallFailed(format!(
-            "stage-B: mmap returned -errno={}",
-            -ret
-        )));
-    }
-    let hook_page = ret as u64;
-
-    // NOTE: From this point until the handle is returned, a failure leaks
-    // `hook_page` (4 KiB RWX) in the tracee. This is deliberate — see the
-    // doc comment on `install_init_hook` above.
-
-    // Write the 4-byte zero sentinel (lock-list length = 0). The hook page
-    // is PROT_READ | WRITE | EXEC per the mmap args, so `process_vm_writev`
-    // inside `write_remote` respects the W bit without needing a POKE
-    // transport.
-    //
-    // SAFETY: `hook_page` was just returned by a successful `mmap` in the
-    // tracee; tracee remains ptrace-stopped via `guard`.
-    let sentinel = [0u8; 4];
-    unsafe { write_remote(pid, hook_page, &sentinel) }
-        .map_err(|e| Error::HookInstallFailed(format!("stage-B: write sentinel: {e}")))?;
-
-    // Snapshot the 16-byte prologue at `target_fn`. P04's trampoline
-    // encoder overwrites exactly this window, so preserving the originals
-    // lets us revert (or, later, single-step-over) the hook cleanly.
-    //
-    // SAFETY: `target_fn` points inside libc.text `r-xp`; `read_remote`
-    // uses `process_vm_readv` which needs only the R bit.
-    let mut saved_prologue = [0u8; 16];
-    unsafe { read_remote(pid, target_fn, &mut saved_prologue) }
-        .map_err(|e| Error::HookInstallFailed(format!("stage-B: read prologue: {e}")))?;
+    // M6 fix: any error past this point leaks `hook_page` unless we
+    // explicitly unmap. Wrap the remaining stage-B steps in a closure
+    // and, on error, issue a best-effort remote munmap before
+    // propagating — the tracee is still ptrace-stopped via `guard`.
+    let saved_prologue = match finish_stage_b_locked(pid, hook_page, target_fn) {
+        Ok(p) => p,
+        Err(e) => {
+            // SAFETY: tracee still ptrace-stopped via `guard`; munmap
+            // is legal in this window. We discard the result because
+            // best-effort cleanup must not mask the original error.
+            let _ = unsafe {
+                remote_syscall_via_poke(
+                    pid,
+                    scratch_pc,
+                    NR_MUNMAP,
+                    [hook_page, HOOK_PAGE_SIZE, 0, 0, 0, 0],
+                )
+            };
+            return Err(e);
+        }
+    };
 
     // Explicit detach — reads cleaner than leaving it to Drop, and surfaces
     // any detach failure at the install site rather than swallowing it in
@@ -256,41 +254,101 @@ pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
         lock_list_len: 0,
         target_fn,
         saved_prologue,
+        libc_base,
+        libc_end,
+        scratch_pc,
+        trampoline_installed: false,
     })
+}
+
+/// Issue the remote `mmap` for `hook_page` and decode its return.
+///
+/// Linux returns `-errno` in `[-4095, -1]` and a valid address otherwise
+/// (linux-arm64-abi.md §11). Any value in the errno window fails the
+/// install regardless of sign bit.
+fn remote_mmap_hook_page(pid: libc::pid_t, scratch_pc: u64) -> Result<u64> {
+    // SAFETY: see `derive_libc_scratch_pc` for the scratch-PC invariants;
+    // `remote_syscall_via_poke` saves / restores both the 8-byte scratch
+    // word and the saved-regs snapshot before returning (ptrace.rs:669-705),
+    // so no outer restore wrapper is required here.
+    let ret = unsafe {
+        remote_syscall_via_poke(
+            pid,
+            scratch_pc,
+            NR_MMAP,
+            [0, HOOK_PAGE_SIZE, PROT_RWX, MAP_PRIVATE_ANON, u64::MAX, 0],
+        )
+    }
+    .map_err(|e| Error::HookInstallFailed(format!("stage-B: mmap: {e}")))?;
+
+    if (-4095..=-1).contains(&ret) {
+        return Err(Error::HookInstallFailed(format!(
+            "stage-B: mmap returned -errno={}",
+            -ret
+        )));
+    }
+    Ok(ret as u64)
+}
+
+/// Finish stage-B after a successful `mmap`: write the zero sentinel on
+/// `hook_page` and snapshot the 16-byte prologue at `target_fn`.
+///
+/// Runs under the caller's `RemoteAttach`. Returning `Err` is the trigger
+/// for the caller's best-effort remote `munmap` cleanup path (M6 fix).
+fn finish_stage_b_locked(
+    pid: libc::pid_t,
+    hook_page: u64,
+    target_fn: u64,
+) -> Result<[u8; 16]> {
+    // Write the 4-byte zero sentinel (lock-list length = 0). The hook
+    // page is PROT_READ | WRITE | EXEC per the mmap args, so
+    // `process_vm_writev` inside `write_remote` respects the W bit
+    // without needing a POKE transport.
+    //
+    // SAFETY: `hook_page` was just returned by a successful `mmap` in the
+    // tracee; tracee remains ptrace-stopped via the caller's guard.
+    let sentinel = [0u8; 4];
+    unsafe { write_remote(pid, hook_page, &sentinel) }
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: write sentinel: {e}")))?;
+
+    // Snapshot the 16-byte prologue at `target_fn`. P04's trampoline
+    // encoder overwrites exactly this window, so preserving the originals
+    // lets us revert (or, later, single-step-over) the hook cleanly.
+    //
+    // SAFETY: `target_fn` points inside libc.text `r-xp`; `read_remote`
+    // uses `process_vm_readv` which needs only the R bit.
+    let mut saved_prologue = [0u8; 16];
+    unsafe { read_remote(pid, target_fn, &mut saved_prologue) }
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: read prologue: {e}")))?;
+
+    Ok(saved_prologue)
 }
 
 impl HookHandle {
     /// Best-effort remote `munmap` of the hook page during `Drop`.
     ///
-    /// Re-derives a libc.text scratch PC because the trampoline has not
-    /// been installed yet at P03 scope, so libc.text is still pristine and
-    /// a fresh `find_scratch_slot` scan will pick the same slot stage-B
-    /// used (or an equivalent one — the restore invariants do not require
-    /// identity). Errors propagate back to the `Drop` impl, which
-    /// discards them; all failures here are non-recoverable.
+    /// Reuses `self.scratch_pc` (cached at install time) instead of
+    /// re-parsing `/proc/<pid>/maps` and re-scanning libc.text. This
+    /// removes the Drop-time TOCTOU window: even if libc was hot-swapped
+    /// between install and drop, we do not re-derive into a different
+    /// VMA. The remaining stale-scratch edge case (hot-swap AFTER
+    /// install so the old PC is no longer executable) surfaces as
+    /// EFAULT/ESRCH from `remote_syscall_via_poke`, which the caller
+    /// swallows under best-effort semantics. Drop is inherently
+    /// fallible; this is an acceptable failure mode.
     fn drop_best_effort(&self) -> Result<()> {
-        let entries = seal::maps::parse_maps(self.pid)?;
-        let libc_row = entries
-            .iter()
-            .find(|e| is_libc_row(e))
-            .ok_or_else(|| Error::HookInstallFailed("drop: libc row missing".into()))?;
-        let libc_base = libc_row.start;
-        let libc_end = libc_row.end;
-
         let guard = seal::arena::RemoteAttach::new(self.pid)?;
 
-        // SAFETY: `guard` holds the tracee ptrace-stopped; the libc row we
-        // just parsed is the same `r-xp` mapping stage-B used.
-        let scratch_pc = unsafe { derive_libc_scratch_pc(self.pid, libc_base, libc_end) }?;
-
-        // SAFETY: `scratch_pc` is inside libc.text `r-xp`;
-        // `remote_syscall_via_poke` bypasses VMA write bits via
-        // PEEK/POKEDATA. `self.hook_page` was returned by stage-B's mmap
-        // and is the only argument we pass through to munmap.
+        // SAFETY: `guard` holds the tracee ptrace-stopped.
+        // `self.scratch_pc` was validated at install time as an
+        // 8-byte-aligned offset inside the tracee's `r-xp` libc
+        // mapping; `remote_syscall_via_poke` bypasses VMA write bits
+        // via PEEK/POKEDATA. `self.hook_page` was returned by
+        // stage-B's mmap and is the only argument threaded into munmap.
         unsafe {
             remote_syscall_via_poke(
                 self.pid,
-                scratch_pc,
+                self.scratch_pc,
                 NR_MUNMAP,
                 [self.hook_page, HOOK_PAGE_SIZE, 0, 0, 0, 0],
             )?;
@@ -303,20 +361,21 @@ impl HookHandle {
 
 impl Drop for HookHandle {
     fn drop(&mut self) {
-        // Stage-B never completed if `hook_page == 0`, so there is nothing
-        // in the tracee to unmap. This covers the checklist edge case
-        // "Drop fires before stage-B completes".
-        if self.hook_page == 0 {
-            return;
-        }
-
-        // NOTE for P04: once the trampoline is live at `target_fn`, this
-        // Drop MUST NOT unmap `hook_page` — init will be executing inside
-        // that page. P04 will either short-circuit Drop (flag on the
-        // handle) or revert the trampoline before letting munmap run.
+        // Typestate guards (M5):
+        //
+        // * `hook_page == 0` — stage-B never completed, nothing to unmap.
+        //   Covers the checklist edge case "Drop fires before stage-B
+        //   completes".
+        // * `trampoline_installed` — P04 has patched the prologue and
+        //   init is executing inside `hook_page`. Unmapping here would
+        //   crash init. P04 is responsible for reverting the trampoline
+        //   and unmapping the page explicitly before the handle drops.
         //
         // Errors from the best-effort path are swallowed: Drop cannot
         // propagate, and panicking here would abort on unwind.
+        if self.hook_page == 0 || self.trampoline_installed {
+            return;
+        }
         let _ = self.drop_best_effort();
     }
 }
@@ -347,12 +406,20 @@ mod tests {
             lock_list_len: 7,
             target_fn: 0x1234_5678_9abc_def0,
             saved_prologue: [0xAB; 16],
+            libc_base: 0x7000_0000_0000,
+            libc_end: 0x7000_0010_0000,
+            scratch_pc: 0x7000_0000_1000,
+            trampoline_installed: false,
         };
         assert_eq!(h.pid, 42);
         assert_eq!(h.hook_page, 0xdeadbeef_cafebabe);
         assert_eq!(h.lock_list_len, 7);
         assert_eq!(h.target_fn, 0x1234_5678_9abc_def0);
         assert_eq!(h.saved_prologue, [0xAB; 16]);
+        assert_eq!(h.libc_base, 0x7000_0000_0000);
+        assert_eq!(h.libc_end, 0x7000_0010_0000);
+        assert_eq!(h.scratch_pc, 0x7000_0000_1000);
+        assert!(!h.trampoline_installed);
     }
 
     /// Exercises `is_libc_row` against the tricky cases called out in the
