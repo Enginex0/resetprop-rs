@@ -383,20 +383,41 @@ else
 fi
 
 # --- Test 22: Seal (Tier A) — arena privatize holds sealed prop ---
-ORIG=$(getprop "$TEL_PROP")
-if $RP -sla "$TEL_PROP" "0" 2>/dev/null; then
+# Uses a DIFFERENT prop from Test 21 (audit C2): Test 21's Tier B trampoline remains
+# installed in init's text after --unseal (trampoline_installed:true prevents Drop
+# from unmapping per hook.rs:154-158). Reusing TEL_PROP would let the leftover
+# trampoline shadow the Tier A assertion — both tiers would hold the prop
+# simultaneously, so a passing assertion would not prove Tier A alone works.
+# ro.telephony.sms_receive_mode lives in the same telephony_prop arena as Test 21's
+# TEL_PROP (Tier A privatize still covers it) but carries no Tier B residue.
+TEL_PROP_A="ro.telephony.sms_receive_mode"
+ORIG_A=$(getprop "$TEL_PROP_A")
+
+# Pre-flight: can shell write this prop via setprop? The Tier A assertion requires
+# init-mediated writes to observe the privatized COW view — if SELinux rejects the
+# write before it reaches init, the test is degenerate and we skip rather than
+# report a false PASS on a prop that was never actually challenged.
+setprop "$TEL_PROP_A" "SELINUX_PROBE" 2>/dev/null
+sleep 0.1
+PROBE_LANDED=0
+[ "$(getprop "$TEL_PROP_A")" = "SELINUX_PROBE" ] && PROBE_LANDED=1
+setprop "$TEL_PROP_A" "$ORIG_A" 2>/dev/null
+
+if [ "$PROBE_LANDED" != "1" ]; then
+    log "  SKIP Test 22: setprop '$TEL_PROP_A' not writable from shell (SELinux); arena assertion would be degenerate"
+elif $RP -sla "$TEL_PROP_A" "0" 2>/dev/null; then
     for i in $(seq 1 50); do
-        setprop "$TEL_PROP" "99" 2>/dev/null
+        setprop "$TEL_PROP_A" "99" 2>/dev/null
         sleep 0.05
     done
-    ARENA_FINAL=$(getprop "$TEL_PROP")
+    ARENA_FINAL=$(getprop "$TEL_PROP_A")
     if [ "$ARENA_FINAL" = "0" ]; then
         pass "Test 22: seal Tier A — sealed held at '0' (arena privatized)"
     else
-        fail "Test 22: seal Tier A — sealed='$ARENA_FINAL'"
+        fail "Test 22: seal Tier A — sealed='$ARENA_FINAL' (expected '0')"
     fi
-    $RP --unseal-arena "$TEL_PROP" 2>/dev/null
-    setprop "$TEL_PROP" "$ORIG" 2>/dev/null
+    $RP --unseal-arena "$TEL_PROP_A" 2>/dev/null
+    setprop "$TEL_PROP_A" "$ORIG_A" 2>/dev/null
 else
     fail "Test 22: seal Tier A — install failed"
 fi
