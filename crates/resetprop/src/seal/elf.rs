@@ -513,6 +513,88 @@ pub fn gnu_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
 }
 
 // -----------------------------------------------------------------------------
+// Linear symbol-table fallback (T3)
+// -----------------------------------------------------------------------------
+
+/// Linear scan of `.dynsym` for `name`, returning the matched symbol's
+/// `st_value` or `None` on miss / malformed bounds.
+///
+/// This is the defensive net behind the GNU_HASH fast path in
+/// [`resolve_symbol`]: a libc with a missing, truncated, or otherwise
+/// malformed GNU_HASH section still permits symbol resolution as long as
+/// `.dynsym` and `.dynstr` parse.
+///
+/// Bounds policy:
+/// * `entries = (strtab_offset - symtab_offset) / size_of::<Elf64_Sym>()`.
+///   ELF toolchains emit `.dynstr` immediately after `.dynsym` in the
+///   read-only segment, so this yields the symbol count without needing
+///   `DT_HASH.nchain`. If `strtab_offset <= symtab_offset` (malformed),
+///   return `None`.
+/// * Per-entry `read_struct` failures (truncation) short-circuit to `None`.
+/// * Entries with `st_shndx == SHN_UNDEF (0)` are skipped — these are
+///   imports with no usable `st_value`.
+/// * Name comparison is byte-exact against `name.as_bytes()`.
+///
+/// Never panics.
+pub fn linear_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
+    let bytes = &view.bytes;
+    let target = name.as_bytes();
+
+    if view.strtab_offset <= view.symtab_offset {
+        return None;
+    }
+    let entries =
+        (view.strtab_offset - view.symtab_offset) / mem::size_of::<Elf64_Sym>();
+
+    for i in 0..entries {
+        let sym_off = view
+            .symtab_offset
+            .checked_add(i.checked_mul(mem::size_of::<Elf64_Sym>())?)?;
+        let sym: Elf64_Sym = read_struct(bytes, sym_off, "Sym").ok()?;
+
+        if sym.st_shndx == SHN_UNDEF {
+            continue;
+        }
+
+        let name_off = view.strtab_offset.checked_add(sym.st_name as usize)?;
+        let cand = match read_cstr_at(bytes, name_off, view.strtab_size) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        if cand == target {
+            return Some(sym.st_value);
+        }
+    }
+
+    None
+}
+
+/// Resolve `name` against `view`, preferring GNU_HASH and falling through
+/// to the linear `.dynsym` scan on miss.
+///
+/// Dispatcher order (locked by spec §Approach item 2):
+/// 1. If `view.gnu_hash_offset.is_some()`, call [`gnu_lookup`]; return on hit.
+/// 2. Otherwise (or on GNU_HASH miss), call [`linear_lookup`]; return on hit.
+/// 3. Neither resolved → `Err(Error::SymbolNotFound)`.
+///
+/// We deliberately do NOT skip linear when GNU_HASH is present but returns
+/// `None`: a malformed GNU_HASH section (bad bloom filter, truncated chain)
+/// should still permit linear to recover, which is the invariant the T4
+/// symbol-patching pipeline relies on.
+pub fn resolve_symbol(view: &LibcElfView, name: &str) -> Result<u64> {
+    if view.gnu_hash_offset.is_some() {
+        if let Some(v) = gnu_lookup(view, name) {
+            return Ok(v);
+        }
+    }
+    if let Some(v) = linear_lookup(view, name) {
+        return Ok(v);
+    }
+    Err(Error::SymbolNotFound(name.into()))
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
