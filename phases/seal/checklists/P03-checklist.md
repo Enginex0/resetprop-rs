@@ -6,32 +6,32 @@
 
 ## Prerequisites
 
-- [ ] P01 (Foundation: ptrace + maps) shows COMPLETE in REGISTRY §4
-- [ ] `crates/resetprop/src/seal/ptrace.rs` exists with public `remote_syscall` that takes `(pid, scratch_pc, syscall_no, [u64; 6])` and returns `Result<i64>`
-- [ ] `crates/resetprop/src/seal/maps.rs` exists with public `parse_maps(pid) -> Result<Vec<MapEntry>>` and a `MapEntry { start, end, perms, pathname, ... }` type
-- [ ] `crates/resetprop/src/error.rs` extended with variants `PtraceAttach`, `PtraceScope`, `ElfParse`, `SymbolNotFound`, `HookInstallFailed`
-- [ ] `crates/resetprop/src/seal/mod.rs` exists (from P01) as the module-tree root
+- [x] P01 (Foundation: ptrace + maps) shows COMPLETE in REGISTRY §4
+- [x] `crates/resetprop/src/seal/ptrace.rs` exists with public `remote_syscall` that takes `(pid, scratch_pc, syscall_no, [u64; 6])` and returns `Result<i64>` (ptrace.rs:512)
+- [x] `crates/resetprop/src/seal/maps.rs` exists with public `parse_maps(pid) -> Result<Vec<MapEntry>>` and a `MapEntry { start, end, perms, pathname, ... }` type (maps.rs:17,32)
+- [x] `crates/resetprop/src/error.rs` extended with variants `PtraceAttach`, `PtraceScope`, `ElfParse`, `SymbolNotFound`, `HookInstallFailed` (error.rs:15-23)
+- [x] `crates/resetprop/src/seal/mod.rs` exists (from P01) as the module-tree root
 
 (Source: P03 spec, Preconditions; REGISTRY §5)
 
 ## Branch
 
-- [ ] Branch `feat/P03-tier-b-part1` created (or resumed) from latest main
-- [ ] All commits follow `feat(seal):` / `test(seal):` / `fix(seal):` / `docs(seal):` prefix per REGISTRY §2
+- [x] Branch `feat/P03-tier-b-part1` created (cut from P02 tip 39ff4f4 — P03 depends on P01 only per §5, P02 changes are preserved along the parallel track)
+- [x] All commits follow `feat(seal):` / `test(seal):` / `fix(seal):` / `docs(seal):` prefix per REGISTRY §2
 
 ## Implementation Tasks (with mandatory self-audit gates)
 
 ### Task 1: Create `seal/elf.rs` with ELF64 layouts, constants, and `parse_libc_elf`
 
-- [ ] Implementation: `crates/resetprop/src/seal/elf.rs` exists with `#[repr(C)]` structs `Elf64_Ehdr` (64 B), `Elf64_Phdr` (56 B), `Elf64_Dyn` (16 B), `Elf64_Sym` (24 B), each with `const _: () = assert!(mem::size_of::<T>() == N);` guards
-- [ ] Implementation: constants `ELFMAG`, `ELFCLASS64`, `ELFDATA2LSB`, `ET_DYN = 3`, `EM_AARCH64 = 183`, `PT_LOAD = 1`, `PT_DYNAMIC = 2`, `DT_NULL = 0`, `DT_HASH = 4`, `DT_STRTAB = 5`, `DT_SYMTAB = 6`, `DT_STRSZ = 10`, `DT_SYMENT = 11`, `DT_GNU_HASH = 0x6fff_fef5`, `STT_FUNC = 2`, `STB_GLOBAL = 1`, `SHN_UNDEF = 0` all declared
-- [ ] Implementation: `pub fn parse_libc_elf(file: &File) -> Result<LibcElfView>` validates magic + class + data + machine + type + phentsize, walks phdrs, locates the single `PT_DYNAMIC`, walks `Elf64_Dyn` entries until `DT_NULL`, records `symtab_offset`, `strtab_offset`, `strtab_size`, `gnu_hash_offset` via a `vaddr_to_foff` helper built from the PT_LOAD list
-- [ ] Test: `cargo test -p resetprop --lib seal::elf::tests::ehdr_size_64` exits 0
-- [ ] Test: `cargo test -p resetprop --lib seal::elf::tests::phdr_size_56` exits 0
-- [ ] Test: `cargo test -p resetprop --lib seal::elf::tests::dyn_size_16` exits 0
-- [ ] Test: `cargo test -p resetprop --lib seal::elf::tests::sym_size_24` exits 0
-- [ ] Test: `cargo test -p resetprop --lib seal::elf::tests::parse_rejects_bad_magic` exits 0
-- [ ] Test: `cargo test -p resetprop --lib seal::elf::tests::parse_rejects_wrong_machine` exits 0
+- [x] Implementation: `crates/resetprop/src/seal/elf.rs` exists with `#[repr(C)]` structs `Elf64_Ehdr` (64 B), `Elf64_Phdr` (56 B), `Elf64_Dyn` (16 B), `Elf64_Sym` (24 B), each with `const _: () = assert!(mem::size_of::<T>() == N);` guards
+- [x] Implementation: constants `ELFMAG`, `ELFCLASS64`, `ELFDATA2LSB`, `ET_DYN = 3`, `EM_AARCH64 = 183`, `PT_LOAD = 1`, `PT_DYNAMIC = 2`, `DT_NULL = 0`, `DT_HASH = 4`, `DT_STRTAB = 5`, `DT_SYMTAB = 6`, `DT_STRSZ = 10`, `DT_SYMENT = 11`, `DT_GNU_HASH = 0x6fff_fef5`, `STT_FUNC = 2`, `STB_GLOBAL = 1`, `SHN_UNDEF = 0` all declared
+- [x] Implementation: `pub fn parse_libc_elf(file: &File) -> Result<LibcElfView>` validates magic + class + data + machine + type + phentsize, walks phdrs, locates the single `PT_DYNAMIC`, walks `Elf64_Dyn` entries until `DT_NULL`, records `symtab_offset`, `strtab_offset`, `strtab_size`, `gnu_hash_offset` via a `vaddr_to_foff` helper built from the PT_LOAD list
+- [x] Test: `cargo test -p resetprop --lib seal::elf::tests::ehdr_size_64` exits 0
+- [x] Test: `cargo test -p resetprop --lib seal::elf::tests::phdr_size_56` exits 0
+- [x] Test: `cargo test -p resetprop --lib seal::elf::tests::dyn_size_16` exits 0
+- [x] Test: `cargo test -p resetprop --lib seal::elf::tests::sym_size_24` exits 0
+- [x] Test: `cargo test -p resetprop --lib seal::elf::tests::parse_rejects_bad_magic` exits 0
+- [x] Test: `cargo test -p resetprop --lib seal::elf::tests::parse_rejects_wrong_machine` exits 0
 
 #### Self-Audit Gate 1 (MANDATORY before Task 2)
 
@@ -41,13 +41,13 @@
 
 ### Task 2: GNU_HASH lookup matching bionic chain-walk and terminator semantics
 
-- [ ] Implementation: `pub fn gnu_lookup(view: &LibcElfView, name: &str) -> Option<u64>` parses the on-disk GNU_HASH header (`nbuckets`, `symoffset`, `bloom_size`, `bloom_shift` as four u32s), then `bloom: [u64; bloom_size]`, then `buckets: [u32; nbuckets]`, then chain
-- [ ] Implementation: hash function is `h = 5381; for b in name.as_bytes() { h = h.wrapping_add(h.wrapping_shl(5)).wrapping_add(*b as u32); }` (bionic form from `linker_gnu_hash.h:46-54`)
-- [ ] Implementation: bloom test uses `bits = 64`, masks `1 << (h % bits)` and `1 << ((h >> bloom_shift) % bits)`, both must be set to proceed
-- [ ] Implementation: chain walk compares `((chain[idx] ^ h) >> 1) == 0` (per `linker_soinfo.cpp:362`) and terminates when `chain[idx] & 1 != 0` (per `linker_soinfo.cpp:371`)
-- [ ] Implementation: on chain match, reads the `Elf64_Sym` at `symtab_offset + n * 24`, reads the NUL-terminated name at `strtab_offset + st_name` (bounded by `strtab_size`), and returns `Some(sym.st_value)` only after a byte-exact name match
-- [ ] Test: `cargo test -p resetprop --lib seal::elf::tests::gnu_hash_seed_5381` asserts `gnu_hash(b"") == 5381` and `gnu_hash(b"_") == 5381*33 + b'_' as u32` (wrapping)
-- [ ] Test: `cargo test -p resetprop --lib seal::elf::tests::gnu_lookup_absent_returns_none` exits 0
+- [x] Implementation: `pub fn gnu_lookup(view: &LibcElfView, name: &str) -> Option<u64>` parses the on-disk GNU_HASH header (`nbuckets`, `symoffset`, `bloom_size`, `bloom_shift` as four u32s), then `bloom: [u64; bloom_size]`, then `buckets: [u32; nbuckets]`, then chain
+- [x] Implementation: hash function is `h = 5381; for b in name.as_bytes() { h = h.wrapping_add(h.wrapping_shl(5)).wrapping_add(*b as u32); }` (bionic form from `linker_gnu_hash.h:46-54`)
+- [x] Implementation: bloom test uses `bits = 64`, masks `1 << (h % bits)` and `1 << ((h >> bloom_shift) % bits)`, both must be set to proceed
+- [x] Implementation: chain walk compares `((chain[idx] ^ h) >> 1) == 0` (per `linker_soinfo.cpp:362`) and terminates when `chain[idx] & 1 != 0` (per `linker_soinfo.cpp:371`)
+- [x] Implementation: on chain match, reads the `Elf64_Sym` at `symtab_offset + n * 24`, reads the NUL-terminated name at `strtab_offset + st_name` (bounded by `strtab_size`), and returns `Some(sym.st_value)` only after a byte-exact name match
+- [x] Test: `cargo test -p resetprop --lib seal::elf::tests::gnu_hash_seed_5381` asserts `gnu_hash(b"") == 5381` and `gnu_hash(b"_") == 5381*33 + b'_' as u32` (wrapping)
+- [x] Test: `cargo test -p resetprop --lib seal::elf::tests::gnu_lookup_absent_returns_none` exits 0
 
 #### Self-Audit Gate 2 (MANDATORY before Task 3)
 
@@ -57,12 +57,12 @@
 
 ### Task 3: Linear fallback, `resolve_symbol` dispatcher, and fixture-based integration test
 
-- [ ] Implementation: `pub fn linear_lookup(view: &LibcElfView, name: &str) -> Option<u64>` iterates `0..((strtab_offset - symtab_offset) / 24)`, reads each `Elf64_Sym`, skips `st_shndx == SHN_UNDEF`, compares the NUL-terminated name at `strtab_offset + st_name` against the target, returns `Some(st_value)` on match
-- [ ] Implementation: `pub fn resolve_symbol(view: &LibcElfView, name: &str) -> Result<u64>` dispatches to `gnu_lookup` when `gnu_hash_offset.is_some()` and falls back to `linear_lookup`, wrapping a `None` result in `Error::SymbolNotFound(name.into())`
-- [ ] Implementation: fixture crate `crates/resetprop/tests/fixtures/elf_fixture/Cargo.toml` declares `crate-type = ["cdylib"]` and names the crate `elf_fixture`
-- [ ] Implementation: fixture `crates/resetprop/tests/fixtures/elf_fixture/src/lib.rs` exports three `#[no_mangle] pub extern "C"` functions (`__system_property_update`, `seal_fixture_probe_a`, `seal_fixture_probe_b`), all returning `0`
-- [ ] Implementation: integration test `crates/resetprop/tests/elf_fixture_smoke.rs` is `#[test] #[ignore]`, invokes `cargo build -p elf_fixture --release` via `std::process::Command`, opens the produced `.so` path, calls `parse_libc_elf` + `resolve_symbol`, and asserts (a) `__system_property_update` resolves to a non-zero `st_value`, (b) `gnu_lookup` and `linear_lookup` agree on the value for a fixture symbol
-- [ ] Test: `cargo test -p resetprop --test elf_fixture_smoke -- --ignored --test-threads=1` exits 0
+- [x] Implementation: `pub fn linear_lookup(view: &LibcElfView, name: &str) -> Option<u64>` iterates `0..((strtab_offset - symtab_offset) / 24)`, reads each `Elf64_Sym`, skips `st_shndx == SHN_UNDEF`, compares the NUL-terminated name at `strtab_offset + st_name` against the target, returns `Some(st_value)` on match
+- [x] Implementation: `pub fn resolve_symbol(view: &LibcElfView, name: &str) -> Result<u64>` dispatches to `gnu_lookup` when `gnu_hash_offset.is_some()` and falls back to `linear_lookup`, wrapping a `None` result in `Error::SymbolNotFound(name.into())`
+- [x] Implementation: fixture crate `crates/resetprop/tests/fixtures/elf_fixture/Cargo.toml` declares `crate-type = ["cdylib"]` and names the crate `elf_fixture`
+- [x] Implementation: fixture `crates/resetprop/tests/fixtures/elf_fixture/src/lib.rs` exports three `#[no_mangle] pub extern "C"` functions (`__system_property_update`, `seal_fixture_probe_a`, `seal_fixture_probe_b`), all returning `0`
+- [x] Implementation: integration test `crates/resetprop/tests/elf_fixture_smoke.rs` is `#[test] #[ignore]`, invokes `cargo build -p elf_fixture --release` via `std::process::Command`, opens the produced `.so` path, calls `parse_libc_elf` + `resolve_symbol`, and asserts (a) `__system_property_update` resolves to a non-zero `st_value`, (b) `gnu_lookup` and `linear_lookup` agree on the value for a fixture symbol
+- [x] Test: `cargo test -p resetprop --test elf_fixture_smoke -- --ignored --test-threads=1` exits 0
 
 #### Self-Audit Gate 3 (MANDATORY before Task 4)
 
@@ -72,11 +72,11 @@
 
 ### Task 4: `HookHandle` type + stage-A of `install_init_hook`
 
-- [ ] Implementation: `pub struct HookHandle { pid: libc::pid_t, hook_page: u64, lock_list_len: u32, target_fn: u64, saved_prologue: [u8; 16] }` declared in `crates/resetprop/src/seal/hook.rs`
-- [ ] Implementation: `pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle>` stage-A calls `seal::maps::parse_maps(pid)`, filters the first row with `perms == "r-xp"` and `pathname.ends_with("/libc.so")`, formats `/proc/<pid>/map_files/<start>-<end>` using hex `format!("{:x}-{:x}", start, end)`, opens it with `File::open`, parses via `seal::elf::parse_libc_elf`, resolves `__system_property_update` via `seal::elf::resolve_symbol`, and computes `target_fn = libc_base + st_value`
-- [ ] Implementation: any failure in stage-A surfaces as `Error::HookInstallFailed(msg)` wrapping the underlying `Error`, preserving the failing step in the message (e.g., `"stage-A: libc row not found in /proc/{pid}/maps"`)
-- [ ] Test: `cargo test -p resetprop --lib seal::hook::tests::hook_handle_size` asserts the struct has the expected field layout (non-zero fields are reachable via accessors)
-- [ ] Test: `cargo test -p resetprop --lib seal::hook::tests::libc_row_filter_r_xp_suffix` exercises the filter logic on a synthetic `Vec<MapEntry>` and confirms only `r-xp` + `/libc.so` suffix passes
+- [x] Implementation: `pub struct HookHandle { pid: libc::pid_t, hook_page: u64, lock_list_len: u32, target_fn: u64, saved_prologue: [u8; 16] }` declared in `crates/resetprop/src/seal/hook.rs`
+- [x] Implementation: `pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle>` stage-A calls `seal::maps::parse_maps(pid)`, filters the first row with `perms == "r-xp"` and `pathname.ends_with("/libc.so")`, formats `/proc/<pid>/map_files/<start>-<end>` using hex `format!("{:x}-{:x}", start, end)`, opens it with `File::open`, parses via `seal::elf::parse_libc_elf`, resolves `__system_property_update` via `seal::elf::resolve_symbol`, and computes `target_fn = libc_base + st_value`
+- [x] Implementation: any failure in stage-A surfaces as `Error::HookInstallFailed(msg)` wrapping the underlying `Error`, preserving the failing step in the message (e.g., `"stage-A: libc row not found in /proc/{pid}/maps"`)
+- [x] Test: `cargo test -p resetprop --lib seal::hook::tests::hook_handle_size` asserts the struct has the expected field layout (non-zero fields are reachable via accessors)
+- [x] Test: `cargo test -p resetprop --lib seal::hook::tests::libc_row_filter_r_xp_suffix` exercises the filter logic on a synthetic `Vec<MapEntry>` and confirms only `r-xp` + `/libc.so` suffix passes
 
 #### Self-Audit Gate 4 (MANDATORY before Task 5)
 
@@ -86,15 +86,15 @@
 
 ### Task 5: Stage-B — remote mmap + prologue snapshot + sentinel + Drop cleanup
 
-- [ ] Implementation: stage-B ptrace-attaches via `seal::ptrace` (SEIZE + INTERRUPT) before issuing the remote syscall
-- [ ] Implementation: `seal::ptrace::remote_syscall(pid, __NR_mmap = 222, [0_u64, 4096, 0x7, 0x22, u64::MAX, 0])` is invoked; the returned `i64` is decoded — values in `-4095..=-1` are `-errno` and surface as `Error::HookInstallFailed`, otherwise `hook_page = ret as u64`
-- [ ] Implementation: `process_vm_writev` writes a 4-byte zero word at `hook_page` (empty lock-list sentinel); `lock_list_len = 0` is set in the returned `HookHandle`
-- [ ] Implementation: `process_vm_readv` captures 16 bytes from `target_fn` into `saved_prologue: [u8; 16]`
-- [ ] Implementation: the tracer detaches (`PTRACE_DETACH`) before returning
-- [ ] Implementation: `impl Drop for HookHandle` re-attaches, issues `remote_syscall(pid, __NR_munmap = 215, [hook_page, 4096, 0, 0, 0, 0])`, detaches, and swallows all errors (best-effort cleanup)
-- [ ] Implementation: a doc comment on `impl Drop` explicitly flags that P04 will override this behavior once the trampoline is installed (must NOT unmap while the hook is live)
-- [ ] Test: `cargo test -p resetprop --lib seal::hook::tests::handle_drop_is_defined` asserts the `Drop` impl exists (compile-time check via `fn _drop_compiles<T: Drop>() {}; _drop_compiles::<HookHandle>();`)
-- [ ] Test: stage-B paths are exercised by the off-device Tier B child smoke test deferred to P04 (`tier_b_child_smoke.rs` is P04 scope per REGISTRY §3)
+- [x] Implementation: stage-B ptrace-attaches via `seal::ptrace` (SEIZE + INTERRUPT) before issuing the remote syscall
+- [x] Implementation: `seal::ptrace::remote_syscall(pid, __NR_mmap = 222, [0_u64, 4096, 0x7, 0x22, u64::MAX, 0])` is invoked; the returned `i64` is decoded — values in `-4095..=-1` are `-errno` and surface as `Error::HookInstallFailed`, otherwise `hook_page = ret as u64`
+- [x] Implementation: `process_vm_writev` writes a 4-byte zero word at `hook_page` (empty lock-list sentinel); `lock_list_len = 0` is set in the returned `HookHandle`
+- [x] Implementation: `process_vm_readv` captures 16 bytes from `target_fn` into `saved_prologue: [u8; 16]`
+- [x] Implementation: the tracer detaches (`PTRACE_DETACH`) before returning
+- [x] Implementation: `impl Drop for HookHandle` re-attaches, issues `remote_syscall(pid, __NR_munmap = 215, [hook_page, 4096, 0, 0, 0, 0])`, detaches, and swallows all errors (best-effort cleanup)
+- [x] Implementation: a doc comment on `impl Drop` explicitly flags that P04 will override this behavior once the trampoline is installed (must NOT unmap while the hook is live)
+- [x] Test: `cargo test -p resetprop --lib seal::hook::tests::handle_drop_is_defined` asserts the `Drop` impl exists (compile-time check via `fn _drop_compiles<T: Drop>() {}; _drop_compiles::<HookHandle>();`)
+- [x] Test: stage-B paths are exercised by the off-device Tier B child smoke test deferred to P04 (`tier_b_child_smoke.rs` is P04 scope per REGISTRY §3)
 
 #### Self-Audit Gate 5 (MANDATORY — phase end)
 
@@ -106,89 +106,89 @@
 
 ### ELF parser (per `references/android-libc-elf.md` §2-§4)
 
-- [ ] FR-01: `Elf64_Ehdr` is 64 bytes, `Elf64_Phdr` 56, `Elf64_Dyn` 16, `Elf64_Sym` 24, all validated by compile-time asserts (per `references/android-libc-elf.md` §2)
-- [ ] FR-02: `parse_libc_elf` rejects any file whose first 4 bytes are not `[0x7f, b'E', b'L', b'F']` (per `references/android-libc-elf.md` §4.1)
-- [ ] FR-03: `parse_libc_elf` rejects any file with `e_ident[EI_CLASS] != ELFCLASS64` (2) (per `references/android-libc-elf.md` §3)
-- [ ] FR-04: `parse_libc_elf` rejects any file with `e_ident[EI_DATA] != ELFDATA2LSB` (1) (per `references/android-libc-elf.md` §3)
-- [ ] FR-05: `parse_libc_elf` rejects any file with `e_machine != EM_AARCH64` (183) (per `references/android-libc-elf.md` §3)
-- [ ] FR-06: `parse_libc_elf` rejects any file with `e_type != ET_DYN` (3) (per `references/android-libc-elf.md` §3)
-- [ ] FR-07: `parse_libc_elf` locates the single `PT_DYNAMIC` program header and walks its entries until `DT_NULL` (per `references/android-libc-elf.md` §4.3)
-- [ ] FR-08: `parse_libc_elf` translates `DT_SYMTAB`, `DT_STRTAB`, `DT_GNU_HASH` virtual addresses to file offsets using the `PT_LOAD` map (per `references/android-libc-elf.md` §4.5)
+- [x] FR-01: `Elf64_Ehdr` is 64 bytes, `Elf64_Phdr` 56, `Elf64_Dyn` 16, `Elf64_Sym` 24, all validated by compile-time asserts (per `references/android-libc-elf.md` §2)
+- [x] FR-02: `parse_libc_elf` rejects any file whose first 4 bytes are not `[0x7f, b'E', b'L', b'F']` (per `references/android-libc-elf.md` §4.1)
+- [x] FR-03: `parse_libc_elf` rejects any file with `e_ident[EI_CLASS] != ELFCLASS64` (2) (per `references/android-libc-elf.md` §3)
+- [x] FR-04: `parse_libc_elf` rejects any file with `e_ident[EI_DATA] != ELFDATA2LSB` (1) (per `references/android-libc-elf.md` §3)
+- [x] FR-05: `parse_libc_elf` rejects any file with `e_machine != EM_AARCH64` (183) (per `references/android-libc-elf.md` §3)
+- [x] FR-06: `parse_libc_elf` rejects any file with `e_type != ET_DYN` (3) (per `references/android-libc-elf.md` §3)
+- [x] FR-07: `parse_libc_elf` locates the single `PT_DYNAMIC` program header and walks its entries until `DT_NULL` (per `references/android-libc-elf.md` §4.3)
+- [x] FR-08: `parse_libc_elf` translates `DT_SYMTAB`, `DT_STRTAB`, `DT_GNU_HASH` virtual addresses to file offsets using the `PT_LOAD` map (per `references/android-libc-elf.md` §4.5)
 
 ### GNU_HASH lookup (per `references/android-libc-elf.md` §5)
 
-- [ ] FR-09: GNU_HASH function is `h = 5381; h = h + (h << 5) + b` for each byte, matching bionic `linker_gnu_hash.h:46-54` (per `references/android-libc-elf.md` §5.2)
-- [ ] FR-10: bloom filter mask bit width is 64 (arm64 pointer size), index is `(h / 64) & (bloom_size - 1)` (per `references/android-libc-elf.md` §5.3)
-- [ ] FR-11: chain compare is `((chain[idx] ^ h) >> 1) == 0` (per bionic `linker_soinfo.cpp:362`)
-- [ ] FR-12: chain terminator is `chain[idx] & 1 != 0` (per bionic `linker_soinfo.cpp:371`)
-- [ ] FR-13: on hash match, name is byte-compared against the target before returning `Some(st_value)` (per `references/android-libc-elf.md` §5.3)
+- [x] FR-09: GNU_HASH function is `h = 5381; h = h + (h << 5) + b` for each byte, matching bionic `linker_gnu_hash.h:46-54` (per `references/android-libc-elf.md` §5.2)
+- [x] FR-10: bloom filter mask bit width is 64 (arm64 pointer size), index is `(h / 64) & (bloom_size - 1)` (per `references/android-libc-elf.md` §5.3)
+- [x] FR-11: chain compare is `((chain[idx] ^ h) >> 1) == 0` (per bionic `linker_soinfo.cpp:362`)
+- [x] FR-12: chain terminator is `chain[idx] & 1 != 0` (per bionic `linker_soinfo.cpp:371`)
+- [x] FR-13: on hash match, name is byte-compared against the target before returning `Some(st_value)` (per `references/android-libc-elf.md` §5.3)
 
 ### Linear fallback (per `references/android-libc-elf.md` §6)
 
-- [ ] FR-14: `linear_lookup` iterates at most `(strtab_offset - symtab_offset) / 24` entries (per `references/android-libc-elf.md` §6)
-- [ ] FR-15: `linear_lookup` skips entries with `st_shndx == SHN_UNDEF` (per `references/android-libc-elf.md` §7)
-- [ ] FR-16: `resolve_symbol` prefers GNU_HASH when available and falls back to linear (per P03 spec §Approach)
-- [ ] FR-17: `resolve_symbol` returns a non-zero `st_value` for `__system_property_update` against the fixture cdylib (per P03 spec §Tasks T3)
+- [x] FR-14: `linear_lookup` iterates at most `(strtab_offset - symtab_offset) / 24` entries (per `references/android-libc-elf.md` §6)
+- [x] FR-15: `linear_lookup` skips entries with `st_shndx == SHN_UNDEF` (per `references/android-libc-elf.md` §7)
+- [x] FR-16: `resolve_symbol` prefers GNU_HASH when available and falls back to linear (per P03 spec §Approach)
+- [x] FR-17: `resolve_symbol` returns a non-zero `st_value` for `__system_property_update` against the fixture cdylib (per P03 spec §Tasks T3)
 
 ### Hook installer (per P03 spec §Tasks T4-T5)
 
-- [ ] FR-18: `install_init_hook` selects the first `/proc/<pid>/maps` row with `perms == "r-xp"` and `pathname` ending in `/libc.so` (per P03 spec §Tasks T4)
-- [ ] FR-19: `install_init_hook` opens libc via `/proc/<pid>/map_files/<start>-<end>` (hex-formatted) (per `references/android-libc-elf.md` §1)
-- [ ] FR-20: `target_fn = libc_base + st_value` where `libc_base` is the row's `start` (per `references/android-libc-elf.md` §7)
-- [ ] FR-21: hook page is allocated via `remote_syscall(__NR_mmap, [0, 4096, PROT_READ|WRITE|EXEC = 0x7, MAP_PRIVATE|MAP_ANONYMOUS = 0x22, -1, 0])` (per `references/linux-arm64-abi.md` §1, §2)
-- [ ] FR-22: on success, `hook_page` is non-zero, `saved_prologue` is 16 bytes of the target function prologue, `lock_list_len == 0` (per P03 spec §Tasks T5)
-- [ ] FR-23: `Drop for HookHandle` unmaps the hook page (`__NR_munmap = 215`, length 4096) and ignores errors (per P03 spec §Tasks T5)
+- [x] FR-18: `install_init_hook` selects the first `/proc/<pid>/maps` row with `perms == "r-xp"` and `pathname` ending in `/libc.so` (per P03 spec §Tasks T4)
+- [x] FR-19: `install_init_hook` opens libc via `/proc/<pid>/map_files/<start>-<end>` (hex-formatted) (per `references/android-libc-elf.md` §1)
+- [x] FR-20: `target_fn = libc_base + st_value` where `libc_base` is the row's `start` (per `references/android-libc-elf.md` §7)
+- [x] FR-21: hook page is allocated via `remote_syscall(__NR_mmap, [0, 4096, PROT_READ|WRITE|EXEC = 0x7, MAP_PRIVATE|MAP_ANONYMOUS = 0x22, -1, 0])` (per `references/linux-arm64-abi.md` §1, §2)
+- [x] FR-22: on success, `hook_page` is non-zero, `saved_prologue` is 16 bytes of the target function prologue, `lock_list_len == 0` (per P03 spec §Tasks T5)
+- [x] FR-23: `Drop for HookHandle` unmaps the hook page (`__NR_munmap = 215`, length 4096) and ignores errors (per P03 spec §Tasks T5)
 
 ## Test Criteria
 
-- [ ] TC-01: `cargo test -p resetprop --lib seal::elf` passes with zero failures (per P03 spec §Validation)
-- [ ] TC-02: `cargo test -p resetprop --lib seal::hook` passes with zero failures (per P03 spec §Validation)
-- [ ] TC-03: `cargo test -p resetprop --test elf_fixture_smoke -- --ignored --test-threads=1` passes with zero failures (per P03 spec §Validation)
-- [ ] TC-04: `cargo test -p resetprop --lib seal::ptrace` still passes (regression check on P01) (per P03 spec §Validation)
-- [ ] TC-05: `cargo test -p resetprop --lib seal::maps` still passes (regression check on P01) (per P03 spec §Validation)
-- [ ] TC-06: `cargo build --release --target aarch64-linux-android -p resetprop-cli` produces a binary ≤ 400 KB (per REGISTRY §2 binary size target)
+- [x] TC-01: `cargo test -p resetprop --lib seal::elf` passes with zero failures (per P03 spec §Validation)
+- [x] TC-02: `cargo test -p resetprop --lib seal::hook` passes with zero failures (per P03 spec §Validation)
+- [x] TC-03: `cargo test -p resetprop --test elf_fixture_smoke -- --ignored --test-threads=1` passes with zero failures (per P03 spec §Validation)
+- [x] TC-04: `cargo test -p resetprop --lib seal::ptrace` still passes (regression check on P01) (per P03 spec §Validation)
+- [x] TC-05: `cargo test -p resetprop --lib seal::maps` still passes (regression check on P01) (per P03 spec §Validation)
+- [x] TC-06: `cargo build --release --target aarch64-linux-android -p resetprop-cli` produces a binary ≤ 400 KB (per REGISTRY §2 binary size target)
 
 ## Integration Verification
 
-- [ ] IV-01: Consumes P01: `seal::ptrace::remote_syscall`, `seal::maps::parse_maps`, `Error::ElfParse`, `Error::SymbolNotFound`, `Error::HookInstallFailed` (per REGISTRY §5)
-- [ ] IV-02: Exposes `HookHandle`, `install_init_hook`, `seal::elf::resolve_symbol` — consumed by P04 (per REGISTRY §5)
-- [ ] IV-03: Does NOT touch `info.rs`, `trie.rs`, `compact.rs`, `area.rs`, `persist/mod.rs`, `appcompat.rs` (per plan §Files modified)
-- [ ] IV-04: Does NOT add public methods to `PropSystem` (P04 scope — per P03 spec §Anti-Scope)
+- [x] IV-01: Consumes P01: `seal::ptrace::remote_syscall`, `seal::maps::parse_maps`, `Error::ElfParse`, `Error::SymbolNotFound`, `Error::HookInstallFailed` (per REGISTRY §5)
+- [x] IV-02: Exposes `HookHandle`, `install_init_hook`, `seal::elf::resolve_symbol` — consumed by P04 (per REGISTRY §5)
+- [x] IV-03: Does NOT touch `info.rs`, `trie.rs`, `compact.rs`, `area.rs`, `persist/mod.rs`, `appcompat.rs` (per plan §Files modified)
+- [x] IV-04: Does NOT add public methods to `PropSystem` (P04 scope — per P03 spec §Anti-Scope)
 
 ## Canonical Values (REGISTRY-locked)
 
 | Item | Required Value | Verified at |
 |------|----------------|-------------|
-| `DT_GNU_HASH` | `0x6fff_fef5` (`/usr/include/elf.h:890-961`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:<line>` |
-| `ET_DYN` | `3` (`/usr/include/elf.h:161`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:<line>` |
-| `EM_AARCH64` | `183` (`/usr/include/elf.h:317`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:<line>` |
-| `sizeof(Elf64_Ehdr)` | `64` (`/usr/include/elf.h:81-97`; `references/android-libc-elf.md` §2) | `crates/resetprop/src/seal/elf.rs:<line>` compile-time assert |
-| `sizeof(Elf64_Phdr)` | `56` (`/usr/include/elf.h:697-707`; `references/android-libc-elf.md` §2) | `crates/resetprop/src/seal/elf.rs:<line>` compile-time assert |
-| `sizeof(Elf64_Dyn)` | `16` (`/usr/include/elf.h:878-886`; `references/android-libc-elf.md` §2) | `crates/resetprop/src/seal/elf.rs:<line>` compile-time assert |
-| `sizeof(Elf64_Sym)` | `24` (`/usr/include/elf.h:530-538`; `references/android-libc-elf.md` §2) | `crates/resetprop/src/seal/elf.rs:<line>` compile-time assert |
-| `MAP_PRIVATE \| MAP_ANONYMOUS` | `0x22` (libc `MAP_PRIVATE = 0x02`, `MAP_ANONYMOUS = 0x20`; `references/linux-arm64-abi.md` §8) | `crates/resetprop/src/seal/hook.rs:<line>` |
-| `PROT_READ \| PROT_WRITE \| PROT_EXEC` | `0x7` (libc `PROT_READ = 0x1`, `PROT_WRITE = 0x2`, `PROT_EXEC = 0x4`) | `crates/resetprop/src/seal/hook.rs:<line>` |
-| GNU_HASH seed | `5381` (`aosp-android15/bionic/linker/linker_gnu_hash.h:46-54`; `references/android-libc-elf.md` §5.2) | `crates/resetprop/src/seal/elf.rs:<line>` |
-| Hook page size | `4096` (REGISTRY §1 — "Hook page: 4 KB RWX anonymous mmap"; plan §Tier B install step 3) | `crates/resetprop/src/seal/hook.rs:<line>` |
-| `__NR_mmap` | `222` (`asm-generic/unistd.h:570,886`; `references/linux-arm64-abi.md` §1) | `crates/resetprop/src/seal/hook.rs:<line>` |
-| `__NR_munmap` | `215` (`asm-generic/unistd.h:556`; `references/linux-arm64-abi.md` §1) | `crates/resetprop/src/seal/hook.rs:<line>` |
-| `STT_FUNC` | `2` (`/usr/include/elf.h:585-599`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:<line>` |
-| `STB_GLOBAL` | `1` (`/usr/include/elf.h:585-599`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:<line>` |
-| `SHN_UNDEF` | `0` (`/usr/include/elf.h:413`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:<line>` |
+| `DT_GNU_HASH` | `0x6fff_fef5` (`/usr/include/elf.h:890-961`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:70` |
+| `ET_DYN` | `3` (`/usr/include/elf.h:161`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:40` |
+| `EM_AARCH64` | `183` (`/usr/include/elf.h:317`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:43` |
+| `sizeof(Elf64_Ehdr)` | `64` (`/usr/include/elf.h:81-97`; `references/android-libc-elf.md` §2) | `crates/resetprop/src/seal/elf.rs:104` compile-time assert |
+| `sizeof(Elf64_Phdr)` | `56` (`/usr/include/elf.h:697-707`; `references/android-libc-elf.md` §2) | `crates/resetprop/src/seal/elf.rs:119` compile-time assert |
+| `sizeof(Elf64_Dyn)` | `16` (`/usr/include/elf.h:878-886`; `references/android-libc-elf.md` §2) | `crates/resetprop/src/seal/elf.rs:132` compile-time assert |
+| `sizeof(Elf64_Sym)` | `24` (`/usr/include/elf.h:530-538`; `references/android-libc-elf.md` §2) | `crates/resetprop/src/seal/elf.rs:148` compile-time assert |
+| `MAP_PRIVATE \| MAP_ANONYMOUS` | `0x22` (libc `MAP_PRIVATE = 0x02`, `MAP_ANONYMOUS = 0x20`; `references/linux-arm64-abi.md` §8) | `crates/resetprop/src/seal/hook.rs:44` |
+| `PROT_READ \| PROT_WRITE \| PROT_EXEC` | `0x7` (libc `PROT_READ = 0x1`, `PROT_WRITE = 0x2`, `PROT_EXEC = 0x4`) | `crates/resetprop/src/seal/hook.rs:41` |
+| GNU_HASH seed | `5381` (`aosp-android15/bionic/linker/linker_gnu_hash.h:46-54`; `references/android-libc-elf.md` §5.2) | `crates/resetprop/src/seal/elf.rs:386` |
+| Hook page size | `4096` (REGISTRY §1 — "Hook page: 4 KB RWX anonymous mmap"; plan §Tier B install step 3) | `crates/resetprop/src/seal/hook.rs:50` |
+| `__NR_mmap` | `222` (`asm-generic/unistd.h:570,886`; `references/linux-arm64-abi.md` §1) | `crates/resetprop/src/seal/arena.rs:19` (re-exported via `use crate::seal::arena::NR_MMAP` at `hook.rs:30`) |
+| `__NR_munmap` | `215` (`asm-generic/unistd.h:556`; `references/linux-arm64-abi.md` §1) | `crates/resetprop/src/seal/arena.rs:21` (re-exported via `use crate::seal::arena::NR_MUNMAP` at `hook.rs:30`) |
+| `STT_FUNC` | `2` (`/usr/include/elf.h:585-599`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:73` |
+| `STB_GLOBAL` | `1` (`/usr/include/elf.h:585-599`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:76` |
+| `SHN_UNDEF` | `0` (`/usr/include/elf.h:413`; `references/android-libc-elf.md` §3) | `crates/resetprop/src/seal/elf.rs:79` |
 
 ## Anti-Scope (explicitly excluded)
 
-- AS-01: No ARM64 trampoline encoding (P04 scope) (per P03 spec §Anti-Scope)
-- AS-02: No trampoline write at `target_fn` via `process_vm_writev` (P04 scope) (per P03 spec §Anti-Scope)
-- AS-03: No `seal_prop(name)` / `unseal_prop(name)` lock-list write path (P04 scope) (per P03 spec §Anti-Scope)
-- AS-04: No `PropSystem::seal` / `PropSystem::unseal` / `PropSystem::seals` public API (P04 scope) (per P03 spec §Anti-Scope)
-- AS-05: No CLI flag parsing for `-sl` / `--seal` / `--unseal` / `--seals` (P05 scope) (per P03 spec §Anti-Scope)
-- AS-06: No `README.md` updates for the seal user surface (P05 scope) (per P03 spec §Anti-Scope)
-- AS-07: No `tests/device-stress-test.sh` Test 21 / Test 22 additions (P05 scope) (per P03 spec §Anti-Scope)
-- AS-08: No `propdetect` heuristics for the Tier B signature (deferred post-v1 per plan §Touchpoints for propdetect; REGISTRY §1) (per P03 spec §Anti-Scope)
-- AS-09: No `SealRecord` disk persistence (deferred) (per P03 spec §Anti-Scope)
-- AS-10: No i-cache coherence `membarrier` or `isb` calls (P04 scope) (per P03 spec §Anti-Scope)
-- AS-11: No Tier A arena privatization (P02 scope, parallel track) (per P03 spec §Anti-Scope)
+- [x] AS-01: No ARM64 trampoline encoding (P04 scope) (per P03 spec §Anti-Scope)
+- [x] AS-02: No trampoline write at `target_fn` via `process_vm_writev` (P04 scope) (per P03 spec §Anti-Scope)
+- [x] AS-03: No `seal_prop(name)` / `unseal_prop(name)` lock-list write path (P04 scope) (per P03 spec §Anti-Scope)
+- [x] AS-04: No `PropSystem::seal` / `PropSystem::unseal` / `PropSystem::seals` public API (P04 scope) (per P03 spec §Anti-Scope)
+- [x] AS-05: No CLI flag parsing for `-sl` / `--seal` / `--unseal` / `--seals` (P05 scope) (per P03 spec §Anti-Scope)
+- [x] AS-06: No `README.md` updates for the seal user surface (P05 scope) (per P03 spec §Anti-Scope)
+- [x] AS-07: No `tests/device-stress-test.sh` Test 21 / Test 22 additions (P05 scope) (per P03 spec §Anti-Scope)
+- [x] AS-08: No `propdetect` heuristics for the Tier B signature (deferred post-v1 per plan §Touchpoints for propdetect; REGISTRY §1) (per P03 spec §Anti-Scope)
+- [x] AS-09: No `SealRecord` disk persistence (deferred) (per P03 spec §Anti-Scope)
+- [x] AS-10: No i-cache coherence `membarrier` or `isb` calls (P04 scope) (per P03 spec §Anti-Scope)
+- [x] AS-11: No Tier A arena privatization (P02 scope, parallel track) (per P03 spec §Anti-Scope)
 
 ## Phase-End Adversarial Audit (Gate 2)
 
