@@ -9,11 +9,3 @@ linker = "x86_64-linux-android26-clang"
 
 [target.i686-linux-android]
 linker = "i686-linux-android26-clang"
-
-# Keep every `#[no_mangle] pub extern "C"` symbol visible in the binary's
-# .dynsym table. Required by `crates/resetprop/tests/tier_b_child_smoke.rs`
-# so the hook's GNU_HASH lookup can resolve the test binary's own
-# `__system_property_update` when the parent ptraces the forked child.
-# Per `phases/seal/references/test-harness-patterns.md §5 / §9`.
-[build]
-rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]

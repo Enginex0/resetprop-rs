@@ -188,3 +188,31 @@ remote munmap, ONE detach. seal_arena / unseal_arena become thin shims
 that construct a single-element slice; seal_arena_with_mirror
 constructs a two-element slice. Effort: ~40-line refactor confined to
 seal/arena.rs. Track under future phase P0x-hardening.
+
+### P04 Gate 2 round 1 — CRITICAL 2 (off-device integration test removed)
+
+**Finding (critic)**: `tier_b_child_smoke` yields false-positive
+coverage — stage-A's `is_libc_row` (`perms == b"r-xp" && path ends_with
+"/libc.so"`) excludes the test binary's own path, and Rust's
+compile-time call from the child to `#[no_mangle] __system_property_update`
+resolves via intra-module branch instead of the `.dynsym` entry the
+hook patches. Even with `--export-dynamic` the assertion
+`locked_before == locked_after` could pass for the wrong reasons.
+
+**Decision**: Off-device integration test design is unsalvageable
+without a dedicated cdylib shim + a `cfg(test)` relaxation of
+`is_libc_row`. Both paths trade production-filter precision for
+host-side coverage of code that ultimately must be validated against
+real init — which only happens on-device. P04.2 T3 deletes
+`crates/resetprop/tests/tier_b_child_smoke.rs` and the
+`.cargo/config.toml [build] rustflags --export-dynamic` block. Tier B
+functional acceptance (hook actually blocks init's sealed-prop
+writes) becomes the aarch64 on-device run scheduled in P05.
+
+**V2 plan**: None as pure host-side coverage. If a future hardening
+phase wants to revive off-device testing for Tier B mechanics (not
+acceptance), the path is to load a cdylib shim that the child
+`dlopen`s + `dlsym`s, so stage-A sees a real `/libc.so`-suffixed row
+and the child's call routes through the shim's `.dynsym`. Effort
+estimate: two-to-three days (mirrors P03's `elf_fixture` plus the
+fork/ptrace harness plumbing). Not scheduled.

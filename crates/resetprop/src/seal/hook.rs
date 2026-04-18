@@ -1289,8 +1289,12 @@ mod tests {
     /// stage-B Drop body exercises `remote_syscall_via_poke` against a
     /// live tracee and is therefore not unit-testable from an x86_64 host;
     /// this check is the narrow invariant we can enforce without device
-    /// integration (the `tier_b_child_smoke` integration test lands in
-    /// P04 per REGISTRY §3).
+    /// integration. Tier B functional acceptance runs on-device in P05
+    /// against real init; the off-device `tier_b_child_smoke` sacrificial
+    /// child test was removed in P04.2 T3 per Gate 2 round-1 critic
+    /// CRITICAL 2 (false-positive: `is_libc_row` excludes the test binary
+    /// and Rust direct-branch routing bypasses the patched `.dynsym`
+    /// entry).
     #[test]
     fn handle_drop_is_defined() {
         // `T: Drop` is the exact bound the P03 T5 spec prescribes. Clippy's

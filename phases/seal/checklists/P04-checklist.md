@@ -125,16 +125,18 @@
 
 ### Integration Test (per `test-harness-patterns.md` §5)
 
-- [ ] FR-27: Test binary defines `#[no_mangle] pub extern "C" fn __system_property_update(pi: *mut u8, value: *const u8, len: u32) -> libc::c_int` (per test-harness-patterns.md §5)
-- [ ] FR-28: Test constructs two `PinnedPi` with names "locked.prop" and "free.prop" using 96-byte header + name bytes layout (per test-harness-patterns.md §6)
-- [ ] FR-29: Parent reads pi->value bytes via `process_vm_readv` both pre-seal and post-seal (per test-harness-patterns.md §5 `read_remote_value`)
-- [ ] FR-30: Test asserts `locked_before == locked_after` (hook blocked update) and `free_before != free_after` (pass-through worked) (per test-harness-patterns.md §11 Assertions)
-- [ ] FR-31: Test file has `#[ignore]` attribute and doc-comment line specifying `cargo test --test tier_b_child_smoke -- --ignored --test-threads=1` (per test-harness-patterns.md §12)
+**Section obsoleted by P04.2 T3.** The off-device sacrificial-child integration test was deleted per Gate 2 round-1 critic CRITICAL 2 (false-positive test — `is_libc_row` filter excludes the host binary and Rust intra-module routing bypasses the patched `.dynsym` entry even with `--export-dynamic`). All FR-27 … FR-31 below are N/A. Tier B functional acceptance runs on-device in P05 against real init.
+
+- [ ] ~~FR-27~~ N/A: Test binary defines `#[no_mangle] pub extern "C" fn __system_property_update(pi: *mut u8, value: *const u8, len: u32) -> libc::c_int` (per test-harness-patterns.md §5)
+- [ ] ~~FR-28~~ N/A: Test constructs two `PinnedPi` with names "locked.prop" and "free.prop" using 96-byte header + name bytes layout (per test-harness-patterns.md §6)
+- [ ] ~~FR-29~~ N/A: Parent reads pi->value bytes via `process_vm_readv` both pre-seal and post-seal (per test-harness-patterns.md §5 `read_remote_value`)
+- [ ] ~~FR-30~~ N/A: Test asserts `locked_before == locked_after` (hook blocked update) and `free_before != free_after` (pass-through worked) (per test-harness-patterns.md §11 Assertions)
+- [ ] ~~FR-31~~ N/A: Test file has `#[ignore]` attribute and doc-comment line specifying `cargo test --test tier_b_child_smoke -- --ignored --test-threads=1` (per test-harness-patterns.md §12)
 
 ## Test Criteria
 
 - [ ] TC-01: `cargo test -p resetprop --lib seal::hook` passes 0 failures (per spec §Validation) — annotate with test function names after run
-- [ ] TC-02: `cargo test -p resetprop --test tier_b_child_smoke -- --ignored --test-threads=1` passes 0 failures (per spec §Validation) — must run on Linux host with `/proc/sys/kernel/yama/ptrace_scope <= 1` or CAP_SYS_PTRACE (per linux-arm64-abi.md §11)
+- [ ] ~~TC-02~~ N/A per P04.2 T3: `cargo test -p resetprop --test tier_b_child_smoke -- --ignored --test-threads=1` — test file deleted per Gate 2 round-1 critic CRITICAL 2. Tier B acceptance moves to P05 aarch64 device-run.
 - [ ] TC-03: `cargo test -p resetprop` (full regression) passes 0 failures — no regression in P01/P02/P03 modules (per spec §Validation)
 - [ ] TC-04: `cargo build -p resetprop --release` produces no new warnings (per REGISTRY §2 build target)
 - [ ] TC-05: Disassembling the output of `build_hook_body_bytes(0, 0, 0)` in the encoder unit test reproduces the expected `cbz x0, .fallthrough; add x9, x0, #96; ...` sequence (per spec §Tasks T2 verification)
@@ -297,7 +299,49 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   (vi) REGISTER is idempotent per linux/membarrier.h semantics, so
   repeated trampoline installs on the same init don't accumulate state.
 
-### Self-Audit Gate T3 — TODO (pending T3 completion)
+### Self-Audit Gate T3 — Delete sacrificial-child test + rustflag
+
+- [x] **Optimality**: Considered three options.
+  (a) Delete the off-device test + rustflag and declare Tier B acceptance
+      an aarch64 device-run in P05 — chosen.
+  (b) Redesign the test with a cdylib shim that the child loads via
+      `dlopen`, so stage-A's `is_libc_row` sees a real `/libc.so`-suffixed
+      row and the child's call routes through its `.dynsym`. Rejected —
+      mirrors P03's `elf_fixture` complexity at three days of engineering
+      cost for a host-side test that still can't exercise membarrier
+      SYNC_CORE (single-core host behaves differently from SMP init).
+  (c) Widen `is_libc_row` with a `cfg(test)` branch accepting the test
+      binary's path. Rejected — tightens the production filter less
+      defensibly than deleting the test outright, and the intra-module
+      direct-branch bypass (Rust's linker resolves `__system_property_update`
+      via a relocation, not through `.dynsym`) would remain uncovered.
+  Path (a) trades host-side coverage for an honest signal: the only
+  correct proof of Tier B function is a real-init aarch64 device-run.
+- [x] **Completeness**: Deleted
+  `crates/resetprop/tests/tier_b_child_smoke.rs` (219 lines). Removed
+  the `[build] rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]`
+  block from `.cargo/config.toml` (lines 13-19, including the comment
+  block citing the removed test). Updated the `handle_drop_is_defined`
+  doc comment in `hook.rs` to cite P05 device-run instead of the
+  removed off-device test. Updated `P04-tier-b-part2.md` §Scope, §Tasks
+  T5, and §Validation to remove the test entries. Annotated
+  `P04-checklist.md` §Integration Test (FR-27..31) and §Test Criteria
+  TC-02 as N/A with strikethrough + P04.2 T3 citation. REGISTRY §8
+  deferred-findings entry logged with the full rationale.
+- [x] **Correctness**: Walked consequences — (i) library still compiles
+  and all 118 lib tests pass (no runtime code was touched). (ii)
+  `pub` visibility of `install_init_hook` / `install_trampoline` /
+  `seal_prop` / `unseal_prop` is no longer consumed by an off-module
+  test; reviewer MINOR-3 recommended tightening these to `pub(crate)`
+  but that tightening is deferred to P04.3 (MINOR scope, and the
+  `PropSystem::seal` API in `lib.rs` still consumes them as internal
+  crate callers — `pub(crate)` is the correct level). (iii) Binary
+  size should drop by ~40 KB on the next `cargo build --release` run
+  because `--export-dynamic` no longer retains `#[no_mangle]` globals
+  in `.dynsym`; re-measure in P04.3. (iv) No other tests reference
+  the deleted file — `rg tier_b_child_smoke crates/` returns zero
+  matches post-delete in source trees (only in historical docs +
+  REGISTRY log which are append-only).
 
 ### Self-Audit Gate T4 — TODO (pending T4 completion)
 
