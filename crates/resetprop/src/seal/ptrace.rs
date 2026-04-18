@@ -17,7 +17,7 @@ use super::Pid;
 use crate::error::{Error, Result};
 use std::io;
 
-use libc::{c_int, c_void, iovec};
+use libc::{c_int, c_void, iovec, process_vm_readv, process_vm_writev};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PTRACE request numbers — from bionic/libc/kernel/uapi/linux/ptrace.h
@@ -271,6 +271,207 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
         return Err(last_ptrace_err());
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-process memory IO — process_vm_{readv,writev} partial-transfer loops
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Loop `process_vm_readv` until the entire `buf` has been filled from
+/// `remote_addr` in the tracee, or the kernel returns an error.
+///
+/// See linux-arm64-abi.md §10: partial transfers are legal, so callers must
+/// advance and retry until the requested length is satisfied. A zero-byte
+/// return with bytes still outstanding is treated as a stalled transfer and
+/// surfaces as [`Error::PtraceAttach`].
+///
+/// # Safety
+///
+/// Caller guarantees `remote_addr..remote_addr + buf.len()` is readable in
+/// the tracee's address space (typically a verified mapping from
+/// [`super::maps::parse_maps`]) and that the tracee is ptrace-stopped so the
+/// read is not racing concurrent mutation.
+unsafe fn read_remote(pid: Pid, remote_addr: u64, buf: &mut [u8]) -> Result<()> {
+    let mut transferred: usize = 0;
+    while transferred < buf.len() {
+        let remaining = buf.len() - transferred;
+        let local = iovec {
+            iov_base: buf.as_mut_ptr().add(transferred) as *mut c_void,
+            iov_len: remaining,
+        };
+        let remote = iovec {
+            iov_base: (remote_addr + transferred as u64) as *mut c_void,
+            iov_len: remaining,
+        };
+        // SAFETY: `local.iov_base` points at `buf[transferred..]`, which is
+        // valid for `remaining` bytes of write. `remote` addresses tracee
+        // memory guaranteed readable by the function's safety contract.
+        // `flags` must be 0 per the man page; we pass one iovec per side.
+        let n = unsafe { process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        if n == -1 {
+            return Err(last_ptrace_err());
+        }
+        if n == 0 {
+            return Err(Error::PtraceAttach(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "process_vm_readv stalled: {transferred}/{} bytes transferred",
+                    buf.len()
+                ),
+            )));
+        }
+        transferred += n as usize;
+    }
+    Ok(())
+}
+
+/// Loop `process_vm_writev` until the entire `buf` has been written to
+/// `remote_addr` in the tracee, or the kernel returns an error.
+///
+/// Mirror of [`read_remote`]; same partial-transfer handling per
+/// linux-arm64-abi.md §10.
+///
+/// # Safety
+///
+/// Caller guarantees `remote_addr..remote_addr + buf.len()` is writable in
+/// the tracee (kernel's `process_vm_writev` path bypasses VMA write bits for
+/// ptrace-attached writers, so an rx page backing executable code is
+/// acceptable as long as the caller owns its content for the duration of
+/// the call) and that the tracee is ptrace-stopped.
+unsafe fn write_remote(pid: Pid, remote_addr: u64, buf: &[u8]) -> Result<()> {
+    let mut transferred: usize = 0;
+    while transferred < buf.len() {
+        let remaining = buf.len() - transferred;
+        let local = iovec {
+            iov_base: buf.as_ptr().add(transferred) as *mut c_void,
+            iov_len: remaining,
+        };
+        let remote = iovec {
+            iov_base: (remote_addr + transferred as u64) as *mut c_void,
+            iov_len: remaining,
+        };
+        // SAFETY: `local.iov_base` reads from `buf[transferred..]`, valid for
+        // `remaining` bytes. `remote` addresses tracee memory guaranteed
+        // writable by the function's safety contract. `flags` is 0.
+        let n = unsafe { process_vm_writev(pid, &local, 1, &remote, 1, 0) };
+        if n == -1 {
+            return Err(last_ptrace_err());
+        }
+        if n == 0 {
+            return Err(Error::PtraceAttach(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "process_vm_writev stalled: {transferred}/{} bytes transferred",
+                    buf.len()
+                ),
+            )));
+        }
+        transferred += n as usize;
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// remote_syscall — stage `svc #0 ; brk #0` and run one syscall in the tracee
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Execute `syscall_no(args...)` inside `pid` by staging an 8-byte
+/// `svc #0 ; brk #0` blob at `scratch_pc`, resuming until the `brk` traps,
+/// and reading `x0` back.
+///
+/// Caller must have already:
+/// - invoked [`ptrace_seize`] + [`ptrace_interrupt`] on `pid`;
+/// - consumed the initial SEIZE stop via [`wait_stop`];
+/// - ensured `scratch_pc` is 4-byte aligned and points inside an executable
+///   mapping in the tracee with at least 8 bytes of readable+writable+
+///   executable room (typically a bootstrap `mmap` page or a located libc
+///   padding region, per linux-arm64-abi.md §8).
+///
+/// Returns the raw `x0` as `i64`; values in `-4095..=-1` are `-errno`.
+///
+/// # Safety
+///
+/// Caller guarantees (a) the tracee is ptrace-stopped at entry, (b)
+/// `scratch_pc` satisfies the alignment/mapping contract above, and (c) no
+/// other thread in the tracee is racing on those 8 bytes.
+pub unsafe fn remote_syscall(
+    pid: Pid,
+    scratch_pc: u64,
+    syscall_no: u64,
+    args: [u64; 6],
+) -> Result<i64> {
+    // Payload: `svc #0 ; brk #0` little-endian. Derived from the two public
+    // constants so the encoding cannot drift from the ARM ARM citations.
+    let svc_bytes = ARM64_SVC_0.to_le_bytes();
+    let brk_bytes = ARM64_BRK_0.to_le_bytes();
+    let mut payload = [0u8; 8];
+    payload[..4].copy_from_slice(&svc_bytes);
+    payload[4..].copy_from_slice(&brk_bytes);
+
+    // (§7 step 2) Save the 8 bytes we are about to clobber.
+    let mut saved_bytes = [0u8; 8];
+    // SAFETY: forwards caller's `scratch_pc` readability guarantee.
+    unsafe { read_remote(pid, scratch_pc, &mut saved_bytes)? };
+
+    // (§7 step 3) Stage the svc+brk blob.
+    // SAFETY: forwards caller's `scratch_pc` writability guarantee.
+    unsafe { write_remote(pid, scratch_pc, &payload)? };
+
+    // (§7 step 4) Snapshot registers so we can restore on exit.
+    let saved_regs = getregset(pid)?;
+
+    // (§7 step 5) Build the work register set: pc=scratch, x8=syscall,
+    // x0..x5=args. Leave sp/pstate/lr untouched — kernel uses its own stack.
+    let mut work = saved_regs;
+    work.pc = scratch_pc;
+    work.regs[8] = syscall_no;
+    work.regs[0..6].copy_from_slice(&args);
+
+    // (§7 step 6) Install the work regs, then resume.
+    setregset(pid, &work)?;
+
+    // SAFETY: `libc::ptrace` FFI. `addr`/`data` are NULL per PTRACE_CONT
+    // contract. Tracee is guaranteed ptrace-stopped by the function's own
+    // safety contract, so a CONT is legal here.
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_CONT as _,
+            pid,
+            0 as *mut c_void,
+            0 as *mut c_void,
+        )
+    };
+    if rc == -1 {
+        return Err(last_ptrace_err());
+    }
+
+    // (§7 step 7) Wait for the brk trap. `wait_stop` already verifies
+    // `WIFSTOPPED && WSTOPSIG == SIGTRAP`; the event-byte-zero check below
+    // completes the brk-trap classification per linux-arm64-abi.md §9
+    // (excludes group-stop=128 and PTRACE_EVENT_* codes 1..=7).
+    let status = wait_stop(pid)?;
+    let event = (status >> 16) & 0xffff;
+    if event != 0 {
+        return Err(Error::PtraceAttach(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "remote_syscall: unexpected event byte 0x{event:x} in status 0x{status:x}"
+            ),
+        )));
+    }
+
+    // (§7 step 8) Read x0 from the post-trap register state.
+    let out = getregset(pid)?;
+    let ret = out.regs[0] as i64;
+
+    // (§7 step 9) Restore in order: regs first (so pc points back at the
+    // caller's resume address), then the scratch bytes (so a subsequent
+    // `remote_syscall` invocation sees pristine memory to clobber).
+    setregset(pid, &saved_regs)?;
+    // SAFETY: forwards caller's `scratch_pc` writability guarantee.
+    unsafe { write_remote(pid, scratch_pc, &saved_bytes)? };
+
+    Ok(ret)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
