@@ -1,12 +1,41 @@
 //! Tier A arena seal — remote `MAP_PRIVATE|MAP_FIXED` remap of init's writable
-//! view of a property arena. This file ships the mapping-lookup step (T1); the
-//! remote ptrace-driven remap (T2) and the `seal_arena`/`unseal_arena`
-//! orchestrators (T3) follow.
+//! view of a property arena. T1 shipped the mapping-lookup step; T2 shipped
+//! the word-granularity PEEK / POKE primitives and the libc.text NOP-slide
+//! finder; T3 (this file) ships the remote remap primitive
+//! (`remote_remap_private`) that T4's `seal_arena` / `unseal_arena`
+//! orchestrators will consume.
 
 use std::path::Path;
 
 use super::maps::{parse_maps, MapEntry};
 use crate::error::{Error, Result};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Syscall numbers and flag constants (REGISTRY §1 canonical values)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Syscall numbers (asm-generic/unistd.h via linux-arm64-abi.md §1)
+pub(crate) const NR_OPENAT: u64 = 56;
+pub(crate) const NR_MMAP: u64 = 222;
+pub(crate) const NR_CLOSE: u64 = 57;
+
+// fcntl/mman constants (asm-generic/fcntl.h, asm-generic/mman-common.h)
+pub(crate) const AT_FDCWD: u64 = -100_i64 as u64; // sign-extended to 64 bits
+pub(crate) const O_RDONLY_NOFOLLOW: u64 = 0x20000;
+pub(crate) const O_RDWR_NOFOLLOW: u64 = 0x20002;
+pub(crate) const PROT_RW: u64 = 0x3;
+pub(crate) const PROT_RWX: u64 = 0x7;
+pub(crate) const MAP_PRIVATE_FIXED: u64 = 0x12;
+pub(crate) const MAP_SHARED_FIXED: u64 = 0x11;
+pub(crate) const MAP_PRIVATE_ANON: u64 = 0x22;
+
+// Bootstrap scratch page size — one 4 KiB RWX anonymous mapping in init.
+pub(crate) const BOOTSTRAP_PAGE_SIZE: u64 = 4096;
+
+// Upper bound on how much of libc.text we read when scanning for a NOP slide.
+// 64 KiB covers any real libc far beyond the typical .text size but caps the
+// cross-process copy cost.
+pub(crate) const LIBC_SCAN_LIMIT: usize = 64 * 1024;
 
 /// Pure helper: scan a pre-parsed maps slice for init's writable view of
 /// `arena_path`.
@@ -23,7 +52,7 @@ use crate::error::{Error, Result};
 /// rather than returning `&MapEntry`, because `find_arena_mapping` owns the
 /// `Vec<MapEntry>` from `parse_maps` and a borrowed return would tie the
 /// caller to that vec's lifetime.
-#[allow(dead_code)] // consumed by T3 seal_arena orchestrator next session
+#[allow(dead_code)] // first direct caller lives in the integration smoke test (T5)
 fn find_arena_mapping_in(entries: &[MapEntry], arena_path: &Path) -> Result<MapEntry> {
     for entry in entries {
         if entry.path.as_deref() == Some(arena_path) && entry.perms.starts_with(b"rw") {
@@ -40,7 +69,7 @@ fn find_arena_mapping_in(entries: &[MapEntry], arena_path: &Path) -> Result<MapE
 }
 
 /// Locate init's writable mapping of `arena_path` in `/proc/<pid>/maps`.
-#[allow(dead_code)] // consumed by T3 seal_arena orchestrator next session
+#[allow(dead_code)] // consumed by T4's `seal_arena` / `unseal_arena` orchestrators
 pub(crate) fn find_arena_mapping(pid: libc::pid_t, arena_path: &Path) -> Result<MapEntry> {
     let entries = parse_maps(pid)?;
     find_arena_mapping_in(&entries, arena_path)
@@ -48,7 +77,6 @@ pub(crate) fn find_arena_mapping(pid: libc::pid_t, arena_path: &Path) -> Result<
 
 /// AArch64 `nop` instruction encoding: `d503201f` little-endian bytes
 /// `[0x1f, 0x20, 0x03, 0xd5]`. Source: ARM ARM C6.2.203.
-#[allow(dead_code)] // consumed by T3 seal_arena orchestrator next session
 pub(crate) const ARM64_NOP: u32 = 0xd503_201f;
 
 /// Scan `bytes` for the first 8-byte-aligned offset where at least four
@@ -63,7 +91,6 @@ pub(crate) const ARM64_NOP: u32 = 0xd503_201f;
 /// Returns `None` if no qualifying run exists in `bytes`. The caller surfaces
 /// this as `Error::HookInstallFailed` because the absence of a NOP slide in
 /// init's libc.text is an environment failure, not a programming error.
-#[allow(dead_code)] // consumed by T3 seal_arena orchestrator next session
 pub(crate) fn find_nop_slide(bytes: &[u8]) -> Option<usize> {
     const NOP_BYTES: [u8; 4] = ARM64_NOP.to_le_bytes();
     if bytes.len() < 16 {
@@ -82,6 +109,302 @@ pub(crate) fn find_nop_slide(bytes: &[u8]) -> Option<usize> {
         off += 4; // ARM64 instruction stride; 8-byte alignment filter applied above
     }
     None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RemapFlags — direction selector for remote_remap_private
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Direction of the arena remap — `Private` seals (blocks writes from
+/// propagating), `Shared` restores init's original view (unseal).
+#[allow(dead_code)] // variants constructed by T4's `seal_arena` / `unseal_arena`
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RemapFlags {
+    Private,
+    Shared,
+}
+
+impl RemapFlags {
+    const fn open_flags(self) -> u64 {
+        match self {
+            Self::Private => O_RDONLY_NOFOLLOW,
+            Self::Shared => O_RDWR_NOFOLLOW,
+        }
+    }
+    const fn mmap_flags(self) -> u64 {
+        match self {
+            Self::Private => MAP_PRIVATE_FIXED,
+            Self::Shared => MAP_SHARED_FIXED,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RemoteAttach — RAII guard that detaches on drop
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// RAII guard that unconditionally `PTRACE_DETACH`es on Drop.
+///
+/// Acquired immediately after `ptrace_seize + ptrace_interrupt + wait_stop`.
+/// If any subsequent operation returns `Err`, the `?` unwinds through this
+/// guard and the tracee is released. Detach failures during unwind are
+/// logged via `eprintln!` and swallowed — there is no recoverable action,
+/// and panicking in Drop would abort on unwind (double panic).
+pub(crate) struct RemoteAttach {
+    pid: super::Pid,
+    detached: bool,
+}
+
+impl RemoteAttach {
+    fn new(pid: super::Pid) -> Result<Self> {
+        super::ptrace::ptrace_seize(pid)?;
+        super::ptrace::ptrace_interrupt(pid)?;
+        super::ptrace::wait_stop(pid, super::ptrace::PTRACE_EVENT_STOP)?;
+        Ok(Self {
+            pid,
+            detached: false,
+        })
+    }
+
+    fn detach(mut self) -> Result<()> {
+        self.detached = true;
+        super::ptrace::ptrace_detach(self.pid)
+    }
+
+    fn pid(&self) -> super::Pid {
+        self.pid
+    }
+}
+
+impl Drop for RemoteAttach {
+    fn drop(&mut self) {
+        if !self.detached {
+            if let Err(e) = super::ptrace::ptrace_detach(self.pid) {
+                eprintln!("resetprop: ptrace_detach during unwind failed: {e}");
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// remote_remap_private — the core Tier A seal primitive
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Remap init's mapping of `arena_path` as `MAP_PRIVATE|MAP_FIXED`
+/// (Tier A seal) or `MAP_SHARED|MAP_FIXED` (unseal) via remote syscalls
+/// executed in the tracee's own address space.
+///
+/// Bootstrap flow:
+/// 1. Attach to `pid` (SEIZE + INTERRUPT + wait_stop(PTRACE_EVENT_STOP)).
+///    Guarded by `RemoteAttach` so a `?`-propagation still detaches.
+/// 2. Parse `/proc/<pid>/maps`, locate the first `r-xp` mapping of libc.so.
+/// 3. Read up to `LIBC_SCAN_LIMIT` bytes of its text via `read_remote`;
+///    `find_nop_slide` locates an 8-byte-aligned 16-byte NOP run.
+/// 4. Save the 8 bytes at `scratch_pc` via `ptrace_peektext`; POKE the
+///    `svc #0 ; brk #0` blob via `ptrace_poketext`.
+/// 5. Snapshot registers, build work regs running `mmap(NULL, 4096,
+///    PROT_RWX, MAP_PRIVATE|MAP_ANON, -1, 0)`, resume until brk, read x0
+///    as `bootstrap_page`. Restore scratch bytes and registers immediately
+///    — before any error-check can `?` — so libc.text is always left
+///    pristine.
+/// 6. Write the NUL-terminated arena path to `bootstrap_page` via
+///    `write_remote`; `remote_syscall` openat (scratch_pc=bootstrap_page,
+///    the fresh RWX page); `remote_syscall` mmap
+///    (`MAP_PRIVATE|MAP_FIXED` or `MAP_SHARED|MAP_FIXED` per `flags`) over
+///    the arena VMA — must return exactly `mapping.start`; `remote_syscall`
+///    close the fd.
+/// 7. `guard.detach()` returns cleanly.
+///
+/// The bootstrap RWX page is intentionally left mapped in the tracee — see
+/// the inline comment at the end of the body for the rationale.
+///
+/// # Safety
+///
+/// Caller guarantees `pid` refers to a process whose address space may be
+/// modified (typically `1` for init on a rooted Android device). The
+/// function installs a temporary 4 KiB RWX anonymous mapping in the
+/// tracee and does not unmap it before detach (see inline comment). A
+/// tracee death mid-sequence is detected as `Error::PtraceOp` via the
+/// existing `last_ptrace_op_err` path in P01's primitives.
+#[allow(dead_code)] // first consumer lives in T4's `seal_arena` / `unseal_arena`
+pub(crate) unsafe fn remote_remap_private(
+    pid: super::Pid,
+    mapping: &super::maps::MapEntry,
+    arena_path: &std::path::Path,
+    flags: RemapFlags,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let guard = RemoteAttach::new(pid)?;
+
+    // --- Locate a libc.text NOP slide in the tracee ----------------------
+    let maps_entries = super::maps::parse_maps(pid)?;
+    let libc_text = maps_entries
+        .iter()
+        .find(|e| {
+            e.perms.starts_with(b"r-x")
+                && e.path
+                    .as_deref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("libc"))
+        })
+        .ok_or_else(|| Error::HookInstallFailed("no libc.so r-x mapping in target".into()))?;
+
+    let scan_len = (libc_text.end - libc_text.start).min(LIBC_SCAN_LIMIT as u64) as usize;
+    let mut scan_buf = vec![0u8; scan_len];
+    // SAFETY: `libc_text` came from parse_maps, so `libc_text.start..+scan_len`
+    // is an `r-xp` mapping of at least `scan_len` bytes in the tracee, which
+    // process_vm_readv reads without issue (the `r` bit is set). The tracee
+    // is ptrace-stopped for the duration (guarded by `RemoteAttach` above).
+    unsafe { super::ptrace::read_remote(pid, libc_text.start, &mut scan_buf)? };
+
+    let slide_offset = find_nop_slide(&scan_buf)
+        .ok_or_else(|| Error::HookInstallFailed("no NOP slide found in libc.text".into()))?;
+    let scratch_pc = libc_text.start + slide_offset as u64;
+
+    // --- Bootstrap: POKEDATA an svc+brk blob at scratch_pc ---------------
+    let saved_bytes = super::ptrace::ptrace_peektext(guard.pid(), scratch_pc)?;
+
+    // svc #0 (low 4 bytes) ; brk #0 (high 4 bytes), little-endian pack
+    let svc_brk: u64 =
+        (super::ptrace::ARM64_SVC_0 as u64) | ((super::ptrace::ARM64_BRK_0 as u64) << 32);
+    super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, svc_brk)?;
+
+    let bootstrap_page = {
+        let saved_regs = super::ptrace::getregset(guard.pid())?;
+        let mut work = saved_regs;
+        work.pc = scratch_pc;
+        work.regs[8] = NR_MMAP;
+        work.regs[0] = 0; // addr = NULL
+        work.regs[1] = BOOTSTRAP_PAGE_SIZE; // len  = 4096
+        work.regs[2] = PROT_RWX; // prot
+        work.regs[3] = MAP_PRIVATE_ANON; // flags
+        work.regs[4] = (-1_i64) as u64; // fd = -1
+        work.regs[5] = 0; // offset
+
+        super::ptrace::setregset(guard.pid(), &work)?;
+
+        // SAFETY: `libc::ptrace` FFI; tracee is stopped per RemoteAttach's
+        // post-wait_stop contract; `addr` / `data` are NULL per the
+        // PTRACE_CONT contract.
+        let rc = unsafe {
+            libc::ptrace(
+                super::ptrace::PTRACE_CONT as _,
+                guard.pid(),
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        if rc == -1 {
+            // Best-effort restore before propagating, so libc.text isn't
+            // left with the svc+brk bytes in place.
+            let _ = super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes);
+            let _ = super::ptrace::setregset(guard.pid(), &saved_regs);
+            return Err(Error::PtraceOp(std::io::Error::last_os_error()));
+        }
+
+        super::ptrace::wait_stop(guard.pid(), 0)?;
+        let out = super::ptrace::getregset(guard.pid())?;
+        let ret = out.regs[0] as i64;
+
+        // Always restore scratch bytes + registers before inspecting the
+        // return. On failure we still leave init's text pristine.
+        super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes)?;
+        super::ptrace::setregset(guard.pid(), &saved_regs)?;
+
+        if (-4095..=-1).contains(&ret) {
+            return Err(Error::HookInstallFailed(format!(
+                "bootstrap mmap failed: errno={}",
+                -ret
+            )));
+        }
+        ret as u64
+    };
+
+    // --- Stage the arena path at `bootstrap_page` ------------------------
+    let path_bytes = arena_path.as_os_str().as_bytes();
+    let mut path_nul = Vec::with_capacity(path_bytes.len() + 1);
+    path_nul.extend_from_slice(path_bytes);
+    path_nul.push(0);
+    if path_nul.len() as u64 > BOOTSTRAP_PAGE_SIZE {
+        return Err(Error::HookInstallFailed(format!(
+            "arena path exceeds scratch page: {} bytes",
+            path_nul.len()
+        )));
+    }
+    // SAFETY: `bootstrap_page` is the fresh `PROT_RWX` page we just mapped;
+    // process_vm_writev respects VMA write bits and the page is writable.
+    // Tracee remains ptrace-stopped for the duration (guarded above).
+    unsafe { super::ptrace::write_remote(pid, bootstrap_page, &path_nul)? };
+
+    // --- openat(AT_FDCWD, bootstrap_page, flags.open_flags(), 0, 0, 0) ---
+    // SAFETY: `bootstrap_page` is a PROT_RWX page inside the tracee; the
+    // P01 `remote_syscall` contract is satisfied — scratch_pc points into
+    // an executable mapping with at least 8 bytes that may be clobbered
+    // and restored. Tracee is stopped per the RemoteAttach contract.
+    let fd_ret = unsafe {
+        super::ptrace::remote_syscall(
+            pid,
+            bootstrap_page,
+            NR_OPENAT,
+            [AT_FDCWD, bootstrap_page, flags.open_flags(), 0, 0, 0],
+        )?
+    };
+    if fd_ret < 0 {
+        return Err(Error::HookInstallFailed(format!(
+            "openat failed: errno={}",
+            -fd_ret
+        )));
+    }
+    let fd = fd_ret as u64;
+
+    // --- mmap(mapping.start, len, PROT_RW, flags.mmap_flags(), fd, 0) ----
+    // SAFETY: same rationale as the openat call above.
+    let mmap_ret = unsafe {
+        super::ptrace::remote_syscall(
+            pid,
+            bootstrap_page,
+            NR_MMAP,
+            [
+                mapping.start,
+                mapping.end - mapping.start,
+                PROT_RW,
+                flags.mmap_flags(),
+                fd,
+                0,
+            ],
+        )?
+    };
+    if mmap_ret as u64 != mapping.start {
+        // Best-effort close; diagnostic wins over tidy here.
+        // SAFETY: same rationale as the openat call above.
+        let _ = unsafe {
+            super::ptrace::remote_syscall(pid, bootstrap_page, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
+        };
+        return Err(Error::HookInstallFailed(format!(
+            "mmap returned {mmap_ret:#x}, expected {:#x}",
+            mapping.start
+        )));
+    }
+
+    // --- close(fd) -------------------------------------------------------
+    // SAFETY: same rationale as the openat call above.
+    let _ = unsafe {
+        super::ptrace::remote_syscall(pid, bootstrap_page, NR_CLOSE, [fd, 0, 0, 0, 0, 0])?
+    };
+
+    // Bootstrap page intentionally leaked: munmap would require a second
+    // POKEDATA bootstrap because the only existing RWX scratch
+    // (`bootstrap_page` itself) is the munmap target, and libc.text
+    // (still `r-xp`) cannot serve as scratch for the
+    // `process_vm_writev`-based `remote_syscall`. The 4 KiB leak per seal
+    // call is bounded (seals are rare events); unseal produces a fresh
+    // leak of the same size. A future cleanup pass could implement a
+    // second POKEDATA-staged munmap if leak accumulation becomes visible.
+
+    guard.detach()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -176,5 +499,39 @@ mod tests {
         }
         buf.extend(std::iter::repeat_n(0xFFu8, 16));
         assert_eq!(find_nop_slide(&buf), Some(32));
+    }
+
+    #[test]
+    fn remap_flags_private_maps_to_correct_values() {
+        assert_eq!(RemapFlags::Private.open_flags(), 0x20000);
+        assert_eq!(RemapFlags::Private.mmap_flags(), 0x12);
+    }
+
+    #[test]
+    fn remap_flags_shared_maps_to_correct_values() {
+        assert_eq!(RemapFlags::Shared.open_flags(), 0x20002);
+        assert_eq!(RemapFlags::Shared.mmap_flags(), 0x11);
+    }
+
+    #[test]
+    fn constants_match_registry_canonical_values() {
+        // Syscall numbers (REGISTRY §1, linux-arm64-abi.md §1)
+        assert_eq!(NR_OPENAT, 56);
+        assert_eq!(NR_MMAP, 222);
+        assert_eq!(NR_CLOSE, 57);
+
+        // fcntl / mman flags
+        assert_eq!(AT_FDCWD, (-100_i64) as u64);
+        assert_eq!(O_RDONLY_NOFOLLOW, 0x20000);
+        assert_eq!(O_RDWR_NOFOLLOW, 0x20002);
+        assert_eq!(PROT_RW, 0x3);
+        assert_eq!(PROT_RWX, 0x7);
+        assert_eq!(MAP_PRIVATE_FIXED, 0x12);
+        assert_eq!(MAP_SHARED_FIXED, 0x11);
+        assert_eq!(MAP_PRIVATE_ANON, 0x22);
+
+        // Bootstrap / scan sizing
+        assert_eq!(BOOTSTRAP_PAGE_SIZE, 4096);
+        assert_eq!(LIBC_SCAN_LIMIT, 64 * 1024);
     }
 }
