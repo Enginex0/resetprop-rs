@@ -210,8 +210,11 @@ Overwriting live libc code races concurrent threads. Two safer options:
    the first shot touches live libc.
 2. Nop-slide hunting. Scan rx regions of `libc.so` (or `[vdso]`) for a
    4-byte-aligned run of `0xD503201F` (AArch64 `nop`). `process_vm_writev`
-   bypasses VMA write bits via the kernel mm path, but I-cache
-   staleness still applies.
+   respects VMA write permissions (per `man 2 process_vm_writev`:
+   returns `EFAULT` on non-writable pages), so callers staging into rx
+   regions must either `mprotect` them writable remotely first or use
+   `PTRACE_POKEDATA`/`/proc/<pid>/mem` instead. I-cache staleness
+   still applies regardless of the transport chosen.
 
 ## 9. SIGTRAP vs Group-stop vs Syscall-stop
 

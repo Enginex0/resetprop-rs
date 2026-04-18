@@ -174,20 +174,22 @@
 |------|----------------|-------------|
 | `PROP_INFO_FIXED` | `96` (REGISTRY §1 row 24; `prop_info.h:89`) | `crates/resetprop/src/info.rs:6` (unchanged; referenced by P04) |
 | `PROP_VALUE_MAX` | `92` (REGISTRY §1 row 24; `info.rs:7`) | `crates/resetprop/src/info.rs:7` (unchanged; referenced by P04) |
-| `UserPtRegs` size | `272` bytes (linux-arm64-abi.md §3; `asm-arm64/asm/ptrace.h:49-54`) | `crates/resetprop/src/seal/ptrace.rs:104` |
-| `__NR_getpid` | `172` (linux-arm64-abi.md §1; `asm-generic/unistd.h:461`) | Declared at `crates/resetprop/src/seal/ptrace.rs:67`; invoked in test body of `crates/resetprop/tests/ptrace_core_smoke.rs` (verified on-device returns child PID) |
+| `UserPtRegs` size | `272` bytes (linux-arm64-abi.md §3; `asm-arm64/asm/ptrace.h:49-54`) | `crates/resetprop/src/seal/ptrace.rs:111` |
+| `__NR_getpid` | `172` (linux-arm64-abi.md §1; `asm-generic/unistd.h:461`) | Declared locally in `crates/resetprop/tests/ptrace_core_smoke.rs:40` (removed from library surface per Gate 2 M3 fix); invoked in test body, on-device run returns child PID |
 | `__NR_openat` | `56` (linux-arm64-abi.md §1; `asm-generic/unistd.h:158`) | Deferred to P02 (consumer phase). Not declared in P01 scope per anti-scope discipline. |
 | `__NR_mmap` | `222` (linux-arm64-abi.md §1; `asm-generic/unistd.h:570,886`) | Deferred to P02 (consumer phase). Not declared in P01 scope per anti-scope discipline. |
 | `__NR_close` | `57` (linux-arm64-abi.md §1; `asm-generic/unistd.h:160`) | Deferred to P02 (consumer phase). Not declared in P01 scope per anti-scope discipline. |
 | `PTRACE_SEIZE` | `0x4206` (linux-arm64-abi.md §4; `linux/ptrace.h:29`) | `crates/resetprop/src/seal/ptrace.rs:39` |
 | `PTRACE_INTERRUPT` | `0x4207` (linux-arm64-abi.md §4; `linux/ptrace.h:30`) | `crates/resetprop/src/seal/ptrace.rs:42` |
+| `PTRACE_O_TRACESYSGOOD` | `1` (linux-arm64-abi.md §4; `linux/ptrace.h:100`) | `crates/resetprop/src/seal/ptrace.rs:49` (added Gate 2 M1 fix) |
+| `PTRACE_EVENT_STOP` | `128` (linux-arm64-abi.md §4; `linux/ptrace.h:99`) | `crates/resetprop/src/seal/ptrace.rs:54` (added Gate 2 M2 fix — now the `expected_event` argument to `wait_stop` for SEIZE stops) |
 | `PTRACE_GETREGSET` | `0x4204` (linux-arm64-abi.md §4; `linux/ptrace.h:27`) | `crates/resetprop/src/seal/ptrace.rs:33` |
 | `PTRACE_SETREGSET` | `0x4205` (linux-arm64-abi.md §4; `linux/ptrace.h:28`) | `crates/resetprop/src/seal/ptrace.rs:36` |
 | `PTRACE_CONT` | `7` (linux-arm64-abi.md §4; `linux/ptrace.h:17`) | `crates/resetprop/src/seal/ptrace.rs:27` |
 | `PTRACE_DETACH` | `17` (linux-arm64-abi.md §4; `linux/ptrace.h:21`) | `crates/resetprop/src/seal/ptrace.rs:30` |
-| `NT_PRSTATUS` | `1` (linux-arm64-abi.md §4; `linux/elf.h:301`) | `crates/resetprop/src/seal/ptrace.rs:46` |
-| `svc #0` encoding | `0xD4000001` (linux-arm64-abi.md §2; ARM ARM C6.2.304) | `crates/resetprop/src/seal/ptrace.rs:54` |
-| `brk #0` encoding | `0xD4200000` (linux-arm64-abi.md §2; ARM ARM C6.2.41) | `crates/resetprop/src/seal/ptrace.rs:59` |
+| `NT_PRSTATUS` | `1` (linux-arm64-abi.md §4; `linux/elf.h:301`) | `crates/resetprop/src/seal/ptrace.rs:58` |
+| `svc #0` encoding | `0xD4000001` (linux-arm64-abi.md §2; ARM ARM C6.2.304) | `crates/resetprop/src/seal/ptrace.rs:68` (now `pub(crate)` per Gate 2 M3 fix) |
+| `brk #0` encoding | `0xD4200000` (linux-arm64-abi.md §2; ARM ARM C6.2.41) | `crates/resetprop/src/seal/ptrace.rs:74` (now `pub(crate)` per Gate 2 M3 fix) |
 | `SealTier::Arena` variant | `SealTier::Arena` (per REGISTRY §1 row "`SealTier` variants") | `crates/resetprop/src/seal/mod.rs:34` |
 | `SealTier::Prop` variant | `SealTier::Prop` (per REGISTRY §1 row "`SealTier` variants") | `crates/resetprop/src/seal/mod.rs:35` |
 | `SealRecord` fields | `{ name: String, arena_path: PathBuf, tier: SealTier, sealed_at: SystemTime }` (per REGISTRY §1 row "`SealRecord` fields") | `crates/resetprop/src/seal/mod.rs:20-26` |
@@ -208,27 +210,27 @@
 
 This block runs ONCE per phase, after the FINAL segment completes. NOT after each segment.
 
-- [ ] Built context-pointer block (per `.claude/system-prompt.md §Gate 2` template — both persona prompts are inlined there verbatim) with: phase spec path `/home/president/Git-repo-success/resetprop-rs/phases/seal/P01-foundation.md`, checklist path `/home/president/Git-repo-success/resetprop-rs/phases/seal/checklists/P01-checklist.md`, REGISTRY path `/home/president/Git-repo-success/resetprop-rs/phases/seal/REGISTRY-P.md`, code file paths (`crates/resetprop/src/seal/mod.rs`, `crates/resetprop/src/seal/maps.rs`, `crates/resetprop/src/seal/ptrace.rs`, `crates/resetprop/src/error.rs`, `crates/resetprop/src/lib.rs`, `crates/resetprop/tests/ptrace_core_smoke.rs`), branch name `feat/P01-foundation`, External API Verification `YES` with sources `/home/president/aosp-android15/bionic/libc/kernel/uapi/linux/ptrace.h`, `/home/president/aosp-android15/bionic/libc/kernel/uapi/linux/elf.h`, `/home/president/aosp-android15/bionic/libc/kernel/uapi/asm-arm64/asm/ptrace.h`, `/usr/include/asm-generic/unistd.h`.
-- [ ] Deployed `oh-my-claudecode:code-reviewer` (Sonnet) with Persona A prompt + context-pointer block.
-- [ ] Deployed `oh-my-claudecode:critic` (Opus) with Persona B prompt + context-pointer block.
-- [ ] Both agents dispatched IN PARALLEL (single message, two Agent tool calls).
-- [ ] External API Verification confirmed: both agents grep'd/read the listed sources and quoted real signatures for at least `PTRACE_SEIZE`, `PTRACE_INTERRUPT`, `NT_PRSTATUS`, `__NR_getpid`, and the `user_pt_regs` struct layout.
-- [ ] code-reviewer report saved at `phases/seal/audits/P01-audit.md` — verdict: `{{PASS | NEEDS_FIX}}`.
-- [ ] critic report saved at `phases/seal/audits/P01-audit.md` — verdict: `{{PASS | NEEDS_FIX}}`.
-- [ ] All CRITICAL findings resolved.
-- [ ] All MAJOR findings resolved.
-- [ ] MINOR findings logged (not blocking).
-- [ ] Re-ran both agents after fixes; both emitted `VERDICT: PASS`.
+- [x] Built context-pointer block (per `.claude/system-prompt.md §Gate 2` template — both persona prompts are inlined there verbatim) with: phase spec path `/home/president/Git-repo-success/resetprop-rs/phases/seal/P01-foundation.md`, checklist path `/home/president/Git-repo-success/resetprop-rs/phases/seal/checklists/P01-checklist.md`, REGISTRY path `/home/president/Git-repo-success/resetprop-rs/phases/seal/REGISTRY-P.md`, code file paths (`crates/resetprop/src/seal/mod.rs`, `crates/resetprop/src/seal/maps.rs`, `crates/resetprop/src/seal/ptrace.rs`, `crates/resetprop/src/error.rs`, `crates/resetprop/src/lib.rs`, `crates/resetprop/tests/ptrace_core_smoke.rs`), branch name `feat/P01-foundation`, External API Verification `YES` with sources `/home/president/aosp-android15/bionic/libc/kernel/uapi/linux/ptrace.h`, `/home/president/aosp-android15/bionic/libc/kernel/uapi/linux/elf.h`, `/home/president/aosp-android15/bionic/libc/kernel/uapi/asm-arm64/asm/ptrace.h`, `/usr/include/asm-generic/unistd.h`.
+- [x] Deployed `oh-my-claudecode:code-reviewer` (Sonnet) with Persona A prompt + context-pointer block. Rounds: 2 (round 1 NEEDS_FIX with 2 MAJOR, round 2 PASS after fix cycle).
+- [x] Deployed `oh-my-claudecode:critic` (Opus) with Persona B prompt + context-pointer block. Rounds: 2 (round 1 NEEDS_FIX with 3 MAJOR, round 2 PASS after fix cycle — upgraded from ACCEPT-WITH-RESERVATIONS to ACCEPT).
+- [x] Both agents dispatched IN PARALLEL (single message, two Agent tool calls) — both rounds.
+- [x] External API Verification confirmed: both agents read the listed AOSP sources and quoted verified signatures for `PTRACE_CONT`, `PTRACE_DETACH`, `PTRACE_GETREGSET`, `PTRACE_SETREGSET`, `PTRACE_SEIZE`, `PTRACE_INTERRUPT`, `PTRACE_O_TRACESYSGOOD` (linux/ptrace.h:100), `PTRACE_EVENT_STOP` (linux/ptrace.h:99), `NT_PRSTATUS` (linux/elf.h:301), `__NR_getpid = 172` (asm-generic/unistd.h:461), and the 272-byte `struct user_pt_regs` layout (asm-arm64/asm/ptrace.h:49-54). Zero drift found.
+- [x] code-reviewer report saved at `phases/seal/audits/P01-audit.md` — verdict: round 1 NEEDS_FIX (2 MAJOR), round 2 **PASS**.
+- [x] critic report saved at `phases/seal/audits/P01-audit.md` — verdict: round 1 NEEDS_FIX (3 MAJOR), round 2 **PASS**.
+- [x] All CRITICAL findings resolved (zero CRITICAL in both rounds).
+- [x] All MAJOR findings resolved — round 1 surfaced 4 distinct MAJORs (with 1 overlap): M1 missing `PTRACE_O_TRACESYSGOOD` (both agents), M2 `wait_stop` lacks event-byte validation (code-reviewer), M3 `Error::PtraceAttach` overloaded (critic), M4 `pub const` leak of ARM64/NR constants (critic). All four landed in fix commits `684f551` (REGISTRY amendment), `6fc6b48` (ptrace hardening), `3843209` (maps path parsing). Round 2 verified each resolution mechanically.
+- [x] MINOR findings logged (not blocking): round 1 surfaced 5 MINORs, round 2 surfaced 2 new MINORs (m5 stale checklist citations, m6 `linux-arm64-abi.md:213` wrong VMA claim). Both m5 and m6 addressed in the phase-close docs commit.
+- [x] Re-ran both agents after fixes; both emitted `VERDICT: PASS`.
 
 ## Acceptance Gate
 
-- [ ] All 5 implementation tasks COMPLETE with self-audit gates filled (non-empty Notes on Optimality, Completeness, Correctness).
-- [ ] All FR-01 through FR-29 verified with code location annotations.
-- [ ] All TC-01 through TC-09 executed and passing.
-- [ ] All IV-01 through IV-05 verified against the P02/P03/P04 consumers declared in REGISTRY §3.
-- [ ] No regressions in prerequisite phases (none — P01 is root); pre-existing library tests still pass: `cargo test -p resetprop --lib` exits 0, `cargo test -p resetprop --test device_smoke` (if present) exits 0.
-- [ ] Branch `feat/P01-foundation` commits follow `feat(seal):` / `test(seal):` / `refactor(seal):` prefix per REGISTRY §2.
-- [ ] All canonical values verified with `file:line` annotations replacing `<line>` placeholders in the Canonical Values table.
-- [ ] Gate 2 reports PASS from BOTH `code-reviewer` and `critic` agents (saved at `phases/seal/audits/P01-audit.md`).
-- [ ] REGISTRY §4 row "P01 — Foundation: ptrace + maps" updated: `Status = COMPLETE`, `Session(s)` column populated, `Notes` column summarizes deliverables.
-- [ ] REGISTRY §7 session log appended with outcome (`COMPLETE`) and both Gate 2 verdicts.
+- [x] All 5 implementation tasks COMPLETE with self-audit gates filled (non-empty Notes on Optimality, Completeness, Correctness).
+- [x] All FR-01 through FR-29 verified with code location annotations.
+- [x] All TC-01 through TC-09 executed and passing (TC-06/TC-07 verified on-device aarch64 Android 15 with 3 consecutive `1 passed` runs).
+- [x] All IV-01 through IV-06 verified against the P02/P03/P04 consumers declared in REGISTRY §3.
+- [x] No regressions in prerequisite phases (none — P01 is root); `cargo test -p resetprop --lib` = `63 passed; 0 failed` (+5 over T0 baseline 58, all in `seal::*`).
+- [x] Branch `feat/P01-foundation` commits follow `feat(seal):` / `fix(seal):` / `test(seal):` / `refactor(seal):` / `docs(seal):` prefix per REGISTRY §2.
+- [x] All canonical values verified with `file:line` annotations (Canonical Values table updated post-fix-cycle to reflect shifted line numbers after Gate 2 M1/M2/M3 fixes).
+- [x] Gate 2 reports PASS from BOTH `code-reviewer` and `critic` agents after two rounds (saved at `phases/seal/audits/P01-audit.md` under `## code-reviewer report` / `## critic report` and `## code-reviewer report — round 2` / `## critic report — round 2`).
+- [x] REGISTRY §4 row "P01 — Foundation: ptrace + maps" updated: `Status = COMPLETE`, `Session(s)` column populated with S01+S02, `Notes` column summarizes deliverables.
+- [x] REGISTRY §7 session log appended with outcome (`COMPLETE`) and both Gate 2 round 2 verdicts.
