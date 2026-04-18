@@ -58,8 +58,11 @@ pub(super) fn parse_line(line: &str, pid: libc::pid_t) -> Result<Option<MapEntry
         Error::AreaCorrupt(format!("/proc/{pid}/maps: {detail}"))
     };
 
-    // Columns: ADDR perms offset dev inode [path]
-    let mut it = trimmed.split_whitespace();
+    // Columns: ADDR perms offset dev inode [path]. Split on exactly the first
+    // five single-space separators so any spaces inside the path column
+    // (kernel writes raw spaces for some unusual paths — see the
+    // `seq_path_root` call in `fs/proc/task_mmu.c`) survive verbatim.
+    let mut it = trimmed.splitn(6, ' ');
 
     let addr = it.next().ok_or_else(|| corrupt("missing address column"))?;
     let perms_tok = it.next().ok_or_else(|| corrupt("missing perms column"))?;
@@ -84,22 +87,26 @@ pub(super) fn parse_line(line: &str, pid: libc::pid_t) -> Result<Option<MapEntry
     let offset = u64::from_str_radix(offset_tok, 16)
         .map_err(|_| corrupt(&format!("invalid offset '{offset_tok}'")))?;
 
-    // Remainder of the line after the inode column is the path (or empty).
-    // split_whitespace collapses runs of spaces, so the path cannot contain
-    // leading spaces once we rejoin; real maps paths never contain spaces.
-    let path = {
-        let remainder: Vec<&str> = it.collect();
-        if remainder.is_empty() {
-            None
-        } else {
-            let joined = remainder.join(" ");
-            // Strip the kernel's unlinked-file marker (see fs/proc/task_mmu.c
-            // show_map_vma — it appends " (deleted)" to any VMA whose backing
-            // dentry has been unlinked). Only this exact 10-byte suffix is
-            // stripped; `[vdso]`, `[stack]`, `[heap]` and friends stay verbatim.
-            const DELETED: &str = " (deleted)";
-            let cleaned = joined.strip_suffix(DELETED).unwrap_or(&joined);
-            Some(PathBuf::from(cleaned))
+    // Path column is the raw remainder after the inode. The kernel pads the
+    // inode column with spaces for alignment (see `show_map_vma`), so the
+    // raw remainder may start with one or more spaces — trim leading
+    // whitespace, then preserve any interior whitespace verbatim.
+    //
+    // Strip the kernel's unlinked-file marker (see fs/proc/task_mmu.c
+    // `show_map_vma` — it appends " (deleted)" to any VMA whose backing
+    // dentry has been unlinked). Only this exact 10-byte suffix is
+    // stripped; `[vdso]`, `[stack]`, `[heap]` stay verbatim.
+    let path = match it.next() {
+        None => None,
+        Some(raw) => {
+            let trimmed_path = raw.trim_start();
+            if trimmed_path.is_empty() {
+                None
+            } else {
+                const DELETED: &str = " (deleted)";
+                let cleaned = trimmed_path.strip_suffix(DELETED).unwrap_or(trimmed_path);
+                Some(PathBuf::from(cleaned))
+            }
         }
     };
 
