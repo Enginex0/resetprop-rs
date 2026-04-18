@@ -380,6 +380,165 @@ impl Drop for HookHandle {
     }
 }
 
+/// A64 (ARM64) instruction encoders.
+///
+/// Every output is an aligned little-endian `u32` word. All encoders are
+/// `const fn` with inline `assert!` guards on immediate ranges; they run at
+/// compile time when invoked inside a `const` context and panic at runtime
+/// when out-of-range arguments are passed in a non-const call site.
+///
+/// # References
+///
+/// * ARM DDI 0487 Part C, Chapter C6 — A64 base instructions.
+/// * `phases/seal/references/arm64-a64-encoding.md` — canonical opcode
+///   table and bit-layout mirrors used by this module.
+/// * REGISTRY §1 rows `Trampoline — 16 bytes at symbol entry`,
+///   `Trampoline LDR opcode for ldr x16,[pc,#8]`, `ARM64 encoder` —
+///   locked canonical hex values (`NOP=0xd503201f`, `RET=0xd65f03c0`,
+///   `ISB=0xd5033fdf`, `SVC #0=0xd4000001`, `BRK #0=0xd4200000`,
+///   `LDR x16,[pc,#8]=0x58000050`, `BR x16=0xd61f0200`).
+///
+/// Scope: Task 1 of P04 ships exactly the 7 consts + 15 helpers the phase
+/// spec enumerates; no additional abstractions are introduced. Task 2 /
+/// Task 3 of the same phase will consume these from `build_hook_body_bytes`
+/// and `install_trampoline`; until then the symbols are dead from the
+/// library's perspective, hence the module-level `allow(dead_code)`.
+#[allow(dead_code)]
+pub(crate) mod encoder {
+    /// Signed-range check for a two's-complement `bits`-wide immediate.
+    ///
+    /// Used by branch / PC-relative encoders to guard the imm19 / imm26
+    /// fields before masking.
+    #[inline]
+    const fn fits_signed(v: i32, bits: u32) -> bool {
+        let half = 1i32 << (bits - 1);
+        v >= -half && v < half
+    }
+
+    /// Mask `v` into the low `bits` bits as an unsigned value. Callers must
+    /// have already verified the range via `fits_signed`.
+    #[inline]
+    const fn mask_signed(v: i32, bits: u32) -> u32 {
+        (v as u32) & ((1u32 << bits) - 1)
+    }
+
+    /// `nop` — canonical hint encoding (C6.2.273).
+    pub const NOP: u32 = 0xd503_201f;
+
+    /// `ret x30` — C6.2.312 with Rn=30.
+    pub const RET_X30: u32 = 0xd65f_03c0;
+
+    /// `isb sy` — C6.2.187 with CRm=0b1111.
+    pub const ISB_SY: u32 = 0xd503_3fdf;
+
+    /// `svc #0` — C6.2.392, LL=01.
+    pub const SVC_0: u32 = 0xd400_0001;
+
+    /// `brk #0` — C6.2.44, LL=00.
+    pub const BRK_0: u32 = 0xd420_0000;
+
+    /// `ldr x16, [pc, #8]` — trampoline first word (REGISTRY §1).
+    pub const LDR_X16_PC8: u32 = 0x5800_0050;
+
+    /// `br x16` — trampoline second word (REGISTRY §1).
+    pub const BR_X16: u32 = 0xd61f_0200;
+
+    /// `svc #imm16` (C6.2.392). `imm16` occupies bits [20:5].
+    pub const fn svc(imm16: u16) -> u32 {
+        0xd400_0001 | ((imm16 as u32) << 5)
+    }
+
+    /// `brk #imm16` (C6.2.44). `imm16` occupies bits [20:5].
+    pub const fn brk(imm16: u16) -> u32 {
+        0xd420_0000 | ((imm16 as u32) << 5)
+    }
+
+    /// `ret xN` (C6.2.312). Rn in bits [9:5]; default arch alias uses Rn=30.
+    pub const fn ret(rn: u8) -> u32 {
+        assert!(rn < 32);
+        0xd65f_0000 | ((rn as u32) << 5)
+    }
+
+    /// `br xN` (C6.2.41). Rn in bits [9:5].
+    pub const fn br(rn: u8) -> u32 {
+        assert!(rn < 32);
+        0xd61f_0000 | ((rn as u32) << 5)
+    }
+
+    /// `blr xN` (C6.2.40). Rn in bits [9:5]; writes X30.
+    pub const fn blr(rn: u8) -> u32 {
+        assert!(rn < 32);
+        0xd63f_0000 | ((rn as u32) << 5)
+    }
+
+    /// `ldr xt, [pc, #byte_offset]` (C6.2.200). `byte_offset` must be ×4
+    /// and its imm19 field must fit a signed 19-bit value.
+    pub const fn ldr_literal(rt: u8, byte_offset: i32) -> u32 {
+        assert!(rt < 32 && byte_offset % 4 == 0);
+        let imm19 = byte_offset / 4;
+        assert!(fits_signed(imm19, 19));
+        0x5800_0000 | (mask_signed(imm19, 19) << 5) | (rt as u32)
+    }
+
+    /// `add xd, xn, #imm12` (C6.2.4, sf=1, sh=0). `imm12` must fit 12 bits.
+    pub const fn add_imm64(rd: u8, rn: u8, imm12: u16) -> u32 {
+        assert!(rd < 32 && rn < 32 && (imm12 as u32) < (1 << 12));
+        0x9100_0000 | ((imm12 as u32) << 10) | ((rn as u32) << 5) | (rd as u32)
+    }
+
+    /// `movz xd, #imm16, LSL #(hw*16)` (C6.2.271, sf=1). `hw` in 0..=3.
+    pub const fn movz(rd: u8, imm16: u16, hw: u8) -> u32 {
+        assert!(rd < 32 && hw < 4);
+        0xd280_0000 | ((hw as u32) << 21) | ((imm16 as u32) << 5) | (rd as u32)
+    }
+
+    /// `movk xd, #imm16, LSL #(hw*16)` (C6.2.270, sf=1). `hw` in 0..=3.
+    pub const fn movk(rd: u8, imm16: u16, hw: u8) -> u32 {
+        assert!(rd < 32 && hw < 4);
+        0xf280_0000 | ((hw as u32) << 21) | ((imm16 as u32) << 5) | (rd as u32)
+    }
+
+    /// `cbz xt, #byte_offset` (C6.2.48, sf=1). Signed 21-bit range, ×4.
+    pub const fn cbz(rt: u8, byte_offset: i32) -> u32 {
+        assert!(rt < 32 && byte_offset % 4 == 0);
+        let imm19 = byte_offset / 4;
+        assert!(fits_signed(imm19, 19));
+        0xb400_0000 | (mask_signed(imm19, 19) << 5) | (rt as u32)
+    }
+
+    /// `cbnz xt, #byte_offset` (C6.2.47, sf=1). Signed 21-bit range, ×4.
+    pub const fn cbnz(rt: u8, byte_offset: i32) -> u32 {
+        assert!(rt < 32 && byte_offset % 4 == 0);
+        let imm19 = byte_offset / 4;
+        assert!(fits_signed(imm19, 19));
+        0xb500_0000 | (mask_signed(imm19, 19) << 5) | (rt as u32)
+    }
+
+    /// `b #byte_offset` (C6.2.34). Signed 28-bit range, ×4.
+    pub const fn b_rel(byte_offset: i32) -> u32 {
+        assert!(byte_offset % 4 == 0);
+        let imm26 = byte_offset / 4;
+        assert!(fits_signed(imm26, 26));
+        0x1400_0000 | mask_signed(imm26, 26)
+    }
+
+    /// `ldrb wt, [xn, #imm12]` unsigned-offset form (C6.2.203). Byte-scaled.
+    pub const fn ldrb_imm(rt: u8, rn: u8, imm12: u16) -> u32 {
+        assert!(rt < 32 && rn < 32 && (imm12 as u32) < (1 << 12));
+        0x3940_0000 | ((imm12 as u32) << 10) | ((rn as u32) << 5) | (rt as u32)
+    }
+
+    /// `nop` — shorthand for the fixed opcode.
+    pub const fn nop() -> u32 {
+        NOP
+    }
+
+    /// `isb sy` — shorthand for the fixed opcode.
+    pub const fn isb() -> u32 {
+        ISB_SY
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,5 +637,143 @@ mod tests {
         #[allow(drop_bounds)]
         fn _drop_compiles<T: Drop>() {}
         _drop_compiles::<HookHandle>();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P04 T1 — A64 encoder submodule tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Round-trips a 16-byte absolute-target trampoline built from the
+    /// encoder helpers against the canonical byte pattern from
+    /// `references/arm64-a64-encoding.md` §Absolute-target trampoline.
+    ///
+    /// This is the strongest round-trip check we can run without a
+    /// disassembler: it proves (a) `LDR_X16_PC8` and `BR_X16` consts match
+    /// the helper-constructed forms for x16, and (b) the imm19 field of
+    /// `ldr_literal(16, 8)` encodes to the expected `0x58000050` word.
+    #[test]
+    fn trampoline_from_helpers_matches_reference() {
+        use super::encoder::{br, ldr_literal};
+
+        let target: u64 = 0x0000_7fff_abcd_1234;
+        let ldr = ldr_literal(16, 8).to_le_bytes();
+        let br_x16 = br(16).to_le_bytes();
+        let lo = (target as u32).to_le_bytes();
+        let hi = ((target >> 32) as u32).to_le_bytes();
+
+        let actual: [u8; 16] = [
+            ldr[0], ldr[1], ldr[2], ldr[3], br_x16[0], br_x16[1], br_x16[2], br_x16[3], lo[0],
+            lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3],
+        ];
+
+        let expected: [u8; 16] = [
+            0x50, 0x00, 0x00, 0x58, 0x00, 0x02, 0x1f, 0xd6, 0x34, 0x12, 0xcd, 0xab, 0xff, 0x7f,
+            0x00, 0x00,
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    /// Defends the 7 pub consts against refactoring drift. Every value is
+    /// pinned in REGISTRY §1 or `references/arm64-a64-encoding.md` §Instruction
+    /// Table, so any change here must be accompanied by a REGISTRY amendment.
+    #[test]
+    fn opcodes_match_canonical_values() {
+        use super::encoder::{BRK_0, BR_X16, ISB_SY, LDR_X16_PC8, NOP, RET_X30, SVC_0};
+
+        assert_eq!(NOP, 0xd503_201f);
+        assert_eq!(RET_X30, 0xd65f_03c0);
+        assert_eq!(ISB_SY, 0xd503_3fdf);
+        assert_eq!(SVC_0, 0xd400_0001);
+        assert_eq!(BRK_0, 0xd420_0000);
+        assert_eq!(LDR_X16_PC8, 0x5800_0050);
+        assert_eq!(BR_X16, 0xd61f_0200);
+    }
+
+    // Bit-range assertion sub-tests. Each helper is exercised once with an
+    // out-of-range argument to confirm the inline `assert!` fires. The
+    // tests are split per-case so a single regression surfaces the exact
+    // helper whose guard changed.
+
+    #[test]
+    #[should_panic]
+    fn add_imm64_rejects_imm12_equal_to_4096() {
+        let _ = super::encoder::add_imm64(0, 0, 4096);
+    }
+
+    #[test]
+    #[should_panic]
+    fn add_imm64_rejects_rd_equal_to_32() {
+        let _ = super::encoder::add_imm64(32, 0, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn ret_rejects_rn_equal_to_32() {
+        let _ = super::encoder::ret(32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn br_rejects_rn_equal_to_32() {
+        let _ = super::encoder::br(32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn blr_rejects_rn_equal_to_32() {
+        let _ = super::encoder::blr(32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn ldr_literal_rejects_unaligned_offset() {
+        let _ = super::encoder::ldr_literal(0, 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn ldr_literal_rejects_imm19_overflow() {
+        // imm19 signed range is [-2^18, 2^18 - 1] words = [-1048576, 1048572] bytes.
+        // 1048576 (2^20) in bytes is one past the positive limit and must assert.
+        let _ = super::encoder::ldr_literal(0, 1 << 20);
+    }
+
+    #[test]
+    #[should_panic]
+    fn movz_rejects_hw_equal_to_4() {
+        let _ = super::encoder::movz(0, 0, 4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn movk_rejects_hw_equal_to_4() {
+        let _ = super::encoder::movk(0, 0, 4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn cbz_rejects_unaligned_offset() {
+        let _ = super::encoder::cbz(0, 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn cbnz_rejects_unaligned_offset() {
+        let _ = super::encoder::cbnz(0, 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn b_rel_rejects_imm26_overflow() {
+        // imm26 signed range is [-2^25, 2^25 - 1] words. 2^25 words = 2^27 bytes
+        // = 134_217_728 is one past the positive limit and must assert.
+        let _ = super::encoder::b_rel(1 << 27);
+    }
+
+    #[test]
+    #[should_panic]
+    fn ldrb_imm_rejects_imm12_equal_to_4096() {
+        let _ = super::encoder::ldrb_imm(0, 0, 4096);
     }
 }
