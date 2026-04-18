@@ -614,10 +614,12 @@ impl PropSystem {
     ///    `SealTier::Prop`; existing entries with the same `(name, tier)`
     ///    have their timestamp refreshed rather than duplicated.
     ///
-    /// A poisoned hook-handle mutex surfaces as
-    /// `Error::HookInstallFailed` rather than `unwrap_or_else` recovery —
-    /// poisoning means a prior `seal()` panicked mid-install and silent
-    /// recovery could leave the registry inconsistent with the tracee.
+    /// A poisoned hook-handle mutex is recovered with a stderr
+    /// warning rather than returning a permanent error — matches the
+    /// seals-registry poison handling at `insert_or_refresh_seal` and
+    /// closes Gate 2 round-1 critic MAJOR 4, which flagged that the
+    /// prior error surface could brick the API for the lifetime of the
+    /// process after a single mid-install panic.
     pub fn seal(&self, name: &str, value: &str) -> Result<SealRecord> {
         let primary_path = self.resolve_arena_path(name)?;
         let filename = arena_filename(&primary_path)?;
@@ -628,9 +630,10 @@ impl PropSystem {
         self.set_stealth(name, value)?;
 
         let slot = self.hook_handle.get_or_init(|| Mutex::new(None));
-        let mut guard = slot.lock().map_err(|_| {
-            Error::HookInstallFailed("seal: hook_handle mutex poisoned".to_string())
-        })?;
+        let mut guard = slot.lock().unwrap_or_else(|poisoned| {
+            eprintln!("resetprop: seal: hook_handle mutex was poisoned; recovering");
+            poisoned.into_inner()
+        });
         if guard.is_none() {
             let mut handle = seal::hook::install_init_hook(seal::INIT_PID)?;
             seal::hook::install_trampoline(&mut handle)?;
@@ -660,9 +663,10 @@ impl PropSystem {
     /// ptrace work when the hook has not been installed.
     pub fn unseal(&self, name: &str) -> Result<bool> {
         let slot = self.hook_handle.get_or_init(|| Mutex::new(None));
-        let mut guard = slot.lock().map_err(|_| {
-            Error::HookInstallFailed("unseal: hook_handle mutex poisoned".to_string())
-        })?;
+        let mut guard = slot.lock().unwrap_or_else(|poisoned| {
+            eprintln!("resetprop: unseal: hook_handle mutex was poisoned; recovering");
+            poisoned.into_inner()
+        });
         let handle = match guard.as_mut() {
             Some(h) => h,
             None => return Ok(false),
@@ -672,9 +676,10 @@ impl PropSystem {
 
         if removed {
             let registry = seal::seals_registry();
-            let mut entries = registry.lock().map_err(|_| {
-                Error::HookInstallFailed("unseal: seals registry mutex poisoned".to_string())
-            })?;
+            let mut entries = registry.lock().unwrap_or_else(|poisoned| {
+                eprintln!("resetprop: unseal: seals registry mutex was poisoned; recovering");
+                poisoned.into_inner()
+            });
             entries.retain(|r| !(r.name == name && r.tier == SealTier::Prop));
         }
         Ok(removed)
@@ -686,9 +691,10 @@ impl PropSystem {
     /// not reflected in the snapshot.
     pub fn seals(&self) -> Result<Vec<SealRecord>> {
         let registry = seal::seals_registry();
-        let entries = registry.lock().map_err(|_| {
-            Error::HookInstallFailed("seals: seals registry mutex poisoned".to_string())
-        })?;
+        let entries = registry.lock().unwrap_or_else(|poisoned| {
+            eprintln!("resetprop: seals: seals registry mutex was poisoned; recovering");
+            poisoned.into_inner()
+        });
         Ok(entries.clone())
     }
 

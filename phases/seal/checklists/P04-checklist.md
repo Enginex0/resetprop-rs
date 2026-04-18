@@ -521,3 +521,53 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   state (new_len) still matches the tracee; `RemoteAttach::drop`
   detaches on unwind. No off-by-entry overwrite on the next
   `seal_prop` call. This is the scenario the fix closes.
+
+### Self-Audit Gate T3 — `OnceLock<Mutex<_>>` poison recovery
+
+- [x] **Optimality**: Considered three responses to a poisoned lock.
+  (a) `unwrap_or_else(|p| p.into_inner())` with a stderr warning —
+      chosen. Matches the existing precedent at
+      `insert_or_refresh_seal` (`lib.rs:821-824`) and
+      `remove_seal_record` (`lib.rs:840`) and closes the critic's
+      "brick the API" failure mode; a single panic mid-install no
+      longer freezes the `seal` / `unseal` / `seals` APIs for the
+      lifetime of the process.
+  (b) Drop the `Mutex` wrapper altogether per the critic's observation
+      that ptrace-SEIZE already serialises tracer access. Rejected —
+      the `Mutex` also protects `hook_handle.get_or_init`'s one-shot
+      install path from two threads racing into `install_init_hook`
+      with the same init PID, which SEIZE does not prevent. Scope too
+      deep for a fix lane.
+  (c) Replace `Mutex` with `parking_lot::Mutex` (no poisoning). Rejected —
+      introduces a new runtime dependency, breaking REGISTRY §1 row 12
+      "libc = 0.2 only (prod)".
+- [x] **Completeness**: Four `.lock().map_err(...)?` call sites replaced
+  with the `.lock().unwrap_or_else(|poisoned| { eprintln!(...);
+  poisoned.into_inner() })` pattern: `seal` hook-handle lock at
+  `lib.rs:633-636`, `unseal` hook-handle lock at `lib.rs:666-669`,
+  `unseal` seals-registry lock at `lib.rs:679-682`, `seals`
+  seals-registry lock at `lib.rs:694-697`. The stale doc paragraph
+  above `pub fn seal` that justified the old error-surface was
+  rewritten to document the new recovery semantics. `seals()` still
+  returns `Result<Vec<SealRecord>>` even though the body is now
+  infallible — changing the return type is a breaking API change and
+  would be scope-creep against the fix lane's remit. 118 lib tests
+  pass; clippy clean.
+- [x] **Correctness**: Walked three poisoning sequences.
+  (i) No panic ever occurs — lock is never poisoned, `unwrap_or_else`
+  never fires, behaviour identical to before the fix.
+  (ii) `seal()` panics mid-install (e.g. ptrace EPERM on a hardened
+  kernel) while holding the hook-handle lock. Mutex gets poisoned on
+  unwind; next `seal()` call's lock recovery warns to stderr and
+  accesses the `Option<HookHandle>`. If the panic hit before
+  `*guard = Some(handle)`, the `Option` is `None` and install is
+  retried. If the panic hit after `*guard = Some(handle)` but before
+  `seal_prop` completed, the `Option` is `Some(handle)` and the next
+  `seal_prop` call runs `lock_list_append_bytes` against the current
+  tracee state — safe because the counter bump now lives inside the
+  attach window (T2 fix).
+  (iii) `seals()` is called concurrently with a mid-write poison on
+  the registry mutex. Recovery returns the clone of the registry's
+  pre-panic state. Stale data is acceptable here: `seals()` is a
+  read-only snapshot and the caller is expected to re-query for
+  freshness under write contention.
