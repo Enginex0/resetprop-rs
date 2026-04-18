@@ -401,3 +401,349 @@ With these six changes, VERDICT would move from NEEDS_FIX → PASS. Minor findin
 ---
 
 **VERDICT: NEEDS_FIX** (1 CRITICAL + 5 MAJOR)
+
+## critic report — round 2
+
+**Reviewer:** oh-my-claudecode:critic (claude-opus-4-7)
+**Mode:** THOROUGH — no escalation (0 CRITICAL, 0 MAJOR surfaced)
+**Date:** 2026-04-18
+**Branch:** `feat/P03-tier-b-part1`
+**Diff base:** `39ff4f4` (P02 HEAD)
+**Scope verified:** round-1 audit, 2 fix commits (56a27df, 2b89a24), current state of `crates/resetprop/src/seal/elf.rs` and `crates/resetprop/src/seal/hook.rs`, bionic ground truth at `linker_relocate.h:60-74`, `linker.cpp:2912-2917`, `linker_soinfo.cpp:327-371`, `elf.h` constants.
+
+---
+
+### Round-1 findings — verification
+
+| ID | Finding | Fix verified | Notes |
+|----|---------|--------------|-------|
+| C1 | hook.rs TOCTOU stage-A/stage-B | **PASS** | `install_init_hook` (hook.rs:205-262) now acquires `RemoteAttach` FIRST (line 206), then calls `stage_a_locked` (line 210) which runs `parse_maps` → `File::open("/proc/<pid>/map_files/...")` → `parse_libc_elf` → `resolve_symbol` inside the attach window. Pattern mirrors P02 arena.rs:278-304. No residual TOCTOU. |
+| M1 | gnu_lookup/linear_lookup missing STB_GLOBAL\|STB_WEAK + st_shndx filter | **PASS** | `is_global_or_weak_defined` (elf.rs:403-406) mirrors `linker_relocate.h:60-74` verbatim (STB_GLOBAL∨STB_WEAK ∧ st_shndx≠SHN_UNDEF). Called in both `gnu_lookup` (elf.rs:540) and `linear_lookup` (elf.rs:595). STB_WEAK=2 constant added (elf.rs:84). 2 new tests (`gnu_lookup_rejects_local_symbol`, `gnu_lookup_rejects_undef_symbol`) green. |
+| M2 | parse_libc_elf missing seek-to-0 | **PASS** | `f.seek(SeekFrom::Start(0))` added (elf.rs:260) before `read_to_end`. try_clone fd-share-offset hazard closed. Inline comment (elf.rs:252-256) documents the dup(2) rationale. |
+| M3 | resolve_symbol fell through to linear on GNU_HASH miss | **PASS** | `resolve_symbol` (elf.rs:624-631) now dispatches XOR: `gnu_lookup` when GNU_HASH is present, `linear_lookup` ONLY when absent. Rationale doc-block (elf.rs:615-623) cites spec §Approach item 2 and lists failure modes of the old fall-through semantics. |
+| M4 | gnu_lookup accepted non-PoT bloom_size | **PASS** | `!bloom_size.is_power_of_two()` guard at elf.rs:488. Matches bionic `linker.cpp:2912-2916` reject pattern. Test `gnu_lookup_rejects_non_power_of_two_bloom` green. |
+| M5 | Drop foot-gun / no typestate | **PASS** | `trampoline_installed: bool` field added (hook.rs:89), Drop guards on `hook_page == 0 \|\| trampoline_installed` (hook.rs:376). Comment at lines 83-89 documents the P04 flip point. Structural guard now replaces the doc-only caveat. P04 has a compile-visible flag to flip rather than a prose-only invariant. |
+| M6 | RWX page leak on post-mmap error | **PASS** | Post-mmap steps extracted into `finish_stage_b_locked` (hook.rs:298-325). Error path in `install_init_hook` issues `remote_syscall_via_poke(NR_MUNMAP, ...)` before propagating (hook.rs:228-241). Mirrors P02 `910ce69` restore pattern. Leak class eliminated. |
+| M7 | drop_best_effort re-derived scratch non-deterministically | **PASS** | `HookHandle` now caches `libc_base`, `libc_end`, `scratch_pc` (hook.rs:80-82). `drop_best_effort` (hook.rs:339-359) reuses `self.scratch_pc` directly — no second `parse_maps`, no second libc.text scan. Stale-cache edge case (libc hot-swap after install) documented as acceptable best-effort failure mode (hook.rs:330-338). |
+
+All 8 round-1 findings are architecturally sound fixes, not band-aids. Each one either mirrors a bionic reference or applies a pattern already locked in P01/P02.
+
+---
+
+### Round-2 gap analysis — new concerns
+
+I specifically looked for regressions introduced by the fixes and for architectural hazards the round-1 review might have missed. The following were investigated and cleared:
+
+- **`gnu_lookup` chain walk after `is_global_or_weak_defined` rejection.** Bionic at `linker_soinfo.cpp:362-371` has a do-while loop that increments `n` and continues scanning after a candidate fails the check. Our Rust implementation (elf.rs:523-549) also continues: after a failed `cand == target && is_global_or_weak_defined(&sym)`, we do NOT return — the control flow falls through to the `(c & 1) != 0` terminator check and then `n = n.checked_add(1)?`. Matches bionic semantics. CLEAR.
+- **Stage-A ran under attach → `File::open("/proc/<pid>/map_files/...")` could now block a ptrace-stopped tracee.** Verified: `/proc/<pid>/map_files/` is served by the kernel, not the tracee. Opening the symlink does NOT require the tracee to be scheduled. No deadlock. CLEAR.
+- **`trampoline_installed` default of `false` in `install_init_hook`'s return** — P04 must remember to flip. This is still weaker than true typestate (e.g. consuming `self` into `InstalledHookHandle`), but the M5 fix compromise is a reasonable middle ground for P03 scope: the flag is visible at every construction site, it's a compile error to omit, and the Drop guard is explicit. True typestate would require P04 to redesign the handle lifecycle. LOG as open concern only.
+- **Explicit `guard.detach()` call at install end (hook.rs:247-249)** — round-1 did not flag this but it's a divergence from P02's "let `RemoteAttach::drop` handle detach" pattern. Verified at arena.rs: P02 does call `guard.detach()?` explicitly at arena.rs:466 for the same reason (surface detach failure at the call site). Consistent with existing convention. CLEAR.
+- **Cached `scratch_pc` pins to a byte offset inside libc.text** that remains valid as long as `libc_base..libc_end` stays mapped. The Drop comment at hook.rs:330-338 correctly narrows this to a best-effort failure mode. Tradeoff is acceptable — alternative (re-scan on every Drop) reintroduces the original TOCTOU class. CLEAR.
+- **Test coverage for the new round-2 fixes.** Three new unit tests (`gnu_lookup_rejects_local_symbol`, `gnu_lookup_rejects_undef_symbol`, `gnu_lookup_rejects_non_power_of_two_bloom`) cover M1 + M4. `gnu_lookup_absent_returns_none` still covers the default bloom-reject path. M6 cleanup path is device-only code and is gated under the P04 integration test per checklist §Task 5. All 11 `seal::elf` lib tests pass at round-2 verification.
+
+---
+
+### Remaining MINOR items (carry-over from round 1, non-blocking)
+
+- **m1** (round-1): `gnu_lookup`/`linear_lookup` mask `strtab_size == 0` silently. Latent hazard if DT_STRSZ ever absent — bionic always emits it. Non-blocking.
+- **m2** (round-1): `DT_GNU_HASH` declared as `i64`; cosmetic, no bit-pattern issue.
+- **m3** (round-1): Integration test uses `env!("CARGO_MANIFEST_DIR") + "/../../target/release/libelf_fixture.so"` — breaks under `CARGO_TARGET_DIR` override. Ergonomic gap only.
+- **m4** (round-1): `hook_handle_size` test name evokes `mem::size_of` but asserts field round-trip. Rename to `hook_handle_fields_round_trip` recommended but not blocking.
+- **m5** (round-1): `gnu_lookup` mixes `u32_le`/`u64_le` (safe) with `read_struct` (unsafe). Consistency smell; no runtime impact.
+
+All five MINORs were logged-only in round 1 and remain so. None block phase closure.
+
+---
+
+### Open Questions (unscored)
+
+- P04 must flip `trampoline_installed = true` between the trampoline write and the first possible Drop. If P04 accepts this responsibility, M5 is fully resolved. If P04 can't guarantee the flip (e.g. under async drop or panic-through), a true typestate consume (`HookHandle::install_trampoline(self) -> InstalledHookHandle`) is still the only hard-safe design. Flag for P04 review.
+- The P02 §8 deferred finding MAJOR-5 (`wait_stop` spurious-stops retry) applies to every `RemoteAttach::new` call. P03 now makes TWO attach points in the install+drop lifecycle (install + Drop), each subject to that deferred hazard. Not new — inherited — but the surface grew. Consider prioritizing the P0x-hardening wait_stop_retry lift.
+
+---
+
+### Realist Check
+
+All 8 round-1 findings have commit-level evidence and test coverage. No new CRITICAL or MAJOR class of defect surfaced in round 2. The fixes are architecturally sound (attach-first TOCTOU resolution, bionic-parallel binding filter, explicit typestate flag, mirrored P02 cleanup pattern). The remaining residual risks are (a) the typestate flag being weaker than a true consuming state machine, and (b) inherited `wait_stop` spurious-stops surface, both of which are correctly out of P03 scope.
+
+VERDICT: PASS
+
+## code-reviewer report — round 2
+
+**Reviewer:** oh-my-claudecode:code-reviewer (claude-sonnet-4-6)
+**Date:** 2026-04-18
+**Branch:** `feat/P03-tier-b-part1`
+**Diff base:** `39ff4f4` (P02 HEAD)
+**Fix commits reviewed:**
+  - `56a27df` fix(seal): P03 Gate 2 elf.rs findings (M1-M4)
+  - `2b89a24` fix(seal): P03 Gate 2 hook.rs findings (C1, M5-M7)
+**Files reviewed:** `elf.rs` (902 lines), `hook.rs` (482 lines)
+
+---
+
+### Mandate
+
+Verify that each of the 8 round-1 findings (C1, M1–M7) is correctly closed. Hunt for new bugs introduced by the fixes themselves. Re-run the external API verification for all changed code paths.
+
+---
+
+### Round-1 Finding Closure Verification
+
+#### C1 — TOCTOU across stage-A / stage-B
+
+**Status: CLOSED — CORRECT**
+
+`install_init_hook` (`hook.rs:205-261`) now acquires `RemoteAttach::new(pid)` at line 206 _before_ calling `stage_a_locked(pid)` at line 210. `stage_a_locked` is a private function whose doc comment at line 113-121 explicitly states "This MUST be called while the caller holds a live `RemoteAttach` on `pid`" and references the P02 pattern at `arena.rs:278-304`. The entire pipeline — `parse_maps`, `File::open("/proc/<pid>/map_files/...")`, `parse_libc_elf`, `resolve_symbol`, `derive_libc_scratch_pc`, `remote_mmap_hook_page`, `finish_stage_b_locked` — runs under one uninterrupted attach window. The TOCTOU gap is closed.
+
+#### M1 — `gnu_lookup` missing STB_GLOBAL|STB_WEAK + st_shndx != SHN_UNDEF filter
+
+**Status: CLOSED — CORRECT**
+
+`is_global_or_weak_defined` (`elf.rs:403-406`) implements bionic's `linker_relocate.h:60-74` predicate exactly:
+```rust
+fn is_global_or_weak_defined(sym: &Elf64_Sym) -> bool {
+    let bind = sym.st_info >> 4;
+    (bind == STB_GLOBAL || bind == STB_WEAK) && sym.st_shndx != SHN_UNDEF
+}
+```
+External API verification — `linker_relocate.h:60-68` (read directly):
+```cpp
+inline bool is_symbol_global_and_defined(const soinfo* si, const ElfW(Sym)* s) {
+  if (__predict_true(ELF_ST_BIND(s->st_info) == STB_GLOBAL ||
+                     ELF_ST_BIND(s->st_info) == STB_WEAK)) {
+    return s->st_shndx != SHN_UNDEF;
+  }
+  ...
+  return false;
+}
+```
+Match is exact. `gnu_lookup` at line 540 calls `is_global_or_weak_defined` after name-match and only returns `Some(sym.st_value)` when the predicate passes. `linear_lookup` at line 595 also applies the same predicate (improvement over the original SHN_UNDEF-only guard). Three new unit tests (`gnu_lookup_rejects_local_symbol`, `gnu_lookup_rejects_undef_symbol`, `gnu_lookup_rejects_non_power_of_two_bloom`) pin these invariants. `STB_WEAK = 2` is now a named `pub const` at line 84.
+
+The fix correctly continues walking the chain (does not stop) when a hash+name match passes but the binding/shndx filter fails. This is behaviorally correct: bionic's do-while loop at `linker_soinfo.cpp:360-371` evaluates all four conditions (`chain ^ hash`, `version`, `strcmp`, `is_global_and_defined`) as one conjunct; if any fails, the loop continues. Our code at lines 528-548 achieves the same: the `is_global_or_weak_defined` check is inside the `((c ^ h) >> 1) == 0` arm, so a partial match (hash matches, name matches, but binding/shndx fails) does not break the loop — it falls through to the terminator check at line 545. **CORRECT.**
+
+#### M2 — `parse_libc_elf` did not seek to offset 0 before `read_to_end`
+
+**Status: CLOSED — CORRECT**
+
+`parse_libc_elf` (`elf.rs:249-263`) now explicitly calls `f.seek(SeekFrom::Start(0))` before `read_to_end`:
+```rust
+let mut f = file.try_clone()?;
+f.seek(SeekFrom::Start(0))
+    .map_err(|e| Error::ElfParse(format!("seek to 0: {e}")))?;
+f.read_to_end(&mut bytes)?;
+```
+The doc comment at lines 253-256 correctly explains the rationale (POSIX `dup` shares the file offset). The seek error is wrapped as `ElfParse` so it propagates cleanly. Fix is correct and complete.
+
+#### M3 — `resolve_symbol` fell through to linear on GNU_HASH miss
+
+**Status: CLOSED — CORRECT**
+
+`resolve_symbol` (`elf.rs:624-631`) now dispatches exclusively — no fallthrough on miss:
+```rust
+pub fn resolve_symbol(view: &LibcElfView, name: &str) -> Result<u64> {
+    let result = if view.gnu_hash_offset.is_some() {
+        gnu_lookup(view, name)
+    } else {
+        linear_lookup(view, name)
+    };
+    result.ok_or_else(|| Error::SymbolNotFound(name.into()))
+}
+```
+A `gnu_lookup` miss when `gnu_hash_offset.is_some()` now immediately maps to `Err(SymbolNotFound)`. This matches spec §Approach item 2 ("linear scan is a fallback ONLY when `DT_GNU_HASH` is absent") and bionic's own `find_symbol_by_name` (`linker_soinfo.cpp:324`) which never falls back from GNU_HASH to linear. The doc comment at lines 613-623 correctly explains both correctness and performance rationale. Fix is correct.
+
+#### M4 — `gnu_lookup` accepted non-power-of-2 `bloom_size`
+
+**Status: CLOSED — CORRECT**
+
+Guard at `elf.rs:488`:
+```rust
+if nbuckets == 0 || bloom_size == 0 || !bloom_size.is_power_of_two() {
+    return None;
+}
+```
+Verified against `linker.cpp:2912-2916` (read directly):
+```cpp
+if (!powerof2(gnu_maskwords_)) {
+  DL_ERR("invalid maskwords for gnu_hash = 0x%x, ...");
+  return false;
+}
+```
+Our check rejects non-PoT bloom_size before ever computing `(bloom_size - 1)` as a mask. Combined with `bloom_size == 0` already guarded in the same condition. Unit test `gnu_lookup_rejects_non_power_of_two_bloom` (line 866) exercises `bloom_size = 3` (non-PoT) and asserts `None`. Fix is correct.
+
+#### M5 — Drop foot-gun — unconditional `munmap`, no typestate guard
+
+**Status: CLOSED — CORRECT**
+
+`HookHandle` (`hook.rs:74-90`) now carries `pub(crate) trampoline_installed: bool` initialized to `false` at construction (line 260). `Drop::drop` (`hook.rs:362-381`) guards on both:
+```rust
+if self.hook_page == 0 || self.trampoline_installed {
+    return;
+}
+```
+The doc comment at lines 84-90 explicitly states P04's obligation: flip `trampoline_installed = true` after the trampoline is live; only unmap explicitly after reverting. This encodes the safety invariant in the type (observable state) rather than prose alone. Not full typestate (the compiler cannot enforce it cross-phase), but it is the practical equivalent within Rust's type system for a single-crate pub(crate) field. Fix is correct within P03's scope.
+
+#### M6 — RWX page leak on post-mmap error paths
+
+**Status: CLOSED — CORRECT**
+
+`install_init_hook` (`hook.rs:226-242`) wraps the post-mmap steps in a match that fires a best-effort remote `munmap` on `Err`:
+```rust
+let saved_prologue = match finish_stage_b_locked(pid, hook_page, target_fn) {
+    Ok(p) => p,
+    Err(e) => {
+        let _ = unsafe {
+            remote_syscall_via_poke(pid, scratch_pc, NR_MUNMAP,
+                [hook_page, HOOK_PAGE_SIZE, 0, 0, 0, 0])
+        };
+        return Err(e);
+    }
+};
+```
+The cleanup runs under the same `RemoteAttach` guard still in scope. The original error is propagated without masking. All three failure sites identified in round 1 (sentinel write, prologue read, detach) propagate through `finish_stage_b_locked` which returns `Err` on any step failure, triggering this cleanup. Fix is correct.
+
+#### M7 — `drop_best_effort` re-derived scratch non-deterministically; no cached libc base
+
+**Status: CLOSED — CORRECT**
+
+`HookHandle` now caches `libc_base`, `libc_end`, `scratch_pc` as `pub(crate)` fields (lines 80-82), populated from install-time values (lines 257-259). `drop_best_effort` (`hook.rs:339-359`) uses `self.scratch_pc` directly — no re-parse of `/proc/<pid>/maps`, no second libc.text scan. The doc comment at lines 330-338 correctly explains this removes the Drop-time TOCTOU window. Fix is correct.
+
+---
+
+### External API Re-Verification (changed code paths)
+
+#### `linker_gnu_hash.h:46-54` — hash function
+Actual source (read directly):
+```c
+uint32_t h = 5381;
+while (*name_bytes != 0) {
+    h += (h << 5) + *name_bytes++;
+}
+```
+`elf.rs:414-418`: seed 5381, `h.wrapping_add(h.wrapping_shl(5)).wrapping_add(u32::from(b))`. **MATCHES.**
+
+#### `linker_soinfo.cpp:327-377` — `gnu_lookup` chain walk
+Actual source (read directly, lines 360-371):
+```cpp
+do {
+  ElfW(Sym)* s = symtab_ + n;
+  if (((gnu_chain_[n] ^ hash) >> 1) == 0 &&
+      check_symbol_version(versym, n, verneed) &&
+      strcmp(get_string(s->st_name), symbol_name.get_name()) == 0 &&
+      is_symbol_global_and_defined(this, s)) {
+    return symtab_ + n;
+  }
+} while ((gnu_chain_[n++] & 1) == 0);
+```
+Our `elf.rs:523-548`: `((c ^ h) >> 1) == 0` → read sym → read name → `cand == target && is_global_or_weak_defined(&sym)` → return `Some`. Terminator `(c & 1) != 0` → return `None`. Post-increment handled by `n = n.checked_add(1)?` at line 548. **MATCHES semantically.** (Version check `check_symbol_version` is absent — acceptable; bionic's libc.so does not use `.gnu.version` per `android-libc-elf.md §5`.)
+
+#### `linker.cpp:2900-2917` — GNU_HASH on-disk layout and maskwords check
+Actual source (read directly):
+```cpp
+gnu_nbucket_ = reinterpret_cast<uint32_t*>(load_bias + d->d_un.d_ptr)[0];
+// skip symndx (index [1])
+gnu_maskwords_ = reinterpret_cast<uint32_t*>(load_bias + d->d_un.d_ptr)[2];
+gnu_shift2_ = reinterpret_cast<uint32_t*>(load_bias + d->d_un.d_ptr)[3];
+gnu_bloom_filter_ = reinterpret_cast<ElfW(Addr)*>(load_bias + d->d_un.d_ptr + 16);
+gnu_bucket_ = reinterpret_cast<uint32_t*>(gnu_bloom_filter_ + gnu_maskwords_);
+// amend chain for symndx = header[1]
+gnu_chain_ = gnu_bucket_ + gnu_nbucket_ -
+    reinterpret_cast<uint32_t*>(load_bias + d->d_un.d_ptr)[1];
+if (!powerof2(gnu_maskwords_)) { DL_ERR(...); return false; }
+--gnu_maskwords_;
+```
+Our `elf.rs:479-494`: header[0]=nbuckets, header[1]=symoffset (skipped in bionic's maskwords slot but used for chain index adjustment), header[2]=bloom_size, header[3]=bloom_shift. Bloom base at offset 16. Bucket base = bloom_base + bloom_size*8. Chain base = bucket_base + nbuckets*4. Power-of-two check at line 488. **MATCHES.**
+
+Note: bionic does `gnu_maskwords_--` after the power-of-two check, making it `bloom_size - 1`. Our code does not store a decremented field — it applies `(bloom_size - 1)` inline at line 499. These are algebraically equivalent.
+
+#### `linker_relocate.h:60-74` — `is_symbol_global_and_defined`
+Verified above under M1. **MATCHES.**
+
+---
+
+### New Code Introduced by Fixes — Line-by-Line Review
+
+#### `elf.rs` fix additions
+
+**`is_global_or_weak_defined` (lines 403-406):** Correct. `st_info >> 4` is the standard `ELF_ST_BIND` macro equivalent. Both STB_GLOBAL (1) and STB_WEAK (2) are accepted. `st_shndx != SHN_UNDEF` rejects undefined imports. No new issues.
+
+**`STB_WEAK: u8 = 2` constant (line 84):** Matches `/usr/include/elf.h:587` value. Correctly documented with bionic cross-reference. No issues.
+
+**Seek before `read_to_end` (lines 259-262):** Correctly uses `SeekFrom::Start(0)`. Error mapped to `ElfParse`. No issues.
+
+**Power-of-two guard in `gnu_lookup` (line 488):** `u32::is_power_of_two()` is a stable Rust method returning `false` for 0 (special case — `0.is_power_of_two() == false` in Rust). However the code already guards `bloom_size == 0` in the same condition, so this is redundant but harmless. No issues.
+
+**`is_global_or_weak_defined` call in chain walk (line 540):** Placed after `cand == target` — this is correct for performance (hash check then name check then binding check, same order as bionic). The predicate does not stop the chain walk on failure, only on success-with-correct-binding. No issues.
+
+**`is_global_or_weak_defined` call in `linear_lookup` (line 595):** Replaces the original `st_shndx == SHN_UNDEF` guard. This is strictly stronger (also rejects STB_LOCAL entries). Correct, consistent with `gnu_lookup`.
+
+**Three new unit tests (lines 840-873):**
+- `gnu_lookup_rejects_local_symbol`: builds synthetic view with `st_info = (0u8 << 4) | STT_FUNC` (STB_LOCAL). The `build_synthetic_view` helper uses `bloom_size = 1` (power-of-two). Chain word is `(h & !1) | 1` (hash with terminator). Asserts `gnu_lookup` returns `None`. Logic correct.
+- `gnu_lookup_rejects_undef_symbol`: `st_info = (STB_GLOBAL << 4) | STT_FUNC`, `st_shndx = SHN_UNDEF`. Asserts `None`. Logic correct.
+- `gnu_lookup_rejects_non_power_of_two_bloom`: `bloom_size = 3`. Asserts `None` because the power-of-two guard fires before any lookup. Logic correct.
+
+**One subtle concern in `build_synthetic_view`:** The `st_name` offset written at line 815 is `0u32`, meaning the symbol name is at `strtab_offset + 0`. The strtab starts at `strtab_offset` and contains `target_name + NUL`. This is correct. However the chain word at line 810 is `(h & !1u32) | 1u32` — the terminator bit is always set, so the chain walk terminates after exactly one entry. This is correct for a single-symbol table.
+
+#### `hook.rs` fix additions
+
+**`stage_a_locked` renamed/isolated (lines 124-153):** Function is `fn` (private), takes `pid` only, returns `(libc_base, libc_end, target_fn)`. Doc comment correctly states it must be called inside a `RemoteAttach`. Function itself does not acquire or check for an attach — it relies on the caller's contract. This is safe because `install_init_hook` calls it at line 210 after acquiring `guard` at line 206. There is no public path to call `stage_a_locked` without an attach.
+
+**`install_init_hook` restructure (lines 205-261):** `RemoteAttach::new` at line 206. Explicit `guard.detach()` at line 247. If `stage_a_locked` fails after attach, the `?` propagates and `guard` drops — `RemoteAttach::drop` fires and swallows its own detach error (confirmed in arena.rs). Clean.
+
+**`trampoline_installed: bool` field (line 89):** Initialized to `false` at construction (line 260) and in the test literal (line 412). Drop guard at line 376. P04 must set it to `true` before the trampoline is live. The field is `pub(crate)` so only crate-internal code can flip it.
+
+**`drop_best_effort` simplified (lines 339-359):** Uses `self.scratch_pc` directly — no `parse_maps`, no libc.text re-scan. Acquires a fresh `RemoteAttach`, issues `remote_syscall_via_poke` with the cached `scratch_pc`, detaches. The only new failure mode vs. the install path is that the cached `scratch_pc` may no longer be executable (APEX hot-swap between install and drop). In that case `remote_syscall_via_poke` returns `EFAULT/ESRCH`, the `?` propagates up from `drop_best_effort`, `let _ = self.drop_best_effort()` at line 379 discards it, and the hook page leaks. This is explicitly documented at lines 330-338 as "acceptable failure mode" for best-effort Drop semantics. No new defect introduced.
+
+---
+
+### Residual Issues Not Fixed in Round 1 (Minor — pre-logged)
+
+The following round-1 MINOR items were logged-only (non-blocking) and remain unchanged. Confirmed they are still present and still MINOR:
+
+**[MINOR] m1 (strtab_size = 0 silently kills name resolution):**
+`read_cstr_at(bytes, name_off, 0)` returns `None` immediately when `strtab_size == 0`. This causes `gnu_lookup` at line 534 and `linear_lookup` at line 600 to silently miss every symbol when `DT_STRSZ` is absent. In practice bionic always emits `DT_STRSZ`, but the behavior is surprising. No change in this round. Status: MINOR, logged.
+
+**[MINOR] m3 (Drop re-attaches even when tracee may be dead):**
+`drop_best_effort` calls `RemoteAttach::new(self.pid)` which will fail with `PtraceAttach` ESRCH if init has died. The `let _ = self.drop_best_effort()` swallows this. Correct behavior, acknowledged design. No change needed. Status: MINOR, logged.
+
+**[MINOR] m4 (DT_GNU_HASH constant type is i64):**
+`pub const DT_GNU_HASH: i64 = 0x6fff_fef5`. Value fits in i64 (positive). Internally consistent with `Elf64_Dyn.d_tag: i64`. No correctness issue. Status: MINOR, logged.
+
+---
+
+### Positive Observations
+
+1. **Attach-first architecture matches P02 pattern exactly.** `install_init_hook` acquires `RemoteAttach` before any tracee observation, mirroring `arena.rs:278` (`guard = RemoteAttach::new(pid)` then `parse_maps` at line 281). The pattern is now consistent across both Tier A and Tier B.
+
+2. **`stage_a_locked` contract clearly documented.** The function name and doc comment make the caller requirement (must be under attach) explicit and discoverable. A future P04 developer reading the call site at `hook.rs:210` cannot miss the coupling.
+
+3. **Typestate guard for Drop is additive and forward-compatible.** Adding `trampoline_installed: bool` to `HookHandle` gives P04 a single field to flip. The Drop guard is a one-liner. P04 can satisfy the safety invariant with one `handle.trampoline_installed = true;` assignment.
+
+4. **M6 cleanup is scoped correctly.** The best-effort munmap on error fires while the same `guard` is still alive (same attach window), so `scratch_pc` is valid and the tracee is still stopped. No race window between the cleanup mmap and the error return.
+
+5. **Bionic-exact semantic gap (chain-walk continue on binding fail).** The fix correctly continues walking the chain rather than stopping when a hash+name match occurs but binding/shndx fails. This matches bionic's do-while semantics and is the harder-to-get-right behavior.
+
+6. **All three new unit tests use the shared `build_synthetic_view` helper.** This avoids duplicating the GNU_HASH byte layout construction per test and makes the test scaffold itself reviewable. The helper is clearly scoped to `#[cfg(test)]`.
+
+---
+
+### Summary
+
+| Finding | Round-1 Severity | Round-2 Status |
+|---------|-----------------|----------------|
+| C1: TOCTOU stage-A/stage-B | CRITICAL | CLOSED — CORRECT |
+| M1: Missing binding/shndx filter in gnu_lookup | MAJOR | CLOSED — CORRECT |
+| M2: No seek to 0 before read_to_end | MAJOR | CLOSED — CORRECT |
+| M3: resolve_symbol fallthrough on GNU_HASH miss | MAJOR | CLOSED — CORRECT |
+| M4: Non-PoT bloom_size not rejected | MAJOR | CLOSED — CORRECT |
+| M5: Drop unconditional munmap, no typestate | MAJOR | CLOSED — CORRECT |
+| M6: RWX page leak on post-mmap error | MAJOR | CLOSED — CORRECT |
+| M7: scratch_pc re-derived non-deterministically | MAJOR | CLOSED — CORRECT |
+| m1: strtab_size=0 silently kills resolution | MINOR | OPEN — unchanged, logged |
+| m3: Drop re-attaches on dead tracee | MINOR | OPEN — by design, logged |
+| m4: DT_GNU_HASH type cosmetic | MINOR | OPEN — cosmetic, logged |
+
+**CRITICAL findings resolved:** 1/1
+**MAJOR findings resolved:** 7/7
+**New CRITICAL/MAJOR findings introduced by fixes:** 0
+
+VERDICT: PASS
