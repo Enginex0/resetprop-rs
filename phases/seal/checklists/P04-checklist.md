@@ -479,3 +479,45 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   at `phases/seal/audits/P04-audit.md:279`. No new MAJOR surface
   introduced; both notes flag the salvage paths (two-page layout /
   libc-ELF cache) for any future phase that needs them.
+
+### Self-Audit Gate T2 — counter advance before detach
+
+- [x] **Optimality**: Considered three forms of the fix.
+  (a) Swap the two statements — move `handle.lock_list_len = new_len`
+      above `attach.detach()`. Chosen. Minimum diff; keeps the entire
+      tracer-state transition inside the attach window so any tracer
+      interrupt between write and detach leaves the handle and the
+      tracee in agreement.
+  (b) Keep the current order but wrap the counter bump in a
+      `Drop`-based scope guard that fires if an early return happens.
+      Rejected — adds bookkeeping for a one-line problem and doesn't
+      help if the bump panics after a clean detach, which is the actual
+      critic scenario.
+  (c) Move the bump above `write_remote` (before the tracee observes
+      the new list). Rejected — the counter would advance even when
+      `write_remote` fails partway, leaving the handle lying in the
+      opposite direction.
+- [x] **Completeness**: Applied symmetrically to `seal_prop` (success
+  path at `hook.rs:1183-1196`) and `unseal_prop` (success path at
+  `hook.rs:1237-1246`). The `unseal_prop` None-path at
+  `hook.rs:1219-1224` was not modified — no counter change is needed
+  when the name is absent, so the old ordering stays correct. Both
+  call sites carry a comment cross-referencing critic MAJOR 3 so
+  future readers see the rationale. 118 lib tests pass; no new tests
+  needed — the fix is a reordering, and existing `seal_prop` /
+  `unseal_prop` coverage already exercises the two call paths (append,
+  append-with-capacity-reject, remove-middle, remove-only,
+  remove-missing, reject-interior-nul).
+- [x] **Correctness**: Walked the four failure sequences.
+  (i) write succeeds, counter bump succeeds, detach succeeds — handle
+  and tracee agree on the new length. Same as before the fix.
+  (ii) write succeeds, counter bump succeeds, detach fails — error
+  propagates to caller; handle state (new_len) matches the tracee's
+  extended list. Caller can retry `detach` via a future operation or
+  drop the handle; either way the counter is not wrong.
+  (iii) write fails — early `?` returns before the counter bump; both
+  handle and tracee see the old length. Same as before.
+  (iv) Tracer panic / signal between counter bump and detach — handle
+  state (new_len) still matches the tracee; `RemoteAttach::drop`
+  detaches on unwind. No off-by-entry overwrite on the next
+  `seal_prop` call. This is the scenario the fix closes.

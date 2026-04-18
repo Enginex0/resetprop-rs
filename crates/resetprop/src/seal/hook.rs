@@ -1180,11 +1180,19 @@ pub fn seal_prop(handle: &mut HookHandle, name: &str) -> Result<()> {
     }
     .map_err(|e| Error::HookInstallFailed(format!("seal_prop: write_remote: {e}")))?;
 
+    // Counter-before-detach: once `write_remote` succeeds, the tracee
+    // observes the extended list. Bumping `handle.lock_list_len` before
+    // `attach.detach()` keeps the tracer's view and the tracee's view
+    // consistent — a panic or signal interrupting the tracer between
+    // detach and the counter bump would otherwise leave the handle
+    // lying to the next `seal_prop` and producing an off-by-entry
+    // overwrite. Addresses Gate 2 round-1 critic MAJOR 3.
+    handle.lock_list_len = new_len;
+
     attach
         .detach()
         .map_err(|e| Error::HookInstallFailed(format!("seal_prop: detach: {e}")))?;
 
-    handle.lock_list_len = new_len;
     Ok(())
 }
 
@@ -1226,11 +1234,15 @@ pub fn unseal_prop(handle: &mut HookHandle, name: &str) -> Result<bool> {
     unsafe { write_remote(handle.pid, handle.hook_page, &buffer[0..write_end]) }
         .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: write_remote: {e}")))?;
 
+    // Counter-before-detach: mirrors the `seal_prop` invariant — the
+    // tracee observes the compacted list once `write_remote` succeeds,
+    // so the tracer's counter must update inside the attach window.
+    handle.lock_list_len = new_len;
+
     attach
         .detach()
         .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: detach: {e}")))?;
 
-    handle.lock_list_len = new_len;
     Ok(true)
 }
 
