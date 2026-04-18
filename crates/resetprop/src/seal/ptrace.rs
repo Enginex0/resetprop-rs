@@ -540,6 +540,13 @@ pub unsafe fn remote_syscall(
         )
     };
     if rc == -1 {
+        // Best-effort restore before propagating: libc.text (or whichever
+        // scratch VMA the caller picked) must not retain live svc+brk, and
+        // the tracee's saved regs must not remain in work-state. Any error
+        // here is discarded — the original cause is more informative.
+        // SAFETY: forwards caller's `scratch_pc` writability guarantee.
+        let _ = unsafe { write_remote(pid, scratch_pc, &saved_bytes) };
+        let _ = setregset(pid, &saved_regs);
         return Err(last_ptrace_op_err());
     }
 
@@ -547,10 +554,22 @@ pub unsafe fn remote_syscall(
     // `WIFSTOPPED && WSTOPSIG == SIGTRAP && event == 0` atomically per its
     // contract — group-stops (event=128) and syscall-stops (signal=0x85) are
     // rejected as `Error::PtraceUnexpectedStatus`.
-    wait_stop(pid, 0)?;
+    let wait_result = wait_stop(pid, 0);
+    if wait_result.is_err() {
+        // SAFETY: forwards caller's `scratch_pc` writability guarantee.
+        let _ = unsafe { write_remote(pid, scratch_pc, &saved_bytes) };
+        let _ = setregset(pid, &saved_regs);
+    }
+    wait_result?;
 
     // (§7 step 8) Read x0 from the post-trap register state.
-    let out = getregset(pid)?;
+    let out_result = getregset(pid);
+    if out_result.is_err() {
+        // SAFETY: forwards caller's `scratch_pc` writability guarantee.
+        let _ = unsafe { write_remote(pid, scratch_pc, &saved_bytes) };
+        let _ = setregset(pid, &saved_regs);
+    }
+    let out = out_result?;
     let ret = out.regs[0] as i64;
 
     // (§7 step 9) Restore in order: regs first (so pc points back at the
@@ -631,15 +650,32 @@ pub(crate) unsafe fn remote_syscall_via_poke(
         )
     };
     if rc == -1 {
+        // Best-effort restore before propagating: libc.text must not retain
+        // live svc+brk at scratch_pc, and the tracee's saved regs must not
+        // remain in work-state (pc=scratch_pc, x8=syscall_no). Otherwise
+        // RemoteAttach::drop detaches init into a poisoned state and the
+        // next thread scheduled at scratch_pc traps on brk #0.
+        let _ = ptrace_poketext(pid, scratch_pc, saved_word);
+        let _ = setregset(pid, &saved_regs);
         return Err(last_ptrace_op_err());
     }
 
     // Wait for the brk trap. `wait_stop` verifies
     // `WIFSTOPPED && WSTOPSIG == SIGTRAP && event == 0` atomically.
-    wait_stop(pid, 0)?;
+    let wait_result = wait_stop(pid, 0);
+    if wait_result.is_err() {
+        let _ = ptrace_poketext(pid, scratch_pc, saved_word);
+        let _ = setregset(pid, &saved_regs);
+    }
+    wait_result?;
 
     // Read x0 from the post-trap register state.
-    let out = getregset(pid)?;
+    let out_result = getregset(pid);
+    if out_result.is_err() {
+        let _ = ptrace_poketext(pid, scratch_pc, saved_word);
+        let _ = setregset(pid, &saved_regs);
+    }
+    let out = out_result?;
     let ret = out.regs[0] as i64;
 
     // Restore in order: regs first (so pc points back at the caller's resume

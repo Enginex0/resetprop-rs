@@ -301,12 +301,28 @@ pub(crate) unsafe fn remote_remap_private(
             return Err(Error::PtraceOp(std::io::Error::last_os_error()));
         }
 
-        super::ptrace::wait_stop(guard.pid(), 0)?;
-        let out = super::ptrace::getregset(guard.pid())?;
+        // Always restore scratch bytes + registers before inspecting the
+        // result. A failure in `wait_stop` or `getregset` must not leave
+        // libc.text containing live svc+brk or the tracee's saved regs in
+        // work-state — RemoteAttach::drop would release init into that
+        // poisoned state and the next thread scheduled at scratch_pc would
+        // trap on brk #0. On the pre-restore failure paths the errors from
+        // the restore calls are discarded in favor of the original cause.
+        let wait_result = super::ptrace::wait_stop(guard.pid(), 0);
+        if wait_result.is_err() {
+            let _ = super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes);
+            let _ = super::ptrace::setregset(guard.pid(), &saved_regs);
+        }
+        wait_result?;
+
+        let out_result = super::ptrace::getregset(guard.pid());
+        if out_result.is_err() {
+            let _ = super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes);
+            let _ = super::ptrace::setregset(guard.pid(), &saved_regs);
+        }
+        let out = out_result?;
         let ret = out.regs[0] as i64;
 
-        // Always restore scratch bytes + registers before inspecting the
-        // return. On failure we still leave init's text pristine.
         super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes)?;
         super::ptrace::setregset(guard.pid(), &saved_regs)?;
 
