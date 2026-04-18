@@ -539,6 +539,110 @@ pub(crate) mod encoder {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// P04 T2 — pure hook-body encoder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Canonical 23-word (92-byte) hook-body template per
+/// `references/arm64-a64-encoding.md` §Hook body sketch lines 383-407.
+///
+/// The template carries `nop` (0xd503_201f) in the three patch regions
+/// (STOLEN_START=13..=16, RESTORE_LIT=19..=20, LOCK_LIST_LIT=21..=22). The
+/// RESTORE and LOCK_LIST literal slots are documented as zeros in the
+/// reference; we seed them with `nop` for the prologue mirrors and `0` for
+/// the two u64 literal slots so uninitialised reads during construction
+/// remain deterministic. [`build_hook_body_bytes`] overwrites all three
+/// regions before returning, so the seed value is never observable.
+const HOOK_BODY_TEMPLATE: [u32; 23] = [
+    0xb400_01a0, // 0: cbz  x0, .fall_through  (+52)
+    0x9101_8009, // 1: add  x9, x0, #96
+    0x5800_026a, // 2: ldr  x10, =LOCK_LIST    (+76)
+    0x3940_014b, // 3: ldrb w11, [x10]
+    0x3400_012b, // 4: cbz  w11, .fall_through (+36)
+    0x1400_0003, // 5: b .advance              (+12)  -- strcmp stub
+    0x5280_0000, // 6: movz w0, #0
+    0xd65f_03c0, // 7: ret
+    0x9100_054a, // 8: add  x10, x10, #1
+    0x17ff_fffa, // 9: b .next_entry           (-24)
+    0xd503_201f, // 10: nop
+    0xd503_201f, // 11: nop
+    0xd503_201f, // 12: nop
+    0xd503_201f, // 13: STOLEN_0 (patched)
+    0xd503_201f, // 14: STOLEN_1 (patched)
+    0xd503_201f, // 15: STOLEN_2 (patched)
+    0xd503_201f, // 16: STOLEN_3 (patched)
+    0x5800_0050, // 17: ldr x16, =RESTORE_TARGET (+8)
+    0xd61f_0200, // 18: br  x16
+    0x0000_0000, // 19: RESTORE_TARGET lo (patched)
+    0x0000_0000, // 20: RESTORE_TARGET hi (patched)
+    0x0000_0000, // 21: LOCK_LIST lo (patched)
+    0x0000_0000, // 22: LOCK_LIST hi (patched)
+];
+
+/// Word index of the first stolen-prologue slot inside HOOK_BODY_TEMPLATE
+/// (reference §Hook body sketch patch-point indices).
+const STOLEN_START: usize = 13;
+/// Word index of the RESTORE_TARGET u64 low half (literal at words 19..=20).
+const RESTORE_LIT: usize = 19;
+/// Word index of the LOCK_LIST u64 low half (literal at words 21..=22).
+const LOCK_LIST_LIT: usize = 21;
+
+/// Emit the 92-byte hook body for the Tier B per-prop guard.
+///
+/// Pure, deterministic, no ptrace, no I/O, no unsafe. Given the 16 bytes of
+/// stolen prologue (captured by P03 stage-B into [`HookHandle::saved_prologue`]),
+/// the lock-list base address in the tracee, and the resume address
+/// (`target_fn + 16`), returns the 23-word hook body with the three patch
+/// regions filled in little-endian order.
+///
+/// # Patch layout
+///
+/// * Words 13..=16 (`STOLEN_START..STOLEN_START+4`) ← `saved_prologue` decoded
+///   as four LE `u32`s.
+/// * Words 19..=20 (`RESTORE_LIT..RESTORE_LIT+2`) ← `return_addr` split into
+///   low / high LE `u32` halves.
+/// * Words 21..=22 (`LOCK_LIST_LIT..LOCK_LIST_LIT+2`) ← `lock_list_vaddr`
+///   split into low / high LE `u32` halves.
+///
+/// The returned `Vec<u8>` is the little-endian byte serialisation of the
+/// 23-word array per reference §Endianness (ARM64 Linux userspace is always
+/// little-endian; each `u32` is stored LSB-first).
+///
+/// # References
+///
+/// * `references/arm64-a64-encoding.md` §Hook body sketch (canonical template)
+/// * `references/arm64-a64-encoding.md` §Hook body sketch — Patch-point
+///   indices (`STOLEN_START=13`, `RESTORE_LIT=19`, `LOCK_LIST_LIT=21`)
+/// * REGISTRY §1 row `Hook page — 4 KB RWX anonymous mmap`
+pub fn build_hook_body_bytes(
+    saved_prologue: [u8; 16],
+    lock_list_vaddr: u64,
+    return_addr: u64,
+) -> Vec<u8> {
+    let mut body = HOOK_BODY_TEMPLATE;
+
+    // Patch region 1: stolen prologue (words 13..=16, 16 bytes).
+    for (i, word) in body[STOLEN_START..STOLEN_START + 4].iter_mut().enumerate() {
+        let base = i * 4;
+        *word = u32::from_le_bytes([
+            saved_prologue[base],
+            saved_prologue[base + 1],
+            saved_prologue[base + 2],
+            saved_prologue[base + 3],
+        ]);
+    }
+
+    // Patch region 2: RESTORE_TARGET u64 (words 19..=20, LE lo+hi).
+    body[RESTORE_LIT] = return_addr as u32;
+    body[RESTORE_LIT + 1] = (return_addr >> 32) as u32;
+
+    // Patch region 3: LOCK_LIST u64 (words 21..=22, LE lo+hi).
+    body[LOCK_LIST_LIT] = lock_list_vaddr as u32;
+    body[LOCK_LIST_LIT + 1] = (lock_list_vaddr >> 32) as u32;
+
+    body.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +879,135 @@ mod tests {
     #[should_panic]
     fn ldrb_imm_rejects_imm12_equal_to_4096() {
         let _ = super::encoder::ldrb_imm(0, 0, 4096);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P04 T2 — build_hook_body_bytes tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Verifies [`build_hook_body_bytes`] serialises the 23-word template
+    /// with the three patch regions filled in the correct byte positions.
+    ///
+    /// Offsets derive directly from `references/arm64-a64-encoding.md`
+    /// §Hook body sketch: word N lives at byte `N * 4`, so STOLEN_START=13
+    /// lands at offset 52, RESTORE_LIT=19 lands at offset 76, and
+    /// LOCK_LIST_LIT=21 lands at offset 84. Total length is 23 × 4 = 92
+    /// bytes.
+    #[test]
+    fn build_hook_body_bytes_roundtrip() {
+        let saved_prologue = [0xABu8; 16];
+        let lock_list_vaddr: u64 = 0x1111_2222_3333_4444;
+        let return_addr: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
+        let bytes = build_hook_body_bytes(saved_prologue, lock_list_vaddr, return_addr);
+
+        assert_eq!(bytes.len(), 92, "hook body must be 23 words × 4 = 92 bytes");
+
+        // Fixed prologue — reference HOOK_BODY[0..6].
+        assert_eq!(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            0xb400_01a0,
+            "word 0: cbz x0, .fall_through (+52)"
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            0x9101_8009,
+            "word 1: add x9, x0, #96"
+        );
+
+        // Match-exit pair at words 6..=7.
+        assert_eq!(
+            u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            0x5280_0000,
+            "word 6: movz w0, #0"
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+            0xd65f_03c0,
+            "word 7: ret"
+        );
+
+        // Patch region 1: STOLEN_START at words 13..=16 (bytes 52..68).
+        assert_eq!(
+            &bytes[52..68],
+            &saved_prologue,
+            "STOLEN_START must mirror saved_prologue bytes"
+        );
+
+        // Patch region 2: RESTORE_TARGET u64 at words 19..=20 (bytes 76..84).
+        assert_eq!(
+            u64::from_le_bytes([
+                bytes[76], bytes[77], bytes[78], bytes[79], bytes[80], bytes[81], bytes[82],
+                bytes[83],
+            ]),
+            return_addr,
+            "RESTORE_TARGET literal must equal return_addr"
+        );
+
+        // Patch region 3: LOCK_LIST u64 at words 21..=22 (bytes 84..92).
+        assert_eq!(
+            u64::from_le_bytes([
+                bytes[84], bytes[85], bytes[86], bytes[87], bytes[88], bytes[89], bytes[90],
+                bytes[91],
+            ]),
+            lock_list_vaddr,
+            "LOCK_LIST literal must equal lock_list_vaddr"
+        );
+    }
+
+    /// Compile-time coercion that pins the public signature of
+    /// [`build_hook_body_bytes`].
+    ///
+    /// A successful `fn`-pointer assignment proves the function takes
+    /// exactly `([u8; 16], u64, u64)` and returns `Vec<u8>` with no hidden
+    /// `&self`, `&mut self`, or `Self`-bound parameters — i.e. it cannot
+    /// depend on a tracer context, a mutex guard, or any ptrace handle.
+    /// This is the strongest purity assertion the type system alone can
+    /// express. The runtime call with `[0; 16]` / `0` / `0` additionally
+    /// proves the function executes with all zero inputs without panic
+    /// (no hidden `assert!` on the patch values) and returns the
+    /// spec-locked 92-byte length.
+    #[test]
+    fn build_hook_body_bytes_is_pure() {
+        let _: fn([u8; 16], u64, u64) -> Vec<u8> = build_hook_body_bytes;
+
+        let bytes = build_hook_body_bytes([0u8; 16], 0, 0);
+        assert_eq!(bytes.len(), 92);
+    }
+
+    /// Pins the fixed prologue words 0..=5 of the hook body against the
+    /// canonical `HOOK_BODY` array in
+    /// `references/arm64-a64-encoding.md` §Hook body sketch (lines 383-388).
+    ///
+    /// These six words are not in any patch region — a drift here would
+    /// mean the strcmp stub / null-guard layout no longer matches the
+    /// reference and any downstream `install_trampoline` consumer (P04 T3)
+    /// would install a body that branches to the wrong offsets.
+    #[test]
+    fn build_hook_body_bytes_constants_from_reference() {
+        let bytes = build_hook_body_bytes([0u8; 16], 0, 0);
+
+        let expected: [u32; 6] = [
+            0xb400_01a0, // 0: cbz x0, .fall_through (+52)
+            0x9101_8009, // 1: add x9, x0, #96
+            0x5800_026a, // 2: ldr x10, =LOCK_LIST (+76)
+            0x3940_014b, // 3: ldrb w11, [x10]
+            0x3400_012b, // 4: cbz w11, .fall_through (+36)
+            0x1400_0003, // 5: b .advance (+12) — strcmp stub
+        ];
+
+        for (i, expected_word) in expected.iter().enumerate() {
+            let base = i * 4;
+            let actual = u32::from_le_bytes([
+                bytes[base],
+                bytes[base + 1],
+                bytes[base + 2],
+                bytes[base + 3],
+            ]);
+            assert_eq!(
+                actual, *expected_word,
+                "word {i} drifted from reference HOOK_BODY[{i}]"
+            );
+        }
     }
 }
