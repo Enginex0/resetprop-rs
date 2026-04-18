@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 pub(crate) const NR_OPENAT: u64 = 56;
 pub(crate) const NR_MMAP: u64 = 222;
 pub(crate) const NR_CLOSE: u64 = 57;
+pub(crate) const NR_MUNMAP: u64 = 215;
 
 // fcntl/mman constants (asm-generic/fcntl.h, asm-generic/mman-common.h)
 pub(crate) const AT_FDCWD: u64 = -100_i64 as u64; // sign-extended to 64 bits
@@ -391,14 +392,22 @@ pub(crate) unsafe fn remote_remap_private(
         super::ptrace::remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
     };
 
-    // Bootstrap page intentionally leaked: munmap would require a second
-    // POKEDATA bootstrap because the only existing RWX scratch
-    // (`bootstrap_page` itself) is the munmap target, and libc.text
-    // (still `r-xp`) cannot serve as scratch for the
-    // `process_vm_writev`-based `remote_syscall`. The 4 KiB leak per seal
-    // call is bounded (seals are rare events); unseal produces a fresh
-    // leak of the same size. A future cleanup pass could implement a
-    // second POKEDATA-staged munmap if leak accumulation becomes visible.
+    // --- munmap(bootstrap_page, BOOTSTRAP_PAGE_SIZE) ---------------------
+    // SAFETY: scratch_pc is in libc.text r-xp; remote_syscall_via_poke bypasses
+    // VMA write bits via PEEK/POKEDATA. munmap failure here is benign (leaked
+    // 4 KiB in the tracee) — the seal itself is already applied, so do not
+    // propagate the error.
+    let _ = unsafe {
+        super::ptrace::remote_syscall_via_poke(
+            pid,
+            scratch_pc,
+            NR_MUNMAP,
+            [bootstrap_page, BOOTSTRAP_PAGE_SIZE, 0, 0, 0, 0],
+        )
+    };
+
+    // Bootstrap page released via remote munmap above; leak is bounded to
+    // the error-unwind path only.
 
     guard.detach()?;
     Ok(())
@@ -569,6 +578,7 @@ mod tests {
         assert_eq!(NR_OPENAT, 56);
         assert_eq!(NR_MMAP, 222);
         assert_eq!(NR_CLOSE, 57);
+        assert_eq!(NR_MUNMAP, 215);
 
         // fcntl / mman flags
         assert_eq!(AT_FDCWD, (-100_i64) as u64);
