@@ -40,4 +40,5 @@ pub use ptrace::{
     UserPtRegs,
     ptrace_seize, ptrace_interrupt, wait_stop,
     getregset, setregset, ptrace_detach,
+    remote_syscall,
 };
