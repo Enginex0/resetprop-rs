@@ -269,3 +269,154 @@ The cloned repo at `.analysis/ksu_props/` (scratch, gitignored) retains the sour
 - `crates/prop-rs-android/src/sys_prop.rs:580-616` — the dual-path dispatch
 - `crates/prop-rs-android/src/mmap_prop_area.rs:274-278` — the `write_bytes_data` primitive (the direct-mmap write)
 - `crates/prop-rs-android/src/sys_prop.rs:612` — the bionic `__system_property_set` call site (the init-routed path)
+
+---
+
+## P05 Gate 2 round-2 — code-reviewer (sonnet)
+
+**Date**: 2026-04-19
+**Branch**: feat/P04-tier-b-part2 @ ba0e1b4
+**Scope**: P05.2 fix-lane commits `75f4e75`, `4ba60ed`, `919a146`, `8e9a4c0`, `ba0e1b4` + round-1 findings verification
+
+### Verdict: NEEDS_FIX
+
+### Round-1 findings verification
+
+| Finding | Status | Evidence |
+|---------|--------|----------|
+| C1 scope misrepresentation | RESOLVED | `README.md:96` rewritten with scoped claim; `README.md:100` enumerates bypass vectors citing `sys_prop.rs:580` + `mmap_prop_area.rs:277`; `tests/device-stress-test.sh:367-376` adds KSU probe after primary assertion |
+| C2 Test 22 Tier B residue | RESOLVED | `tests/device-stress-test.sh:393` swaps to `ro.telephony.sms_receive_mode`; commit `ba0e1b4` message cites `hook.rs:154-158` trampoline invariant |
+| M1 parser silent drop | RESOLVED | `main.rs:160-175` boolean-array + filter/count guard covers all 5 flag combinations; fires before any seal dispatch |
+| M2 Test 21 SELinux neighbor | RESOLVED | `tests/device-stress-test.sh:333-337` pre-flight writability probe; assertion conditional on `NEIGHBOR_WRITABLE` |
+| M3 stall doc gap | RESOLVED | `README.md:102` Attach-window stall bullet with 15-40 ms range matching `hook.rs:276-287` rustdoc |
+| M5 arena co-residence | NOT_RESOLVED | No runtime assertion added in either Test 21 or Test 22; both tests rely on an unverified out-of-band invariant |
+| M6 `--seals` output example | NOT_RESOLVED | README Seal subsection extended to 8 bullets but no example output shown; `Prop` / `Arena` Debug labels unexplained |
+
+### New findings
+
+#### CRITICAL
+None.
+
+#### MAJOR
+
+**N1** — `README.md:102` "Subsequent calls against the already-installed hook complete in under 5 ms" has no source evidence. `hook.rs:276-287` documents the 15-40 ms first-install window only. A subsequent `seal()` call at `lib.rs:623` goes through the `slot.lock()` → `is_some()` fast-path skipping `install_init_hook` and `install_trampoline` (so is indeed faster) but "under 5 ms" is an unsubstantiated specific figure. Factual accuracy defect in user-facing documentation.
+
+**Fix**: Remove the specific latency figure or replace with a qualitative statement grounded in the code path.
+
+#### MINOR
+
+**N2** — Test 22 SKIP branch at `tests/device-stress-test.sh:407` uses plain `log`; neither `PASS` nor `FAIL` incremented. Summary does not reflect skipped tests. Internally consistent (no false PASS) but a `$SKIP` counter would make the summary honest.
+
+**N3** — Test 21/22 restore paths write empty `$NEIGHBOR_ORIG` / `$ORIG_A` via `setprop ... ""`; empty-value semantics are platform-dependent. Inherited pattern, not introduced by P05.2.
+
+**N4** — `tests/device-stress-test.sh:367` gates KSU probe on `[ -x /data/adb/ksu/bin/resetprop ]` — checks executability not identity. If the path holds a non-ksu_props binary the WARN log misattributes the bypass. Cosmetic.
+
+### Positive observations
+
+- `main.rs:160-175` seal_flag_count guard is flat and self-documenting; extends by array rather than or-chained predicates.
+- KSU probe placement in Test 21 is well-designed: after `SEALED_FINAL` captured (no primary-assertion contamination), before cleanup (bypass empirically observable on real KSU).
+- Test 22 swap (`ro.telephony.sms_receive_mode`) is minimum-code-churn correct fix for C2.
+- `README.md:100` bypass-surface bullet cites exact file:line for both dispatch branch and write primitive; scopes threat model correctly.
+- `README.md:102` 15-40 ms stall figure faithful to `hook.rs:279-283`.
+
+### Summary
+
+P05.2 resolves all round-1 load-bearing findings (C1, C2, M1, M2, M3) with correct implementations. Two round-1 MAJORs (M5, M6) remain unaddressed. One new MAJOR (N1 unsupported "under 5 ms") requires removal/qualification before close.
+
+---
+
+## P05 Gate 2 round-2 — critic (opus)
+
+**Date**: 2026-04-19
+**Branch**: feat/P04-tier-b-part2 @ ba0e1b4
+
+### Verdict: PASS-WITH-RESERVATIONS
+
+### Multi-perspective analysis
+
+#### Executor
+
+Rooted operator runs `$RP -sl ro.telephony.default_network 0` on a KSU device. The `README.md:100` bypass-surface bullet gives concrete disclosure: exact KSU binary path (`/data/adb/ksu/bin/resetprop`), exact dispatch branch (`sys_prop.rs:580`), exact write primitive (`mmap_prop_area.rs:277` `copy_nonoverlapping`), trigger conditions (`ro.*` prefix or `-n` flag). When the operator subsequently runs `/data/adb/ksu/bin/resetprop ro.foo quux`, they are prepared. Not abstract "may be bypassed" — teaches both cause (direct-mmap) and discriminator (prefix/flag). Edge case: Test 22 on a device where `ro.telephony.sms_receive_mode` is absent or read-only — SELinux pre-probe at `tests/device-stress-test.sh:400-404` correctly emits SKIP.
+
+#### Stakeholder
+
+Bypass-surface bullet is #5 under **Seal** (after two-tier summary, Tier B default, Tier A fallback, -st semantics). The lead bullet at `README.md:96` now carries scoped language ("no `setprop`, `property_service`, or bionic `__system_property_set` caller can revert") so the reader is front-loaded with scope before reaching the explicit bypass list. M6 (`--seals` output example) still missing. CLI-reference `--seal-arena` row at `README.md:248` still reads "Broader blast radius, use when Tier B cannot install" — implies auto-fallback; unaddressed in fix lane (round-2 R2-m1).
+
+#### Skeptic
+
+- 15-40 ms claim faithful to `hook.rs:276-287` rustdoc, which explicitly notes "Observed wall-clock on a modern ARM64 handset (Snapdragon-class SoC, bionic libc.so ~1.2 MiB, ~5000 .dynsym entries)". README generalizes to "on modern ARM64 handsets" plural, dropping device-class qualifiers — minor doc drift.
+- Test 21 and Test 22 use literal string `"SELINUX_PROBE"` as sentinel. Collision with a real prop value is astronomically unlikely but a randomized sentinel would be bulletproof.
+- Empty-ORIG restore at `tests/device-stress-test.sh:404` (`setprop ... ""`) is shell-valid but sets prop to empty string instead of deleting. Pre-existing pattern.
+- Permissive-device masking: on permissive/non-enforcing build, pre-probes unconditionally succeed → full assertion fires. Desired behavior, not masking.
+- Test 22 swap claims same `telephony_prop` arena but NOT runtime-asserted (exact M5 finding, unaddressed).
+
+#### Realist
+
+All five round-1 blocking-tier findings addressed with evidence in 5 commits. M5 and M6 silently deferred without REGISTRY §8 entry or commit message acknowledging the deferral — future gate reviews may re-flag as new findings. Fix scope was "~5 edits" per `REGISTRY-P.md:97`; author executed within that scope. Severity check: C1 resolution via README bullet + Test 21 WARN probe is sufficient. Seal code unchanged (correctly does what it does); fix is documentation honesty + empirical test surface. No residual risk of data loss, security, or financial impact.
+
+### Round-1 findings verification
+
+Same as reviewer table above. Convergence: C1, C2, M1, M2, M3 RESOLVED; M5, M6 NOT_RESOLVED.
+
+### New findings
+
+#### CRITICAL
+None.
+
+#### MAJOR
+
+**R2-M1** — Silent deferral of M5 and M6 without REGISTRY documentation. `REGISTRY-P.md:97` P05 row enumerates round-1 findings C1/C2/M1/M2/M3 as load-bearing but omits M5 and M6. §8 Deferred Audit Findings has entries for P02 MAJOR-5, MAJOR-8, and P04 CRITICAL-2 but nothing for P05. Undocumented deferrals drift into silent tech debt.
+
+**Fix**: Either land M6 (~5 lines: add `$ resetprop-rs --seals` example to README Seal subsection) or add §8 entries documenting the decision to defer with V2 plan.
+
+#### MINOR
+
+**R2-m1** — `README.md:248` CLI-reference `--seal-arena` row still reads "Broader blast radius, use when Tier B cannot install" — implies auto-fallback.
+
+**R2-m2** — `README.md:102` generalizes 15-40 ms to "modern ARM64 handsets" plural while `hook.rs:278-279` rustdoc qualifies to specific device class. Minor doc drift.
+
+**R2-m3** — `tests/device-stress-test.sh:333,400` literal sentinel `"SELINUX_PROBE"` — randomized sentinel would be bulletproof.
+
+**R2-m4** — Empty-ORIG restore inherited from Test 18 pattern. Pre-existing.
+
+**R2-m5** — `main.rs:180` `--seals` Debug output `[{tier:?}]` emits `Arena`/`Prop`. Users have no scaffolding; same root cause as M6 — fix one, both dissolve.
+
+### What's missing
+
+- `--seals` output example in README (M6).
+- Arena co-residence runtime assertion in Test 21/22 (M5).
+- §8 REGISTRY entry documenting M5/M6 decision.
+- CLI-reference "broader blast radius" phrasing (R2-m1).
+- Parser-guard unit test for `--seal A --unseal A` rejection.
+
+### Load-bearing defect
+
+None applicable — no CRITICAL or blocking MAJOR. R2-M1 is process hygiene, not technical blocker.
+
+### Summary
+
+P05.2 materially ready to close. 5 commits directly address round-1's load-bearing findings with evidence-backed implementations matching source-of-truth code. Two round-1 findings unaddressed without deferral documentation — minor process gap, not technical blocker. Recommend PASS-WITH-RESERVATIONS + follow-up commit addressing R2-M1.
+
+---
+
+## Consolidated Round-2 Verdict
+
+**Reviewer (sonnet)**: NEEDS_FIX (1 MAJOR + 3 MINOR new; M5/M6 NOT_RESOLVED)
+**Critic (opus)**: PASS-WITH-RESERVATIONS (1 MAJOR + 5 MINOR new; M5/M6 NOT_RESOLVED)
+
+**Convergence**: Both agents verify round-1 C1, C2, M1, M2, M3 as RESOLVED with file:line evidence. Both flag M5 (arena co-residence) and M6 (`--seals` output example) as NOT_RESOLVED carryovers.
+
+**Divergence**: Reviewer uniquely flags N1 (under-5-ms unsubstantiated claim in README) as MAJOR. Critic uniquely flags R2-M1 (silent M5/M6 deferral) as MAJOR. Both agents converge on all other findings.
+
+### Closure commits (round-2 follow-up, S07)
+
+- `4fce23c` docs(readme): close P05 Gate 2 round-2 N1 + M6 + R2-m1
+  - Removes the unsupported "under 5 ms" figure (closes reviewer N1)
+  - Adds `### Sealing properties` subsection with `$ resetprop-rs --seals` example showing `[Prop]`/`[Arena]` Debug labels (closes critic M6)
+  - Rewrites CLI-reference `--seal-arena` row to state "no auto-fallback — invoke manually" (closes critic R2-m1)
+
+- This audit append + new `REGISTRY-P.md` §8 entry formally defers M5 (arena co-residence runtime assertion) with V2 plan — closes critic R2-M1.
+
+### Post-closure status
+
+All round-2 load-bearing defects resolved or formally deferred with V2 plans. P05.2 fix-lane SEGMENT_COMPLETE; P05 awaits the aarch64 on-device acceptance run to promote P05 and P04 to COMPLETE per the P04.2 T3 co-closure decision.

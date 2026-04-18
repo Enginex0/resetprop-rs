@@ -223,3 +223,47 @@ acceptance), the path is to load a cdylib shim that the child
 and the child's call routes through the shim's `.dynsym`. Effort
 estimate: two-to-three days (mirrors P03's `elf_fixture` plus the
 fork/ptrace harness plumbing). Not scheduled.
+
+### P05 Gate 2 round-1 — MAJOR-5 (arena co-residence verification)
+
+**Finding (critic, carried through round-2)**: `tests/device-stress-test.sh`
+Test 21 does not runtime-assert that `TEL_PROP`
+(`ro.telephony.default_network`) and `NEIGHBOR_PROP`
+(`ro.telephony.call_ring.delay`) share a prop arena. Test 22 similarly
+asserts in prose that `ro.telephony.sms_receive_mode` lives in the same
+`telephony_prop` arena as Test 21's target but the script carries no
+runtime verification. All three props currently route to
+`u:object_r:telephony_prop:s0` on Android 10–15, making the Tier B
+precision assertion and the Tier A arena assertion meaningful today. A
+future device that splits telephony props across multiple arenas would
+let Test 21's precision check tautologically pass regardless of Tier B's
+actual per-prop-precision, and would let Test 22's arena assertion cover
+a different arena than the one Tier A was meant to validate.
+
+**Decision**: P05.2 fix lane was scoped for ~5 edits per
+`REGISTRY-P.md:97` and addressed the five load-bearing round-1 findings
+(C1, C2, M1, M2, M3). A runtime arena co-residence assertion requires
+restructuring Test 21 to seal both props via `$RP --seal`, parse
+`$RP --seals` output (arena path field) for both, compare via `awk`
+string-equality, and skip the precision assertion when paths differ —
+about 15–20 lines across Test 21 and Test 22. Deferred to keep the
+P05.2 lane under the 5-task-per-session cap per
+`.claude/system-prompt.md §Hard Rule 1`.
+
+**V2 plan**: When P05 adds a second-pass hardening lane (post-COMPLETE)
+or when vendor testing surfaces a device where the current arena routing
+assumption breaks, extend Test 21 as follows:
+1. Before the primary stress loop, seal both `TEL_PROP` and
+   `NEIGHBOR_PROP` via Tier B to populate `--seals`.
+2. Pipe `$RP --seals` through `awk` extracting the arena path column
+   for each name.
+3. Assert string equality of arena paths; emit `SKIP` on the precision
+   assertion if they diverge.
+4. Unseal both before the stress loop begins so Tier B's hook is still
+   singular-prop when the precision check runs.
+
+Test 22's `ro.telephony.sms_receive_mode` swap can reuse the same
+arena-check helper. Effort estimate: 30–45 minutes. Not scheduled — run
+when the invariant's stability is empirically tested on a non-Pixel
+device routing telephony props through a vendor-customized
+`property_info` trie.
