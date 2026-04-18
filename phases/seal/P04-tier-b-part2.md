@@ -81,6 +81,29 @@ The off-device sacrificial-child integration test listed in the
 original spec was removed in P04.2 T3 per Gate 2 round-1 critic
 CRITICAL 2 — see `phases/seal/REGISTRY-P.md §8` for the rationale.
 
+## Operational Envelope
+
+Tier B ships two known operational limits. Both are accepted for the
+operator-initiated seal use case (a handful of sensitive keys locked
+for the lifetime of the boot) and are therefore not defects against
+the stated scope.
+
+### Lock-list capacity
+
+The hook page is a single 4 KiB RWX mapping. Bytes 0..=1023 hold the
+lock-list entries (`LOCK_LIST_CAPACITY = 1024`); bytes 1024..=1163
+hold the 140-byte hook body (`HOOK_BODY_OFFSET = 1024`); the remainder
+of the page is unused. Each entry costs `name_len + 1` bytes (name +
+NUL separator); the list also ends in a trailing sentinel NUL. At an
+average bionic property name of ~25 bytes, the list saturates at ~37
+entries and `seal_prop` rejects further seals with
+`HookInstallFailed("capacity exceeded (...)")`.
+
+If a future use case needs a larger lock-list, the path is a two-page
+layout: one RW list page, one RX body page, optional unmapped guard
+page. Cost: +4 KiB to init's working set and one extra remote `mmap`
+call at install.
+
 ## Anti-Scope
 
 - No CLI flag wiring (`-sl`, `--seal`, `--unseal`, `--seals`) — P05 scope (CLI + docs + on-device)

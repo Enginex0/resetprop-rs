@@ -85,8 +85,17 @@ pub(crate) const HOOK_BODY_OFFSET: u64 = 1024;
 /// [`seal_prop`] refuses to append when the resulting list would exceed
 /// this capacity; exceeding it would clobber the body's first
 /// instruction (word 0 of the 140-byte hook body at `hook_page + 1024`),
-/// crashing init on its next trampoline entry. Reference:
-/// `P04-tier-b-part2.md §Approach item 4`.
+/// crashing init on its next trampoline entry.
+///
+/// Practical envelope: each entry costs `name_len + 1` bytes (name +
+/// NUL separator); the list also ends in a trailing sentinel NUL. At
+/// an average bionic property name of ~25 bytes, the list saturates at
+/// ~37 entries before `seal_prop` starts rejecting with
+/// capacity-exceeded. Accepted for the operator-initiated Tier B use
+/// case (a handful of keys locked for the lifetime of the boot); a
+/// future two-page layout (one RW list page, one RX body page) would
+/// remove the cap at the cost of +4 KiB init working set. Reference:
+/// `P04-tier-b-part2.md §Operational Envelope`.
 pub(crate) const LOCK_LIST_CAPACITY: u64 = 1024;
 
 /// `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE` — kernel cmd byte
