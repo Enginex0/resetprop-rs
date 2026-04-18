@@ -54,19 +54,26 @@ const FIXTURE_SYMBOL: &str = "__system_property_update";
 #[test]
 #[ignore = "shells out to cargo build -p elf_fixture; run with --ignored --test-threads=1"]
 fn fixture_symbol_resolves() {
-    let status = Command::new(cargo_bin())
-        .args(["build", "-p", "elf_fixture", "--release"])
-        .status()
-        .expect("spawn cargo build for elf_fixture");
-    assert!(
-        status.success(),
-        "cargo build -p elf_fixture --release failed (status={status:?})"
-    );
-
-    let so_path = workspace_root().join("target/release/libelf_fixture.so");
+    // Device-run path: when ELF_FIXTURE_PATH is set, skip the cargo-build
+    // subprocess and use the pre-built cdylib the operator pushed alongside
+    // the test binary. Build-host path: spawn cargo build as before.
+    let so_path = match std::env::var("ELF_FIXTURE_PATH") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            let status = Command::new(cargo_bin())
+                .args(["build", "-p", "elf_fixture", "--release"])
+                .status()
+                .expect("spawn cargo build for elf_fixture");
+            assert!(
+                status.success(),
+                "cargo build -p elf_fixture --release failed (status={status:?})"
+            );
+            workspace_root().join("target/release/libelf_fixture.so")
+        }
+    };
     assert!(
         so_path.exists(),
-        "built cdylib missing at {}",
+        "cdylib missing at {}",
         so_path.display()
     );
 
