@@ -99,7 +99,7 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 - [x] **`-st` semantics unchanged** — pure stealth write, no ptrace, no hook, no arena remap; 100% back-compat for existing scripts
 - [x] **Bypass surface — direct-mmap writers** — callers that write `/dev/__properties__/<ctx>` directly route around init and defeat both tiers. Confirmed bypass vectors: KernelSU's `/data/adb/ksu/bin/resetprop` for every `ro.*` key and every `-n` / `--skip-svc` write (its dispatch branch at `sys_prop.rs:580` forces direct-mmap for those paths, landing bytes via `core::ptr::copy_nonoverlapping` at `mmap_prop_area.rs:277`), Magisk's resetprop (same pattern), and `resetprop-rs` itself invoked against a sealed prop. Seal protects against init-mediated reverts, not against another root tool writing the arena inode — the threat model is init-routed writers, not every root process on the device.
 - [x] **In-session only** — `SealRecord` lives in process memory; seals do not persist across reboots, `SystemProperties::Reload`, or init restart — re-run `--seal` / `--seal-arena` after every boot
-- [x] **Attach-window stall** — the first `-sl` / `-sla` call on a process ptrace-attaches to init and installs the trampoline in a 15–40 ms window on modern ARM64 handsets; any thread that blocks on init for a property write during that window waits out the full stall (zygote, system_server, init-launched daemons included). Subsequent calls against the already-installed hook complete in under 5 ms.
+- [x] **Attach-window stall** — the first `-sl` / `-sla` call on a process ptrace-attaches to init and installs the trampoline in a 15–40 ms window on modern ARM64 handsets; any thread that blocks on init for a property write during that window waits out the full stall (zygote, system_server, init-launched daemons included). Subsequent calls skip the ELF parse and remote mmap, so they complete substantially faster.
 - [x] **Futex waiters stall silently on sealed props** — `__system_property_wait(pi, ...)` waits on init's private serial copy; a sealed prop's serial never bumps in the caller's view, so waiters never wake. Aligned with seal intent (a sealed prop should not notify of spurious updates); downstream test authors must not use waiter-based probes on sealed props.
 
 ---
@@ -201,6 +201,27 @@ resetprop-rs -f props.txt
 resetprop-rs --init -f props.txt
 ```
 
+### Sealing properties
+
+```sh
+# Tier B seal (default): per-prop hook inside init; only the sealed prop freezes.
+resetprop-rs --seal ro.telephony.default_network 0
+resetprop-rs -sl ro.telephony.default_network 0
+
+# Tier A seal (fallback): arena-level MAP_PRIVATE in init. Freezes every prop in
+# the same arena. Invoke manually after --seal reports a Tier B install failure.
+resetprop-rs --seal-arena ro.telephony.default_network 0
+resetprop-rs -sla ro.telephony.default_network 0
+
+# Remove a seal
+resetprop-rs --unseal ro.telephony.default_network
+resetprop-rs --unseal-arena ro.telephony.default_network
+
+# List active seals. Prop = Tier B per-prop hook; Arena = Tier A arena remap.
+resetprop-rs --seals
+# [ro.telephony.default_network]: [Prop] /dev/__properties__/u:object_r:telephony_prop:s0
+```
+
 ### Deleting properties
 
 ```sh
@@ -245,7 +266,7 @@ resetprop-rs --wait ro.crypto.state encrypted --timeout 30
 | `--init` | Zero the serial counter when writing (mimics init for `ro.*` properties) |
 | `--stealth`, `-st` | Stealth set: zeroed serial, no global serial bump, no futex wake |
 | `--seal NAME VALUE`, `-sl NAME VALUE` | Tier B seal (default): stealth write + per-prop init hook. Does not persist across reboots. |
-| `--seal-arena NAME VALUE`, `-sla NAME VALUE` | Tier A seal (fallback): stealth write + arena-level `MAP_PRIVATE` in init. Broader blast radius, use when Tier B cannot install. |
+| `--seal-arena NAME VALUE`, `-sla NAME VALUE` | Tier A seal (fallback): stealth write + arena-level `MAP_PRIVATE` in init. Broader blast radius; no auto-fallback — invoke manually after `--seal` reports a Tier B install failure. |
 | `--unseal NAME` | Remove NAME from the Tier B in-init lock list. |
 | `--unseal-arena NAME` | Revert Tier A privatization for the arena holding NAME. |
 | `--seals` | List active seals (name, tier, arena). |
