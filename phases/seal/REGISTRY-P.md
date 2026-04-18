@@ -32,7 +32,7 @@
 | ARM64 encoder | Hand-rolled `const fn` encoders in `seal/hook.rs` | References §arm64-a64-encoding |
 | Remote syscall path | ptrace SEIZE + INTERRUPT; stage `svc #0 ; brk #0` in rx scratch; GETREGSET/SETREGSET with NT_PRSTATUS iovec | References §linux-arm64-abi §7 |
 | I-cache coherence after hook write | Remote `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE)` (primary); `isb` staging (fallback) | References §linux-arm64-abi + §arm64-a64-encoding |
-| Error surface | Typed `enum Error` (existing pattern); 7 new variants in `error.rs` | No `anyhow`; matches `error.rs:5-14` |
+| Error surface | Typed `enum Error` (existing pattern); 9 new variants in `error.rs`: `PtraceAttach(io::Error)` (seize/detach attach-phase), `PtraceOp(io::Error)` (post-attach ptrace / process_vm_* operation failures), `PtraceUnexpectedStatus(i32)` (wait-status mismatch carrying raw status bits), `PtraceScope`, `ArenaAlreadySealed(PathBuf)`, `ArenaNotMapped(PathBuf)`, `ElfParse(String)`, `SymbolNotFound(String)`, `HookInstallFailed(String)`. No `anyhow`; matches `error.rs:5-22`. [Amended S02 2026-04-18 per Gate 2 critic M2: split the original `PtraceAttach` catch-all into three semantically-distinct variants so the CLI and P02/P04 can match-on-variant for hint logic.] |
 | Threat model | Adversary without root. Rooted self-inspection (reading `/proc/1/maps`) CAN detect seal | Plan §Known Trade-offs — acceptable |
 | propdetect integration | New heuristic for Tier A + Tier B signatures (future) | Plan §Touchpoints for propdetect — noted, not scoped to v1 |
 | Appcompat mirror path convention | `/dev/__properties__/appcompat_override/<filename equal to primary context file>` | Plan §Implementation — Internal flow in `seal()`; AOSP system_properties.cpp:278-296 |
