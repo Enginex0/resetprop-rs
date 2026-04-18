@@ -396,4 +396,44 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   appears anywhere in the authoritative tree except the audit file,
   which is append-only.
 
-### Self-Audit Gate T5 — TODO (pending T5 completion)
+### Self-Audit Gate T5 — `execute_remote_isb` atomic success-path restore
+
+- [x] **Optimality**: Considered three forms of the fix.
+  (a) Capture both results pre-`?`, then propagate them in order —
+      chosen. Matches the pattern the P02 fix commit 910ce69 applied to
+      `remote_syscall_via_poke` and `remote_syscall` for the same class
+      of defect. Minimum diff; no new helper.
+  (b) Extract a `restore_scratch_and_regs(pid, scratch_pc, saved_word,
+      saved_regs) -> Result<()>` helper. Rejected — a 3-line call-site
+      does not justify the indirection and the helper would only have
+      one caller, which is the zero-net-line guidance in the user's
+      Code Style block.
+  (c) Use a scope guard (drop-based cleanup). Rejected — adds a
+      dependency, complicates the happy-path reading, and doesn't buy
+      anything a 4-line capture-then-propagate pattern can't.
+- [x] **Completeness**: Diff is exactly what the audit prescribed:
+  `reg_res = setregset(...)`; `poke_res = ptrace_poketext(...)`;
+  `reg_res?; poke_res?; Ok(())`. Added a 6-line comment block above
+  the capture pattern explaining the symmetry with P02 commit 910ce69
+  and the failure mode the fix closes (libc.text holding `isb; brk`
+  bytes after a successful `wait_stop` if `setregset` fails). 118 lib
+  tests pass; clippy-clean within the T5 diff (pre-existing
+  `persist/proto.rs` + `seal/elf.rs` clippy lints are out of scope).
+- [x] **Correctness**: Walked failure sequences — (i) `setregset`
+  succeeds, `ptrace_poketext` succeeds: both results are `Ok`, the
+  two `?` operators are no-ops, function returns `Ok(())`. Same as
+  before the fix. (ii) `setregset` fails: old code short-circuited
+  via the first `?`, never restoring the scratch word, leaving
+  `isb; brk` at `scratch_pc` for the next execution stream to hit.
+  New code captures both results first; the scratch-word restore
+  fires unconditionally; then `reg_res?` propagates the reg-restore
+  error to the caller. (iii) `setregset` succeeds, `ptrace_poketext`
+  fails: `reg_res?` passes through, then `poke_res?` surfaces the
+  poke error. Net behaviour: the reg restore landed (good), the
+  scratch word didn't (but the caller now sees the failure explicitly
+  and can take further cleanup action). (iv) Both fail: both errors
+  are returned — `reg_res?` fires first (reg restore is
+  higher-criticality because failing to restore the tracee's PC could
+  leave it executing in the scratch slot), `poke_res` is dropped. The
+  earlier error gets reported, matching the convention in
+  `remote_syscall_via_poke` at the P02 fix site.

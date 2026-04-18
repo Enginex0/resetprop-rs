@@ -799,8 +799,16 @@ unsafe fn execute_remote_isb(pid: libc::pid_t, scratch_pc: u64) -> Result<()> {
     }
     wait_result?;
 
-    setregset(pid, &saved_regs)?;
-    ptrace_poketext(pid, scratch_pc, saved_word)?;
+    // Success-path restore is symmetric: capture both results before the
+    // first `?` so that a failure in `setregset` still triggers the
+    // `ptrace_poketext` scratch-word restore. The P02 fix at commit
+    // 910ce69 applied the same pattern to `remote_syscall_via_poke`;
+    // mirroring it here ensures libc.text cannot be left holding the
+    // `isb; brk` staged payload if the reg-restore FFI fails.
+    let reg_res = setregset(pid, &saved_regs);
+    let poke_res = ptrace_poketext(pid, scratch_pc, saved_word);
+    reg_res?;
+    poke_res?;
     Ok(())
 }
 
