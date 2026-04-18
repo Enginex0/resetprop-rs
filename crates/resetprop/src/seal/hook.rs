@@ -80,6 +80,15 @@ pub(crate) const LOCK_LIST_OFFSET: u64 = 0;
 /// item 4`.
 pub(crate) const HOOK_BODY_OFFSET: u64 = 1024;
 
+/// Lock-list byte capacity inside the hook page. Bytes 0..=1023 of the
+/// page are reserved for name entries (per `HOOK_BODY_OFFSET = 1024`).
+/// [`seal_prop`] refuses to append when the resulting list would exceed
+/// this capacity; exceeding it would clobber the body's first
+/// instruction (word 0 of the 92-byte hook body at `hook_page + 1024`),
+/// crashing init on its next trampoline entry. Reference:
+/// `P04-tier-b-part2.md §Approach item 4`.
+pub(crate) const LOCK_LIST_CAPACITY: u64 = 1024;
+
 /// `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE` — kernel cmd byte for
 /// cross-core instruction-cache synchronisation after writing instruction
 /// bytes into another process's VMA. Primary i-cache sync path after the
@@ -911,6 +920,200 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// P04 T4 — lock-list mechanics (pure helpers + public seal / unseal)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Append `name` + entry-NUL + empty-sentinel-NUL to a lock-list buffer in
+/// the atomic-append write order. Returns the new `cur_len`, i.e. the byte
+/// offset of the new trailing empty-entry sentinel.
+///
+/// The encoding is `<entry><NUL><entry><NUL>...<entry><NUL><NUL>` where the
+/// last standalone NUL is the empty-entry sentinel that stops the hook
+/// body's `cbz w11, .fallthrough` walker. Each entry's NUL serves only as
+/// its own terminator; the explicit trailing NUL defends against a zero-pad
+/// assumption being invalidated by a future compact-then-resize.
+///
+/// Write order (seal_prop's remote `write_remote` must honour this):
+///
+/// 1. `name` bytes at `buf[cur_len..cur_len + name.len()]` overwrite the
+///    old sentinel with the entry's first byte.
+/// 2. Entry terminator NUL at `buf[cur_len + name.len()]`.
+/// 3. New trailing sentinel NUL at `buf[cur_len + name.len() + 1]`.
+///
+/// Returns `None` if the new sentinel offset would lie at or past
+/// `capacity`; callers surface this as [`Error::HookInstallFailed`]. The
+/// bounds check uses `>= capacity` rather than `> capacity - 1` because a
+/// sentinel at offset `capacity` would be the first byte of the hook body
+/// at `HOOK_BODY_OFFSET` and clobber init's trampoline target.
+///
+/// Interior-NUL rejection is the caller's responsibility — this helper
+/// assumes `name` is a validated C-string body.
+fn lock_list_append_bytes(
+    buffer: &mut [u8],
+    cur_len: u32,
+    name: &[u8],
+    capacity: u64,
+) -> Option<u32> {
+    let tail = cur_len as usize;
+    let entry_end = tail + name.len();
+    let new_sentinel = entry_end + 1;
+    if (new_sentinel as u64) >= capacity {
+        return None;
+    }
+    buffer[tail..entry_end].copy_from_slice(name);
+    buffer[entry_end] = 0;
+    buffer[new_sentinel] = 0;
+    Some(new_sentinel as u32)
+}
+
+/// Scan `buffer[0..cur_len]` for an entry equal to `name` (followed by its
+/// NUL terminator). On match, shift subsequent entries and the trailing
+/// sentinel left over the removed slot, zero the now-stale tail, and return
+/// `Some(new_cur_len)` where `new_cur_len = cur_len - (name.len() + 1)`.
+///
+/// Returns `None` when `name` is not present; the caller surfaces this as
+/// `Ok(false)` to indicate the unseal was a no-op. Buffer contents are left
+/// unmodified in the not-found case so callers can skip the remote write.
+fn lock_list_remove_bytes(buffer: &mut [u8], cur_len: u32, name: &[u8]) -> Option<u32> {
+    let tail = cur_len as usize;
+    let removed_entry_len = name.len() + 1;
+    let mut entry_start = 0usize;
+    while entry_start < tail {
+        let entry_end = buffer[entry_start..=tail]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| entry_start + p)?;
+        if &buffer[entry_start..entry_end] == name {
+            let match_end = entry_end + 1;
+            buffer.copy_within(match_end..=tail, entry_start);
+            let new_cur_len = tail - removed_entry_len;
+            for byte in &mut buffer[new_cur_len + 1..=tail] {
+                *byte = 0;
+            }
+            return Some(new_cur_len as u32);
+        }
+        entry_start = entry_end + 1;
+    }
+    None
+}
+
+/// Append a name to the tracee's in-page lock list.
+///
+/// Atomic-append invariant (hook-side): the hook body reads the list
+/// without synchronisation, so writes must land in an order where any
+/// partial observation is either the old shorter list or the new longer
+/// list — never a half-written entry. The implementation issues one
+/// `write_remote` covering entry bytes + entry-NUL + new-sentinel-NUL in a
+/// single `process_vm_writev` call under the attach window; only after
+/// that write succeeds does the tracer-side `lock_list_len` counter
+/// advance.
+///
+/// Rejects names containing an interior NUL with [`Error::InvalidKey`]
+/// before any ptrace work, because the hook body's sentinel walk would
+/// prefix-match on the bytes preceding the NUL. Exceeding
+/// [`LOCK_LIST_CAPACITY`] surfaces as [`Error::HookInstallFailed`].
+pub fn seal_prop(handle: &mut HookHandle, name: &str) -> Result<()> {
+    if name.as_bytes().contains(&0) {
+        return Err(Error::InvalidKey);
+    }
+
+    let attach = seal::arena::RemoteAttach::new(handle.pid)
+        .map_err(|e| Error::HookInstallFailed(format!("seal_prop: attach: {e}")))?;
+
+    let mut buffer = vec![0u8; LOCK_LIST_CAPACITY as usize];
+
+    // SAFETY: `handle.hook_page` was allocated PROT_RWX by P03 stage-B
+    // and is still mapped in the tracee; `LOCK_LIST_CAPACITY` bytes at
+    // offset 0 lie inside the 4 KiB page. Tracee is ptrace-stopped via
+    // `attach`, so no concurrent mutation races the read.
+    unsafe { read_remote(handle.pid, handle.hook_page, &mut buffer) }
+        .map_err(|e| Error::HookInstallFailed(format!("seal_prop: read_remote: {e}")))?;
+
+    let new_len = lock_list_append_bytes(
+        &mut buffer,
+        handle.lock_list_len,
+        name.as_bytes(),
+        LOCK_LIST_CAPACITY,
+    )
+    .ok_or_else(|| {
+        Error::HookInstallFailed(format!(
+            "seal_prop: capacity exceeded (len={}, name={} bytes)",
+            handle.lock_list_len,
+            name.len()
+        ))
+    })?;
+
+    let write_start = handle.lock_list_len as usize;
+    let write_end = new_len as usize + 1;
+
+    // SAFETY: same page invariant as the read above; tracee remains
+    // ptrace-stopped via `attach`. `write_remote` loops on partial
+    // transfers and bounds the write to bytes already inside the hook
+    // page (`write_end <= LOCK_LIST_CAPACITY`).
+    unsafe {
+        write_remote(
+            handle.pid,
+            handle.hook_page + write_start as u64,
+            &buffer[write_start..write_end],
+        )
+    }
+    .map_err(|e| Error::HookInstallFailed(format!("seal_prop: write_remote: {e}")))?;
+
+    attach
+        .detach()
+        .map_err(|e| Error::HookInstallFailed(format!("seal_prop: detach: {e}")))?;
+
+    handle.lock_list_len = new_len;
+    Ok(())
+}
+
+/// Remove a name from the tracee's in-page lock list.
+///
+/// Returns `Ok(true)` when the name was present and the compacted list was
+/// written back; `Ok(false)` when the name was absent (no remote write
+/// issued). Compaction shifts trailing entries left over the removed slot
+/// and zeros the stale tail so the hook body never observes a stale byte
+/// past the new sentinel.
+pub fn unseal_prop(handle: &mut HookHandle, name: &str) -> Result<bool> {
+    let attach = seal::arena::RemoteAttach::new(handle.pid)
+        .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: attach: {e}")))?;
+
+    let mut buffer = vec![0u8; LOCK_LIST_CAPACITY as usize];
+
+    // SAFETY: see `seal_prop`'s read SAFETY block — same page and attach
+    // invariants apply.
+    unsafe { read_remote(handle.pid, handle.hook_page, &mut buffer) }
+        .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: read_remote: {e}")))?;
+
+    let new_len = match lock_list_remove_bytes(&mut buffer, handle.lock_list_len, name.as_bytes()) {
+        Some(n) => n,
+        None => {
+            attach
+                .detach()
+                .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: detach: {e}")))?;
+            return Ok(false);
+        }
+    };
+
+    let cur_tail = handle.lock_list_len as usize;
+    let write_end = cur_tail + 1;
+
+    // SAFETY: same invariants as `seal_prop`. Writing `[0..=cur_tail]`
+    // pushes both the compacted payload and the zeroed stale tail back to
+    // the tracee, so the hook body never sees leftover bytes past the new
+    // sentinel.
+    unsafe { write_remote(handle.pid, handle.hook_page, &buffer[0..write_end]) }
+        .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: write_remote: {e}")))?;
+
+    attach
+        .detach()
+        .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: detach: {e}")))?;
+
+    handle.lock_list_len = new_len;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,5 +1480,115 @@ mod tests {
                 "word {i} drifted from reference HOOK_BODY[{i}]"
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P04 T4 — lock-list mechanics tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Builds a dummy `HookHandle` for NUL-rejection paths that never reach
+    /// ptrace. `hook_page == 0` short-circuits [`HookHandle::drop`] so no
+    /// spurious remote work fires at end of scope.
+    fn dummy_handle_for_pre_attach_reject() -> HookHandle {
+        HookHandle {
+            pid: 0,
+            hook_page: 0,
+            lock_list_len: 0,
+            target_fn: 0,
+            saved_prologue: [0u8; 16],
+            libc_base: 0,
+            libc_end: 0,
+            scratch_pc: 0,
+            trampoline_installed: false,
+        }
+    }
+
+    /// Three successive appends into a zero-init 1024-byte buffer yield the
+    /// canonical `<entry><NUL>...<NUL><NUL>` layout; `cur_len` advances to
+    /// the offset of the new trailing sentinel after each call. The final
+    /// 10-byte payload matches the hook body's `cbz w11, .fallthrough`
+    /// walker expectations (a standalone NUL sentinel after the last
+    /// entry's own terminator).
+    #[test]
+    fn lock_list_append_bytes_three_entries() {
+        let mut buf = vec![0u8; LOCK_LIST_CAPACITY as usize];
+        let mut cur_len: u32 = 0;
+
+        cur_len = lock_list_append_bytes(&mut buf, cur_len, b"a", LOCK_LIST_CAPACITY).unwrap();
+        assert_eq!(cur_len, 2);
+
+        cur_len = lock_list_append_bytes(&mut buf, cur_len, b"bb", LOCK_LIST_CAPACITY).unwrap();
+        assert_eq!(cur_len, 5);
+
+        cur_len = lock_list_append_bytes(&mut buf, cur_len, b"ccc", LOCK_LIST_CAPACITY).unwrap();
+        assert_eq!(cur_len, 9);
+
+        assert_eq!(&buf[0..10], b"a\0bb\0ccc\0\0");
+    }
+
+    /// Capacity guard fires when the new sentinel offset would land at or
+    /// past `capacity`. At `cap = 16`, the last accepted name has
+    /// `name.len() == 14` (sentinel lands at offset 15, the last valid
+    /// index); `name.len() == 15` is the first rejected case because the
+    /// sentinel would alias offset 16 — the first byte of the hook body.
+    #[test]
+    fn lock_list_append_bytes_rejects_capacity_overflow() {
+        let mut buf = vec![0u8; 16];
+        assert!(lock_list_append_bytes(&mut buf, 0, b"123456789012345", 16).is_none());
+        assert!(lock_list_append_bytes(&mut buf, 0, b"12345678901234", 16).is_some());
+    }
+
+    /// Removing a middle entry shifts the trailing entries + sentinel left
+    /// over the removed slot and zeros the now-stale tail. New `cur_len`
+    /// equals the old `cur_len` minus `name.len() + 1` (the removed entry
+    /// and its NUL terminator).
+    #[test]
+    fn lock_list_remove_bytes_middle_entry() {
+        let mut buf = vec![0u8; LOCK_LIST_CAPACITY as usize];
+        buf[0..10].copy_from_slice(b"a\0bb\0ccc\0\0");
+
+        let new_len = lock_list_remove_bytes(&mut buf, 9, b"bb").unwrap();
+        assert_eq!(new_len, 6);
+        assert_eq!(&buf[0..7], b"a\0ccc\0\0");
+
+        for byte in &buf[7..10] {
+            assert_eq!(*byte, 0, "stale tail bytes must be zeroed after compaction");
+        }
+    }
+
+    /// Missing name returns `None`; the buffer is left byte-for-byte
+    /// unchanged so the caller can skip the remote write.
+    #[test]
+    fn lock_list_remove_bytes_missing_returns_none() {
+        let mut buf = vec![0u8; LOCK_LIST_CAPACITY as usize];
+        buf[0..6].copy_from_slice(b"a\0bb\0\0");
+        let snapshot = buf.clone();
+
+        assert!(lock_list_remove_bytes(&mut buf, 5, b"missing").is_none());
+        assert_eq!(buf, snapshot);
+    }
+
+    /// Removing the only entry drops `cur_len` to zero and leaves the
+    /// sentinel at offset 0 — the initial empty-list state the hook body
+    /// encounters immediately after P03 stage-B.
+    #[test]
+    fn lock_list_remove_bytes_only_entry_resets_to_empty() {
+        let mut buf = vec![0u8; LOCK_LIST_CAPACITY as usize];
+        buf[0..6].copy_from_slice(b"solo\0\0");
+
+        let new_len = lock_list_remove_bytes(&mut buf, 5, b"solo").unwrap();
+        assert_eq!(new_len, 0);
+        assert_eq!(buf[0], 0, "sentinel must sit at offset 0 for empty list");
+    }
+
+    /// Interior-NUL rejection fires before any ptrace work, so a dummy
+    /// handle with `hook_page == 0` suffices — `seal_prop`'s guard clause
+    /// returns `Err(Error::InvalidKey)` without touching
+    /// `RemoteAttach::new`.
+    #[test]
+    fn seal_prop_rejects_interior_nul() {
+        let mut handle = dummy_handle_for_pre_attach_reject();
+        let err = seal_prop(&mut handle, "a\0b").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey));
     }
 }
