@@ -43,6 +43,7 @@ pub use seal::{SealRecord, SealTier};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 const PROP_DIR: &str = "/dev/__properties__";
@@ -297,6 +298,7 @@ pub struct PropSystem {
     context: Option<context::PropertyContext>,
     area_by_name: HashMap<String, usize>,
     appcompat: Option<appcompat::AppcompatAreas>,
+    hook_handle: OnceLock<Mutex<Option<seal::hook::HookHandle>>>,
 }
 
 impl PropSystem {
@@ -358,6 +360,7 @@ impl PropSystem {
             context: ctx,
             area_by_name,
             appcompat,
+            hook_handle: OnceLock::new(),
         })
     }
 
@@ -584,6 +587,109 @@ impl PropSystem {
         )?;
 
         Ok(remove_seal_record(name))
+    }
+
+    /// Tier B seal: lazily install init's `__system_property_update` hook,
+    /// then append `name` to the hook's lock list so subsequent writes with
+    /// that exact name short-circuit to `mov w0, #0; ret` without mutating
+    /// the arena. Unsealed neighbour properties keep writing normally.
+    ///
+    /// Flow:
+    /// 1. Reject `properties_serial` up front — matches the P02 `seal_arena`
+    ///    guard and REGISTRY §1 "Arenas NOT to touch". Keeps the Tier A /
+    ///    Tier B boundary consistent even though the hook path does not
+    ///    touch the serial counter directly.
+    /// 2. `set_stealth(name, value)` — writes the target value with no
+    ///    serial bump, matching `-st` semantics. Runs BEFORE any ptrace
+    ///    work so a misconfigured context fails fast.
+    /// 3. Lazily initialise the shared `HookHandle` under the per-process
+    ///    `OnceLock<Mutex<Option<HookHandle>>>`. `install_init_hook` walks
+    ///    init's `/proc/1/maps` + libc ELF, then `install_trampoline`
+    ///    patches the 16-byte prologue. A failure between the two leaves
+    ///    the slot `None` so the next `seal()` can retry cleanly.
+    /// 4. `seal::hook::seal_prop(handle, name)` appends the name under the
+    ///    hook's atomic-append invariant (entry bytes → trailing sentinel
+    ///    → length counter).
+    /// 5. Record the operation in the process-wide `seals_registry()` as
+    ///    `SealTier::Prop`; existing entries with the same `(name, tier)`
+    ///    have their timestamp refreshed rather than duplicated.
+    ///
+    /// A poisoned hook-handle mutex surfaces as
+    /// `Error::HookInstallFailed` rather than `unwrap_or_else` recovery —
+    /// poisoning means a prior `seal()` panicked mid-install and silent
+    /// recovery could leave the registry inconsistent with the tracee.
+    pub fn seal(&self, name: &str, value: &str) -> Result<SealRecord> {
+        let primary_path = self.resolve_arena_path(name)?;
+        let filename = arena_filename(&primary_path)?;
+        if filename == SERIAL_FILE {
+            return Err(Error::InvalidKey);
+        }
+
+        self.set_stealth(name, value)?;
+
+        let slot = self.hook_handle.get_or_init(|| Mutex::new(None));
+        let mut guard = slot.lock().map_err(|_| {
+            Error::HookInstallFailed("seal: hook_handle mutex poisoned".to_string())
+        })?;
+        if guard.is_none() {
+            let mut handle = seal::hook::install_init_hook(seal::INIT_PID)?;
+            seal::hook::install_trampoline(&mut handle)?;
+            *guard = Some(handle);
+        }
+        let handle = guard
+            .as_mut()
+            .expect("hook handle initialised above or was already present");
+        seal::hook::seal_prop(handle, name)?;
+        drop(guard);
+
+        let record = SealRecord {
+            name: name.to_string(),
+            arena_path: primary_path,
+            tier: SealTier::Prop,
+            sealed_at: SystemTime::now(),
+        };
+        Ok(insert_or_refresh_seal(record))
+    }
+
+    /// Reverse of [`seal`](Self::seal): remove `name` from init's hook
+    /// lock list and delete the matching `SealTier::Prop` record. Arena
+    /// seals for the same name (if any) are left untouched.
+    ///
+    /// Returns `Ok(true)` if a hook entry was removed, `Ok(false)` if no
+    /// hook is installed yet or the name was never sealed. Never issues
+    /// ptrace work when the hook has not been installed.
+    pub fn unseal(&self, name: &str) -> Result<bool> {
+        let slot = self.hook_handle.get_or_init(|| Mutex::new(None));
+        let mut guard = slot.lock().map_err(|_| {
+            Error::HookInstallFailed("unseal: hook_handle mutex poisoned".to_string())
+        })?;
+        let handle = match guard.as_mut() {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        let removed = seal::hook::unseal_prop(handle, name)?;
+        drop(guard);
+
+        if removed {
+            let registry = seal::seals_registry();
+            let mut entries = registry.lock().map_err(|_| {
+                Error::HookInstallFailed("unseal: seals registry mutex poisoned".to_string())
+            })?;
+            entries.retain(|r| !(r.name == name && r.tier == SealTier::Prop));
+        }
+        Ok(removed)
+    }
+
+    /// Returns a snapshot of the process-wide seal registry. The returned
+    /// `Vec` is an owned clone — callers can iterate without holding the
+    /// internal mutex, and mutations in the registry after the call are
+    /// not reflected in the snapshot.
+    pub fn seals(&self) -> Result<Vec<SealRecord>> {
+        let registry = seal::seals_registry();
+        let entries = registry.lock().map_err(|_| {
+            Error::HookInstallFailed("seals: seals registry mutex poisoned".to_string())
+        })?;
+        Ok(entries.clone())
     }
 
     /// Returns the appcompat mirror path for `primary_path` when the loaded
