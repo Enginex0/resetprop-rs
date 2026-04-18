@@ -169,7 +169,7 @@ pub fn ptrace_seize(pid: Pid) -> Result<()> {
         libc::ptrace(
             PTRACE_SEIZE as _,
             pid,
-            0 as *mut c_void,
+            std::ptr::null_mut::<c_void>(),
             PTRACE_O_TRACESYSGOOD as *mut c_void,
         )
     };
@@ -188,8 +188,8 @@ pub fn ptrace_interrupt(pid: Pid) -> Result<()> {
         libc::ptrace(
             PTRACE_INTERRUPT as _,
             pid,
-            0 as *mut c_void,
-            0 as *mut c_void,
+            std::ptr::null_mut::<c_void>(),
+            std::ptr::null_mut::<c_void>(),
         )
     };
     if rc == -1 {
@@ -286,8 +286,8 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
         libc::ptrace(
             PTRACE_DETACH as _,
             pid,
-            0 as *mut c_void,
-            0 as *mut c_void,
+            std::ptr::null_mut::<c_void>(),
+            std::ptr::null_mut::<c_void>(),
         )
     };
     if rc == -1 {
@@ -335,13 +335,10 @@ unsafe fn read_remote(pid: Pid, remote_addr: u64, buf: &mut [u8]) -> Result<()> 
             return Err(last_ptrace_op_err());
         }
         if n == 0 {
-            return Err(Error::PtraceOp(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "process_vm_readv stalled: {transferred}/{} bytes transferred",
-                    buf.len()
-                ),
-            )));
+            return Err(Error::PtraceOp(io::Error::other(format!(
+                "process_vm_readv stalled: {transferred}/{} bytes transferred",
+                buf.len()
+            ))));
         }
         transferred += n as usize;
     }
@@ -384,13 +381,10 @@ unsafe fn write_remote(pid: Pid, remote_addr: u64, buf: &[u8]) -> Result<()> {
             return Err(last_ptrace_op_err());
         }
         if n == 0 {
-            return Err(Error::PtraceOp(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "process_vm_writev stalled: {transferred}/{} bytes transferred",
-                    buf.len()
-                ),
-            )));
+            return Err(Error::PtraceOp(io::Error::other(format!(
+                "process_vm_writev stalled: {transferred}/{} bytes transferred",
+                buf.len()
+            ))));
         }
         transferred += n as usize;
     }
@@ -463,8 +457,8 @@ pub unsafe fn remote_syscall(
         libc::ptrace(
             PTRACE_CONT as _,
             pid,
-            0 as *mut c_void,
-            0 as *mut c_void,
+            std::ptr::null_mut::<c_void>(),
+            std::ptr::null_mut::<c_void>(),
         )
     };
     if rc == -1 {
