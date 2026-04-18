@@ -155,7 +155,7 @@
 | Item | Required Value | Verified at |
 |------|----------------|-------------|
 | `PROP_INFO_NAME_OFFSET` | 96 (REGISTRY §1 "prop_info layout — name at offset 96"; aosp-property-system.md §1 `static_assert(sizeof(prop_info) == 96)` at prop_info.h:89) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |
-| `HOOK_BODY_OFFSET` (inside hook_page) | 4 (P04 spec §Approach item 4 — byte 0 is empty-list sentinel NUL, bytes 1..=3 zero-pad, hook body starts at byte 4) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |
+| `HOOK_BODY_OFFSET` (inside hook_page) | 1024 (P04 spec §Approach item 4 — bytes 0..=1023 reserved for lock-list, body at bytes 1024..=1115, bytes 1116..=4095 spare; corrects the spec's inline `HOOK_BODY_OFFSET = 4` typo which contradicted the same paragraph's "first 1024 bytes for the list" clause and would have left zero lock-list capacity before the body) | `crates/resetprop/src/seal/hook.rs:81` |
 | `LOCK_LIST_OFFSET` (inside hook_page) | 0 (P04 spec §Approach item 4) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |
 | `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE` | `0x80` (arm64-a64-encoding.md §i-cache invalidation options; linux/membarrier.h cmd enum value) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |
 | `__NR_membarrier` | 283 (linux-arm64-abi.md §1 citations table: `asm-generic/unistd.h:683`) | `crates/resetprop/src/seal/hook.rs:<line>` after verification |

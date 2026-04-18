@@ -67,10 +67,18 @@ const LIBC_SCAN_LIMIT: usize = 64 * 1024;
 pub(crate) const LOCK_LIST_OFFSET: u64 = 0;
 
 /// Hook page byte offset where [`build_hook_body_bytes`]'s 92-byte body
-/// lands. Byte 0 is the empty-list sentinel NUL; bytes 1..=3 are zero
-/// alignment padding; the body starts at byte 4. Reference:
-/// `P04-tier-b-part2.md §Approach item 4`.
-pub(crate) const HOOK_BODY_OFFSET: u64 = 4;
+/// lands. Bytes 0..=1023 are reserved for the lock-list region (initial
+/// empty-list sentinel NUL at offset 0, per `LOCK_LIST_OFFSET = 0`); the
+/// hook body occupies bytes 1024..=1115, leaving bytes 1116..=4095 spare.
+///
+/// The 1024-byte list capacity matches the P04 spec's own
+/// "P03 reserved the first 1024 bytes of the 4 KB hook page for the list"
+/// clause in §Approach item 4 (spec's literal `HOOK_BODY_OFFSET = 4` was a
+/// typo in the same paragraph — a 4-byte offset would leave zero capacity
+/// for any lock-list entry before the body, corrupting init's trampoline
+/// target on the first seal). Reference: `P04-tier-b-part2.md §Approach
+/// item 4`.
+pub(crate) const HOOK_BODY_OFFSET: u64 = 1024;
 
 /// `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE` — kernel cmd byte for
 /// cross-core instruction-cache synchronisation after writing instruction
