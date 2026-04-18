@@ -143,3 +143,41 @@ P05 joins both tracks — requires P02 and P04 both COMPLETE.
 | 2026-04-18 | S01 — "fire up P01" | P01 / — | IN_PROGRESS (3 of 5 tasks complete) | Branch `feat/P01-foundation` 9 commits ahead of `main`. T1 shipped seal module skeleton + 7 error variants + SealRecord/SealTier (65b5a25, b0917f2, 07d9238). T2 shipped `/proc/pid/maps` parser + 3 unit tests (fa02dc3, 2ad4557). T3 shipped ptrace constants + UserPtRegs (272 B, aarch64-asserted) + ptrace_seize/interrupt/wait_stop/getregset/setregset/ptrace_detach with yama EPERM classification + 6/6 SAFETY pairing (3477933, 0d30d9f). Self-audit gates 1–3 filled with Optimality/Completeness/Correctness notes (6982944, 67b9848, plus this commit). 63 unit tests pass; zero regressions vs T0 baseline 58. Handoff: next session begins at T4 (`remote_syscall` injector) per `phases/seal/SESSION-01-HANDOFF.md`. |
 | 2026-04-18 | S01 — "fire up P02" | P02 / — | IN_PROGRESS (4 of 5 tasks complete) | Branch `feat/P02-tier-a` cut from P01 tip `24c7cd1`. Five commits shipped: T1 `find_arena_mapping` + 3 unit tests (690e606); T2 refactor clippy cleanup (d96d68c) + `ptrace_peektext`/`ptrace_poketext` + `ARM64_NOP` + `find_nop_slide` + `read_remote`/`write_remote` viz bump + 4 tests (8ff023b); T3 `RemoteAttach` RAII detach guard + `RemapFlags` + `remote_remap_private` bootstrap flow (libc.text NOP slide → POKEDATA svc+brk → MAP_PRIVATE\|MAP_ANON RWX page → openat/mmap/close via `remote_syscall` with intentional bootstrap page leak) + 3 tests (cb65fad); T4 thin orchestrators `seal_arena`/`unseal_arena`/`_with_mirror` + `OnceLock<Mutex<Vec<SealRecord>>>` registry + `PropSystem::seal_arena`/`unseal_arena` with `properties_serial` guard reusing `SERIAL_FILE` constant + mirror path via REGISTRY-locked convention + `pub use seal::{SealRecord, SealTier}` + 3 unit tests (bd1c7d6). Mid-session restructure: P02 spec's T2/T3 wording assumed P01 shipped `attach`/`stage_svc`/`restore_scratch` helpers; actual P01 surface exposes 6 primitives + `remote_syscall` with internal svc+brk staging. Task boundaries rebalanced to add POKEDATA path (user-approved option) without exceeding the 5-task cap. All SAFETY pairings filled, zero new error variants, zero `chmod`/`fchmod`/`fchown`/`ftruncate` calls verified via grep, 75 lib tests pass (63 P01 baseline + 12 P02), `cargo clippy -p resetprop --no-deps --lib -- -D warnings` clean. REGISTRY §1 row 35 variant count unchanged at 9. Next session picks up at T5 integration smoke test, then checklist refresh, then Gate 2 adversarial audit. See `phases/seal/SESSION-02-HANDOFF.md`. |
 | 2026-04-18 | S02 — "close P01 to COMPLETE" | P01 / — | COMPLETE | T4 shipped `remote_syscall` 9-step injector with 12/12 SAFETY pairing + `read_remote`/`write_remote` partial-transfer loops (e9da006, 2cfb549, f91ea5b). T5 shipped `ptrace_core_smoke.rs` integration test — gated `#![cfg(target_arch = "aarch64")]` because the test executes real ARM64 `svc #0 ; brk #0` bytecode that cannot run on x86_64 hosts; verified on-device (aarch64 Android 15, `u:r:su:s0` root, no yama) with 3 consecutive `1 passed` runs at 0.06s each, zero flakiness (77839ec, aa7835e, 9fab6f8). Gate 2 round 1 surfaced 4 distinct MAJOR findings across code-reviewer + critic: `PTRACE_O_TRACESYSGOOD` missing on SEIZE, `wait_stop` lacks event-byte validation at the contract boundary, `Error::PtraceAttach` overloaded as catch-all, ARM64/NR constants leaked as `pub` — all addressed in fix commits 684f551 (REGISTRY amendment: 7→9 error variants), 6fc6b48 (ptrace hardening: TRACESYSGOOD + wait_stop(pid, expected_event) + PtraceAttach/PtraceOp/PtraceUnexpectedStatus split + visibility downgrade + write_remote SAFETY fix), 3843209 (maps.rs path whitespace preservation via splitn). Gate 2 round 2 PASS from both agents; 2 new MINORs (m5 stale checklist citations, m6 `linux-arm64-abi.md:213` VMA claim) fixed in phase-close docs commit. Branch `feat/P01-foundation` 22+ commits ahead of `main`. TC-01..TC-09 green, FR-01..FR-29 annotated. Next: P02 (Tier A arena-level seal) OR P03 (Tier B pt1 ELF+hook page) — both can proceed in parallel per §5 dependency graph. |
+
+## 8. Deferred Audit Findings
+
+### P02 Gate 2 round 1 — MAJOR-5 (wait_stop spurious stops)
+
+**Finding (critic)**: wait_stop rejects syscall-stops (SIGTRAP|0x80) and
+spurious group-stops on busy multi-threaded init with no retry. Under
+load (SIM swaps, zygote SIGCHLD churn) seal_arena surfaces
+PtraceUnexpectedStatus intermittently.
+
+**Decision**: Deferred to a future hardening phase. Touching wait_stop
+is a P01 surface modification; doing it inside P02 would breach the
+one-phase-per-session discipline.
+
+**V2 plan**: Introduce wait_stop_retry(pid, expected_event, max_retries)
+that re-resumes spurious stops via PTRACE_CONT with the pending signal
+delivered, bounded to 64 iterations. Callers opt in by changing
+call-sites from wait_stop to wait_stop_retry. Effort: ~20 lines in
+seal/ptrace.rs plus 2 call-site updates in arena.rs. Track under
+future phase P0x-hardening.
+
+### P02 Gate 2 round 1 — MAJOR-8 (non-atomic mirror seal)
+
+**Finding (critic)**: seal_arena_with_mirror runs two independent
+attach/detach cycles. Between them init resumes; a concurrent property
+write in the window leaves mirror != primary.
+
+**Decision**: Deferred. The race window is sub-millisecond (bounded by
+detach+attach latency) and seals are rare operator events per REGISTRY
+§1. v1 ships with the limitation documented.
+
+**V2 plan**: Refactor remote_remap_private into
+remote_remap_private_batch(pid, &[(&MapEntry, &Path)], flags) that runs
+ONE RemoteAttach, ONE bootstrap mmap, N openat+mmap+close triples, ONE
+remote munmap, ONE detach. seal_arena / unseal_arena become thin shims
+that construct a single-element slice; seal_arena_with_mirror
+constructs a two-element slice. Effort: ~40-line refactor confined to
+seal/arena.rs. Track under future phase P0x-hardening.
