@@ -212,3 +212,60 @@ The single most consequential finding is **C1**: the README's claim that seal cr
 **Both agents converge on**: the seal feature works as implemented, but the documentation over-claims its scope, and the tests only exercise the path where the seal fires — never the path where it bypasses.
 
 **Fix scope estimate**: 5–7 small edits across `README.md`, `tests/device-stress-test.sh`, and `crates/resetprop-cli/src/main.rs`. Achievable in a single P05.2 fix-lane session under the 5-task cap. No code-surface redesign required; mostly documentation honesty + one parser guard + one test prop swap + one test KSU probe step.
+
+---
+
+## Addendum — ksu_props empirical analysis (2026-04-18)
+
+**Source**: `https://github.com/Kernel-SU/ksu_props` cloned at `.analysis/ksu_props/`. Two sonnet agents dispatched in parallel (write-path tracer + init-routing verifier) with independent prompts. Both converged with file:line citations.
+
+### Key finding — ksu_props has TWO write paths
+
+The dispatch branch is at `crates/prop-rs-android/src/sys_prop.rs:580`:
+
+```rust
+let force_skip = skip_svc || key.starts_with("ro.");
+```
+
+| Condition | Write primitive | File:line | Routes through init? | Seal catches? |
+|---|---|---|---|---|
+| Any `ro.*` key (ALWAYS) | Direct mmap — `core::ptr::copy_nonoverlapping` into MAP_SHARED mmap of `/dev/__properties__/<ctx>` | `mmap_prop_area.rs:277` | NO | **NO** |
+| `-n` / `--skip-svc` flag on any key | Direct mmap (same path) | `mmap_prop_area.rs:277` | NO | **NO** |
+| Mutable key, no `-n` flag | bionic `__system_property_set` via dlsym | `sys_prop.rs:612` | YES (socket → init → `__system_property_update`) | **YES** |
+
+### Dependencies scanned
+
+`crates/prop-rs-android/Cargo.toml` declares `libc`, `memmap2`, `log` — no Android property-service crate. The only init contact is the dlsym-loaded `__system_property_set` function pointer used conditionally.
+
+### Implication for the C1 finding
+
+My earlier CRITICAL framing ("seal is bypassed by direct-mmap writers") was correct in direction but imprecise on scope. The correct statement:
+
+- The seal IS effective for mutable properties written without the `-n` flag (bionic routing through init).
+- The seal is NOT effective for `ro.*` properties (which are the primary spoofing target — fingerprint, serial, telephony identities) because ksu_props unconditionally routes those through direct-mmap regardless of any flag.
+- The seal is NOT effective when the `-n` flag is used on any key.
+
+This matters because the property in Test 21 (`ro.telephony.default_network`) is exactly the case that bypasses the seal via ksu_props. A user running `/data/adb/ksu/bin/resetprop ro.telephony.default_network 99` overwrites the sealed prop without triggering the Tier B hook.
+
+### Fix guidance for P05.2 (sharpens the C1 remediation)
+
+1. **README Seal subsection** must enumerate the write paths the seal covers vs bypasses:
+   - COVERED: `setprop`, `property_service`, any caller of bionic's `__system_property_set` (socket path)
+   - NOT COVERED: ksu_props with `ro.*` keys or `-n` flag, Magisk resetprop (same direct-mmap pattern), resetprop-rs itself (same pattern — `PropSystem::set` at `lib.rs:446-463`)
+
+2. **Test 21 should include a KSU resetprop probe** after the `setprop` loop:
+   - Check `[ -x /data/adb/ksu/bin/resetprop ]`
+   - Attempt `ksu_props resetprop "$TEL_PROP" "99"` (will take direct-mmap path for the `ro.*` prefix)
+   - Log the outcome as `WARN` (not `FAIL`) — documenting the expected bypass
+   - Makes the seal's scope limitation empirically observable instead of invisible
+
+3. **The "nothing on the device can revert" phrasing** must be replaced with "no init-mediated writer can revert". The spoof-persistence use case the feature markets itself for needs honest threat-model docs.
+
+### Evidence preserved
+
+The cloned repo at `.analysis/ksu_props/` (scratch, gitignored) retains the source tree for follow-up inspection. Key files for future reference:
+- `tools/resetprop/src/main.rs:185` — CLI entry
+- `crates/prop-rs-android/src/resetprop.rs:64` — `ResetProp::set` delegates to `sys_prop::set`
+- `crates/prop-rs-android/src/sys_prop.rs:580-616` — the dual-path dispatch
+- `crates/prop-rs-android/src/mmap_prop_area.rs:274-278` — the `write_bytes_data` primitive (the direct-mmap write)
+- `crates/prop-rs-android/src/sys_prop.rs:612` — the bionic `__system_property_set` call site (the init-routed path)
