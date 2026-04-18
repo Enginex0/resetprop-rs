@@ -207,3 +207,63 @@ This block runs ONCE per phase, after the FINAL segment (Task 5) completes. NOT 
 - [ ] Gate 2 reports PASS from BOTH `code-reviewer` AND `critic` agents
 - [ ] REGISTRY §4 row for P04 updated: `Status = COMPLETE`, branch, sessions, notes
 - [ ] REGISTRY §7 session log appended with session date, phase P04, outcome, artifacts (audit report path)
+
+## P04.2 Fix-Lane Self-Audit Gates
+
+Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUST fill all three Notes below before the next fix task may start, per `.claude/system-prompt.md §Per-Task Implementation Loop`.
+
+### Self-Audit Gate T1 — STRCMP_BODY splice + scan-past-NUL + pointer rebind
+
+- [x] **Optimality**: Considered three alternatives for the splice.
+  (a) Expand `HOOK_BODY_TEMPLATE` in place from 23 → 35 words (chosen).
+  (b) Keep the 23-word template and emit a separate out-of-line STRCMP page
+      invoked via `bl` from the stub slot. Rejected — doubles the RWX page
+      allocation and adds a second i-cache sync target.
+  (c) Hand-assemble the body per-call via the `encoder::` submodule. Rejected —
+      defeats the point of the const template and loses the byte-for-byte
+      reference check. The chosen expansion keeps the reference §Hook body
+      sketch as the line-by-line ground truth and makes the splice a
+      const-array substitution with no runtime assembly.
+- [x] **Completeness**: Delivered per spec item by item — (1) template grew to
+  35 words / 140 bytes (`hook.rs:599-636`); (2) pre-splice pointer rebind at
+  words 5-6 (`mov x12,x9 ; mov x13,x10`) preserves caller x0/x1 (critic M5);
+  (3) 13-word STRCMP splice at words 7-19 with registers rebound to
+  x12/x13/w14/w15 and `.mismatch`/`.match` exits rewritten as
+  `b .advance` / `b .on_match` per reference §Hook body sketch line 415;
+  (4) 3-word `.advance` block at words 22-24 replaces the broken 1-word
+  stub with post-indexed `ldrb ; cbnz ; b .next_entry` scan-past-NUL;
+  (5) patch-point constants advanced to STOLEN_START=25, RESTORE_LIT=31,
+  LOCK_LIST_LIT=33; (6) doc comments + `HOOK_BODY_OFFSET` / `LOCK_LIST_CAPACITY`
+  size references updated 92→140 throughout; (7) three tests added
+  (`_header_matches_spliced_layout`, `_splices_strcmp_body`,
+  `_advance_block_scans_past_nul`) for byte-for-byte round-trip decoding,
+  existing `_roundtrip` + `_is_pure` tests migrated to the 140-byte layout.
+- [x] **Correctness**: Walked edge cases — (i) empty lock list: word 3 peeks
+  NUL sentinel, word 4 takes `cbz` to `.fall_through` at word 25, splice
+  never entered, stolen prologue + `br x16` → `target_fn + 16` with
+  (x0,x1,w2) preserved. (ii) First-entry match: outer loop peeks non-NUL,
+  word 5-6 rebind, splice ldrb/ldrb/cmp matches, word 11 `cbz w14` on
+  terminating NUL takes to word 18 which `b`s to `.on_match` (word 20)
+  → `movz w0,#0; ret`. (iii) Mismatch mid-entry: word 10 `b.ne` to word 16
+  which `b`s to `.advance` (word 22), post-indexed `ldrb w11,[x10],#1`
+  advances x10 past the current entry's remaining chars + its NUL,
+  `cbnz w11, .-4` loops until NUL reached, `b .next_entry` re-enters
+  outer loop at word 3. (iv) Entry longer than property name: strcmp sees
+  non-NUL `w14` vs NUL `w15` → `b.ne` → advance. (v) Property name longer
+  than entry: strcmp sees NUL `w14` vs non-NUL `w15` → `b.ne` → advance
+  (not `.match`, because word 11 `cbz w14, .match` requires w14==0 but
+  the preceding `cmp` would have set NE). (vi) x0/x1 preservation on
+  fallthrough: splice mutates only x12/x13/w14/w15; x0 and x1 remain
+  caller-provided; `br x16` branches back with full ABI intact.
+  (vii) Upper-32-bit zeroing on `ldrb`: AArch64 semantics zero-extend
+  byte loads to 32 bits and writing a W register clears the high 32 bits
+  of its X counterpart, so `cbnz w11` after `ldrb w11, [x10], #1`
+  reliably detects NUL regardless of prior x11 state.
+
+### Self-Audit Gate T2 — TODO (pending T2 completion)
+
+### Self-Audit Gate T3 — TODO (pending T3 completion)
+
+### Self-Audit Gate T4 — TODO (pending T4 completion)
+
+### Self-Audit Gate T5 — TODO (pending T5 completion)

@@ -66,10 +66,10 @@ const LIBC_SCAN_LIMIT: usize = 64 * 1024;
 /// Reference: `P04-tier-b-part2.md §Approach item 4`.
 pub(crate) const LOCK_LIST_OFFSET: u64 = 0;
 
-/// Hook page byte offset where [`build_hook_body_bytes`]'s 92-byte body
+/// Hook page byte offset where [`build_hook_body_bytes`]'s 140-byte body
 /// lands. Bytes 0..=1023 are reserved for the lock-list region (initial
 /// empty-list sentinel NUL at offset 0, per `LOCK_LIST_OFFSET = 0`); the
-/// hook body occupies bytes 1024..=1115, leaving bytes 1116..=4095 spare.
+/// hook body occupies bytes 1024..=1163, leaving bytes 1164..=4095 spare.
 ///
 /// The 1024-byte list capacity matches the P04 spec's own
 /// "P03 reserved the first 1024 bytes of the 4 KB hook page for the list"
@@ -84,7 +84,7 @@ pub(crate) const HOOK_BODY_OFFSET: u64 = 1024;
 /// page are reserved for name entries (per `HOOK_BODY_OFFSET = 1024`).
 /// [`seal_prop`] refuses to append when the resulting list would exceed
 /// this capacity; exceeding it would clobber the body's first
-/// instruction (word 0 of the 92-byte hook body at `hook_page + 1024`),
+/// instruction (word 0 of the 140-byte hook body at `hook_page + 1024`),
 /// crashing init on its next trampoline entry. Reference:
 /// `P04-tier-b-part2.md §Approach item 4`.
 pub(crate) const LOCK_LIST_CAPACITY: u64 = 1024;
@@ -586,76 +586,116 @@ pub(crate) mod encoder {
 // P04 T2 — pure hook-body encoder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Canonical 23-word (92-byte) hook-body template per
-/// `references/arm64-a64-encoding.md` §Hook body sketch lines 383-407.
+/// Canonical 35-word (140-byte) hook-body layout.
 ///
-/// The template carries `nop` (0xd503_201f) in the three patch regions
-/// (STOLEN_START=13..=16, RESTORE_LIT=19..=20, LOCK_LIST_LIT=21..=22). The
-/// RESTORE and LOCK_LIST literal slots are documented as zeros in the
-/// reference; we seed them with `nop` for the prologue mirrors and `0` for
-/// the two u64 literal slots so uninitialised reads during construction
-/// remain deterministic. [`build_hook_body_bytes`] overwrites all three
-/// regions before returning, so the seed value is never observable.
-const HOOK_BODY_TEMPLATE: [u32; 23] = [
-    0xb400_01a0, // 0: cbz  x0, .fall_through  (+52)
-    0x9101_8009, // 1: add  x9, x0, #96
-    0x5800_026a, // 2: ldr  x10, =LOCK_LIST    (+76)
-    0x3940_014b, // 3: ldrb w11, [x10]
-    0x3400_012b, // 4: cbz  w11, .fall_through (+36)
-    0x1400_0003, // 5: b .advance              (+12)  -- strcmp stub
-    0x5280_0000, // 6: movz w0, #0
-    0xd65f_03c0, // 7: ret
-    0x9100_054a, // 8: add  x10, x10, #1
-    0x17ff_fffa, // 9: b .next_entry           (-24)
-    0xd503_201f, // 10: nop
-    0xd503_201f, // 11: nop
-    0xd503_201f, // 12: nop
-    0xd503_201f, // 13: STOLEN_0 (patched)
-    0xd503_201f, // 14: STOLEN_1 (patched)
-    0xd503_201f, // 15: STOLEN_2 (patched)
-    0xd503_201f, // 16: STOLEN_3 (patched)
-    0x5800_0050, // 17: ldr x16, =RESTORE_TARGET (+8)
-    0xd61f_0200, // 18: br  x16
-    0x0000_0000, // 19: RESTORE_TARGET lo (patched)
-    0x0000_0000, // 20: RESTORE_TARGET hi (patched)
-    0x0000_0000, // 21: LOCK_LIST lo (patched)
-    0x0000_0000, // 22: LOCK_LIST hi (patched)
+/// Derived from `references/arm64-a64-encoding.md` §Hook body sketch +
+/// §Strcmp loop skeleton (splice rule at line 415 — "Splice the 13-word
+/// STRCMP_BODY over HOOK_BODY[STRCMP_STUB]"). The reference lists the
+/// template in its pre-splice form (23 words with a 1-word `b .advance`
+/// stub at word 5); this const is the post-splice realisation used at
+/// install time.
+///
+/// Word layout:
+///
+/// | Words | Role |
+/// |---|---|
+/// | 0..=4   | Header — NULL-guard, `&pi->name`, LOCK_LIST ptr, entry peek, sentinel bail |
+/// | 5..=6   | Pointer rebind (`x12 = x9`, `x13 = x10`) — preserves caller x0/x1 across the splice so the fallthrough path can hand the original `prop_info*` / `value` pair back to the real `__system_property_update` at `target_fn + 16` |
+/// | 7..=19  | Spliced STRCMP — canonical 13-word loop re-encoded against x12/x13 (pointers) and w14/w15 (byte temps), with the canonical `.mismatch` / `.match` exits (originally `movz wN,#…; ret` pairs) rewritten as `b .advance` / `b .on_match` to flow back into the outer loop or the short-circuit return |
+/// | 20..=21 | `.on_match` — `movz w0, #0; ret` (hook's short-circuit success return) |
+/// | 22..=24 | `.advance` — post-indexed `ldrb w11, [x10], #1; cbnz w11, .-4` walks `x10` past the entry's NUL terminator, then `b .next_entry` re-enters the outer loop at word 3 |
+/// | 25..=28 | `.fall_through` — four stolen prologue words (patched at install) |
+/// | 29..=30 | `ldr x16, =RESTORE_TARGET; br x16` — tail-branch to `target_fn + 16` |
+/// | 31..=32 | `RESTORE_TARGET` u64 LE (patched at install) |
+/// | 33..=34 | `LOCK_LIST` u64 LE (patched at install) |
+///
+/// The template seeds STOLEN_START with `nop` (so an uninitialised read
+/// during construction remains deterministic) and the two u64 literal
+/// slots with `0`. [`build_hook_body_bytes`] overwrites all three regions
+/// before returning, so the seed value is never observable.
+const HOOK_BODY_TEMPLATE: [u32; 35] = [
+    0xb400_0320, // 0:  cbz  x0, .fall_through        (+100 → word 25)
+    0x9101_8009, // 1:  add  x9, x0, #96
+    0x5800_03ea, // 2:  ldr  x10, =LOCK_LIST           (+124 → word 33)
+    0x3940_014b, // 3:  .next_entry: ldrb w11, [x10]
+    0x3400_02ab, // 4:  cbz  w11, .fall_through        (+84  → word 25)
+    0xaa09_03ec, // 5:  mov  x12, x9                   -- rebind: property-name ptr
+    0xaa0a_03ed, // 6:  mov  x13, x10                  -- rebind: lock-list entry ptr
+    0x3940_018e, // 7:  .strcmp_loop: ldrb w14, [x12]
+    0x3940_01af, // 8:  ldrb w15, [x13]
+    0x6b0f_01df, // 9:  cmp  w14, w15
+    0x5400_00c1, // 10: b.ne .mismatch                 (+24  → word 16)
+    0x3400_00ee, // 11: cbz  w14, .match               (+28  → word 18)
+    0x9100_058c, // 12: add  x12, x12, #1
+    0x9100_05ad, // 13: add  x13, x13, #1
+    0x17ff_fff9, // 14: b    .strcmp_loop              (-28  → word 7)
+    0xd503_201f, // 15: nop
+    0x1400_0006, // 16: .mismatch: b .advance          (+24  → word 22)
+    0xd503_201f, // 17: nop (unused — was canonical `ret`)
+    0x1400_0002, // 18: .match: b .on_match            (+8   → word 20)
+    0xd503_201f, // 19: nop (unused — was canonical `ret`)
+    0x5280_0000, // 20: .on_match: movz w0, #0
+    0xd65f_03c0, // 21: ret
+    0x3841_054b, // 22: .advance: ldrb w11, [x10], #1  -- post-indexed scan
+    0x35ff_ffeb, // 23: cbnz w11, .-4                  (-4   → word 22)
+    0x17ff_ffeb, // 24: b    .next_entry               (-84  → word 3)
+    0xd503_201f, // 25: STOLEN_0 (patched)
+    0xd503_201f, // 26: STOLEN_1 (patched)
+    0xd503_201f, // 27: STOLEN_2 (patched)
+    0xd503_201f, // 28: STOLEN_3 (patched)
+    0x5800_0050, // 29: ldr x16, =RESTORE_TARGET       (+8   → word 31)
+    0xd61f_0200, // 30: br  x16
+    0x0000_0000, // 31: RESTORE_TARGET lo (patched)
+    0x0000_0000, // 32: RESTORE_TARGET hi (patched)
+    0x0000_0000, // 33: LOCK_LIST lo (patched)
+    0x0000_0000, // 34: LOCK_LIST hi (patched)
 ];
 
-/// Word index of the first stolen-prologue slot inside HOOK_BODY_TEMPLATE
-/// (reference §Hook body sketch patch-point indices).
-const STOLEN_START: usize = 13;
-/// Word index of the RESTORE_TARGET u64 low half (literal at words 19..=20).
-const RESTORE_LIT: usize = 19;
-/// Word index of the LOCK_LIST u64 low half (literal at words 21..=22).
-const LOCK_LIST_LIT: usize = 21;
+/// Word index of the first stolen-prologue slot inside HOOK_BODY_TEMPLATE.
+///
+/// The reference §Hook body sketch pins this at word 13 in its pre-splice
+/// layout. P04.2 T1 expanded the template to 35 words to realise the
+/// STRCMP splice + correct `.advance` scan-past-NUL block, which pushes
+/// the stolen-prologue slots to words 25..=28.
+const STOLEN_START: usize = 25;
 
-/// Emit the 92-byte hook body for the Tier B per-prop guard.
+/// Word index of the RESTORE_TARGET u64 low half (literal at words 31..=32).
+const RESTORE_LIT: usize = 31;
+
+/// Word index of the LOCK_LIST u64 low half (literal at words 33..=34).
+const LOCK_LIST_LIT: usize = 33;
+
+/// Emit the 140-byte hook body for the Tier B per-prop guard.
 ///
 /// Pure, deterministic, no ptrace, no I/O, no unsafe. Given the 16 bytes of
 /// stolen prologue (captured by P03 stage-B into [`HookHandle::saved_prologue`]),
 /// the lock-list base address in the tracee, and the resume address
-/// (`target_fn + 16`), returns the 23-word hook body with the three patch
+/// (`target_fn + 16`), returns the 35-word hook body with the three patch
 /// regions filled in little-endian order.
 ///
 /// # Patch layout
 ///
-/// * Words 13..=16 (`STOLEN_START..STOLEN_START+4`) ← `saved_prologue` decoded
+/// * Words 25..=28 (`STOLEN_START..STOLEN_START+4`) ← `saved_prologue` decoded
 ///   as four LE `u32`s.
-/// * Words 19..=20 (`RESTORE_LIT..RESTORE_LIT+2`) ← `return_addr` split into
+/// * Words 31..=32 (`RESTORE_LIT..RESTORE_LIT+2`) ← `return_addr` split into
 ///   low / high LE `u32` halves.
-/// * Words 21..=22 (`LOCK_LIST_LIT..LOCK_LIST_LIT+2`) ← `lock_list_vaddr`
+/// * Words 33..=34 (`LOCK_LIST_LIT..LOCK_LIST_LIT+2`) ← `lock_list_vaddr`
 ///   split into low / high LE `u32` halves.
 ///
 /// The returned `Vec<u8>` is the little-endian byte serialisation of the
-/// 23-word array per reference §Endianness (ARM64 Linux userspace is always
+/// 35-word array per reference §Endianness (ARM64 Linux userspace is always
 /// little-endian; each `u32` is stored LSB-first).
 ///
 /// # References
 ///
-/// * `references/arm64-a64-encoding.md` §Hook body sketch (canonical template)
-/// * `references/arm64-a64-encoding.md` §Hook body sketch — Patch-point
-///   indices (`STOLEN_START=13`, `RESTORE_LIT=19`, `LOCK_LIST_LIT=21`)
+/// * `references/arm64-a64-encoding.md` §Hook body sketch (canonical template,
+///   pre-splice form — 23 words) + §Strcmp loop skeleton (13-word canonical
+///   STRCMP_BODY) + §Hook body sketch install-time patching rules (line 415
+///   — "Splice the 13-word STRCMP_BODY over HOOK_BODY[STRCMP_STUB]")
+/// * P04.2 T1 expanded the template to 35 words to realise the splice +
+///   correct `.advance` scan-past-NUL block; patch-point indices shifted
+///   from pre-splice (`STOLEN_START=13`, `RESTORE_LIT=19`, `LOCK_LIST_LIT=21`)
+///   to post-splice (`STOLEN_START=25`, `RESTORE_LIT=31`, `LOCK_LIST_LIT=33`).
 /// * REGISTRY §1 row `Hook page — 4 KB RWX anonymous mmap`
 pub fn build_hook_body_bytes(
     saved_prologue: [u8; 16],
@@ -789,7 +829,7 @@ fn revert_trampoline(pid: libc::pid_t, target_fn: u64, saved_prologue: &[u8; 16]
 }
 
 /// Install the 16-byte absolute-target trampoline at `handle.target_fn`
-/// and the 92-byte hook body at `handle.hook_page + HOOK_BODY_OFFSET`.
+/// and the 140-byte hook body at `handle.hook_page + HOOK_BODY_OFFSET`.
 ///
 /// Write order is load-bearing: the hook body must be fully materialised
 /// before the trampoline's `br x16` can land on a valid target, so the
@@ -823,7 +863,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
     let hook_body_vaddr = handle.hook_page + HOOK_BODY_OFFSET;
     let resume_addr = handle.target_fn + 16;
 
-    // Step 2: pure helper emits the 92-byte hook body.
+    // Step 2: pure helper emits the 140-byte hook body.
     let body_bytes = build_hook_body_bytes(handle.saved_prologue, lock_list_vaddr, resume_addr);
 
     // Step 3: acquire attach RAII guard.
@@ -1356,14 +1396,12 @@ mod tests {
     // P04 T2 — build_hook_body_bytes tests
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Verifies [`build_hook_body_bytes`] serialises the 23-word template
+    /// Verifies [`build_hook_body_bytes`] serialises the 35-word template
     /// with the three patch regions filled in the correct byte positions.
     ///
-    /// Offsets derive directly from `references/arm64-a64-encoding.md`
-    /// §Hook body sketch: word N lives at byte `N * 4`, so STOLEN_START=13
-    /// lands at offset 52, RESTORE_LIT=19 lands at offset 76, and
-    /// LOCK_LIST_LIT=21 lands at offset 84. Total length is 23 × 4 = 92
-    /// bytes.
+    /// Word N lives at byte `N * 4`, so post-splice the patch regions land
+    /// at: STOLEN_START=25 → byte 100, RESTORE_LIT=31 → byte 124,
+    /// LOCK_LIST_LIT=33 → byte 132. Total length is 35 × 4 = 140 bytes.
     #[test]
     fn build_hook_body_bytes_roundtrip() {
         let saved_prologue = [0xABu8; 16];
@@ -1372,13 +1410,17 @@ mod tests {
 
         let bytes = build_hook_body_bytes(saved_prologue, lock_list_vaddr, return_addr);
 
-        assert_eq!(bytes.len(), 92, "hook body must be 23 words × 4 = 92 bytes");
+        assert_eq!(
+            bytes.len(),
+            140,
+            "hook body must be 35 words × 4 = 140 bytes"
+        );
 
-        // Fixed prologue — reference HOOK_BODY[0..6].
+        // Header words 0..=1 (NULL-guard + &pi->name).
         assert_eq!(
             u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            0xb400_01a0,
-            "word 0: cbz x0, .fall_through (+52)"
+            0xb400_0320,
+            "word 0: cbz x0, .fall_through (+100)"
         );
         assert_eq!(
             u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
@@ -1386,40 +1428,40 @@ mod tests {
             "word 1: add x9, x0, #96"
         );
 
-        // Match-exit pair at words 6..=7.
+        // .on_match pair at words 20..=21 (bytes 80..88).
         assert_eq!(
-            u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]),
             0x5280_0000,
-            "word 6: movz w0, #0"
+            "word 20: movz w0, #0"
         );
         assert_eq!(
-            u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+            u32::from_le_bytes([bytes[84], bytes[85], bytes[86], bytes[87]]),
             0xd65f_03c0,
-            "word 7: ret"
+            "word 21: ret"
         );
 
-        // Patch region 1: STOLEN_START at words 13..=16 (bytes 52..68).
+        // Patch region 1: STOLEN_START at words 25..=28 (bytes 100..116).
         assert_eq!(
-            &bytes[52..68],
+            &bytes[100..116],
             &saved_prologue,
             "STOLEN_START must mirror saved_prologue bytes"
         );
 
-        // Patch region 2: RESTORE_TARGET u64 at words 19..=20 (bytes 76..84).
+        // Patch region 2: RESTORE_TARGET u64 at words 31..=32 (bytes 124..132).
         assert_eq!(
             u64::from_le_bytes([
-                bytes[76], bytes[77], bytes[78], bytes[79], bytes[80], bytes[81], bytes[82],
-                bytes[83],
+                bytes[124], bytes[125], bytes[126], bytes[127], bytes[128], bytes[129], bytes[130],
+                bytes[131],
             ]),
             return_addr,
             "RESTORE_TARGET literal must equal return_addr"
         );
 
-        // Patch region 3: LOCK_LIST u64 at words 21..=22 (bytes 84..92).
+        // Patch region 3: LOCK_LIST u64 at words 33..=34 (bytes 132..140).
         assert_eq!(
             u64::from_le_bytes([
-                bytes[84], bytes[85], bytes[86], bytes[87], bytes[88], bytes[89], bytes[90],
-                bytes[91],
+                bytes[132], bytes[133], bytes[134], bytes[135], bytes[136], bytes[137], bytes[138],
+                bytes[139],
             ]),
             lock_list_vaddr,
             "LOCK_LIST literal must equal lock_list_vaddr"
@@ -1437,34 +1479,39 @@ mod tests {
     /// express. The runtime call with `[0; 16]` / `0` / `0` additionally
     /// proves the function executes with all zero inputs without panic
     /// (no hidden `assert!` on the patch values) and returns the
-    /// spec-locked 92-byte length.
+    /// spec-locked 140-byte length.
     #[test]
     fn build_hook_body_bytes_is_pure() {
         let _: fn([u8; 16], u64, u64) -> Vec<u8> = build_hook_body_bytes;
 
         let bytes = build_hook_body_bytes([0u8; 16], 0, 0);
-        assert_eq!(bytes.len(), 92);
+        assert_eq!(bytes.len(), 140);
     }
 
-    /// Pins the fixed prologue words 0..=5 of the hook body against the
-    /// canonical `HOOK_BODY` array in
-    /// `references/arm64-a64-encoding.md` §Hook body sketch (lines 383-388).
+    /// Pins the 7 header + pointer-rebind words (0..=6) against the
+    /// post-splice hook body layout.
     ///
-    /// These six words are not in any patch region — a drift here would
-    /// mean the strcmp stub / null-guard layout no longer matches the
-    /// reference and any downstream `install_trampoline` consumer (P04 T3)
-    /// would install a body that branches to the wrong offsets.
+    /// Words 0..=4 are the reference §Hook body sketch outer-loop header
+    /// re-targeted to the new `.fall_through` (word 25) and `LOCK_LIST`
+    /// literal (word 33) positions after the STRCMP splice landed.
+    /// Words 5..=6 are the P04.2 T1 addition — `mov x12, x9 ; mov x13, x10`
+    /// — that preserves caller x0/x1 across the splice so the fallthrough
+    /// path can resume `__system_property_update` at `target_fn + 16` with
+    /// the ABI-mandated `(prop_info*, value)` pair intact. A drift in any
+    /// of these seven words means the outer loop no longer aligns with the
+    /// splice entry or the downstream fall-through target.
     #[test]
-    fn build_hook_body_bytes_constants_from_reference() {
+    fn build_hook_body_bytes_header_matches_spliced_layout() {
         let bytes = build_hook_body_bytes([0u8; 16], 0, 0);
 
-        let expected: [u32; 6] = [
-            0xb400_01a0, // 0: cbz x0, .fall_through (+52)
-            0x9101_8009, // 1: add x9, x0, #96
-            0x5800_026a, // 2: ldr x10, =LOCK_LIST (+76)
+        let expected: [u32; 7] = [
+            0xb400_0320, // 0: cbz  x0, .fall_through (+100 → word 25)
+            0x9101_8009, // 1: add  x9, x0, #96
+            0x5800_03ea, // 2: ldr  x10, =LOCK_LIST   (+124 → word 33)
             0x3940_014b, // 3: ldrb w11, [x10]
-            0x3400_012b, // 4: cbz w11, .fall_through (+36)
-            0x1400_0003, // 5: b .advance (+12) — strcmp stub
+            0x3400_02ab, // 4: cbz  w11, .fall_through (+84 → word 25)
+            0xaa09_03ec, // 5: mov  x12, x9
+            0xaa0a_03ed, // 6: mov  x13, x10
         ];
 
         for (i, expected_word) in expected.iter().enumerate() {
@@ -1477,7 +1524,91 @@ mod tests {
             ]);
             assert_eq!(
                 actual, *expected_word,
-                "word {i} drifted from reference HOOK_BODY[{i}]"
+                "header word {i} drifted from spliced-layout canonical"
+            );
+        }
+    }
+
+    /// Pins the 13 spliced STRCMP words (7..=19) against the canonical
+    /// `STRCMP_BODY` from `references/arm64-a64-encoding.md` §Strcmp loop
+    /// skeleton, re-encoded with the pointer/byte-temp register rebind
+    /// (`x0→x12`, `x1→x13`, `w9→w14`, `w10→w15`) and with the canonical
+    /// `.mismatch` / `.match` exits (originally `movz wN,#…; ret` pairs)
+    /// rewritten as `b .advance` / `b .on_match` to flow back into the
+    /// hook's outer loop.
+    ///
+    /// This is the round-trip test requested by Gate 2 round-1 critic
+    /// CRITICAL 1 — without it, a future drift in `HOOK_BODY_TEMPLATE`
+    /// could silently reintroduce a stub in place of the splice and the
+    /// unit tests alone would still pass.
+    #[test]
+    fn build_hook_body_bytes_splices_strcmp_body() {
+        let bytes = build_hook_body_bytes([0u8; 16], 0, 0);
+
+        let expected: [u32; 13] = [
+            0x3940_018e, // 7:  ldrb w14, [x12]    (was `ldrb w9,  [x0]`)
+            0x3940_01af, // 8:  ldrb w15, [x13]    (was `ldrb w10, [x1]`)
+            0x6b0f_01df, // 9:  cmp  w14, w15     (was `cmp w9, w10`)
+            0x5400_00c1, // 10: b.ne .mismatch    (+24 → word 16)
+            0x3400_00ee, // 11: cbz  w14, .match  (+28 → word 18)
+            0x9100_058c, // 12: add  x12, x12, #1 (was `add x0, x0, #1`)
+            0x9100_05ad, // 13: add  x13, x13, #1 (was `add x1, x1, #1`)
+            0x17ff_fff9, // 14: b    .strcmp_loop (-28 → word 7)
+            0xd503_201f, // 15: nop
+            0x1400_0006, // 16: .mismatch: b .advance (+24 → word 22)
+            0xd503_201f, // 17: nop (unused — was canonical `ret`)
+            0x1400_0002, // 18: .match:    b .on_match (+8 → word 20)
+            0xd503_201f, // 19: nop (unused — was canonical `ret`)
+        ];
+
+        for (i, expected_word) in expected.iter().enumerate() {
+            let word_index = 7 + i;
+            let base = word_index * 4;
+            let actual = u32::from_le_bytes([
+                bytes[base],
+                bytes[base + 1],
+                bytes[base + 2],
+                bytes[base + 3],
+            ]);
+            assert_eq!(
+                actual, *expected_word,
+                "splice word {word_index} drifted — expected canonical STRCMP \
+                 with register rebind / exit redirect"
+            );
+        }
+    }
+
+    /// Pins the 3-word `.advance` block (words 22..=24) that walks `x10`
+    /// past the current entry's NUL terminator and re-enters the outer
+    /// loop at `.next_entry` (word 3).
+    ///
+    /// Pre-P04.2 the template carried a single-word `add x10, x10, #1`
+    /// stub here, which advanced by exactly one byte per outer iteration
+    /// — wrong for any entry longer than one byte. Critic CRITICAL 1
+    /// called for a post-indexed scan that advances past the full entry
+    /// and its terminator in one pass.
+    #[test]
+    fn build_hook_body_bytes_advance_block_scans_past_nul() {
+        let bytes = build_hook_body_bytes([0u8; 16], 0, 0);
+
+        let expected: [u32; 3] = [
+            0x3841_054b, // 22: ldrb w11, [x10], #1  (post-indexed load+advance)
+            0x35ff_ffeb, // 23: cbnz w11, .-4        (-4 → word 22, loop on non-NUL)
+            0x17ff_ffeb, // 24: b    .next_entry    (-84 → word 3)
+        ];
+
+        for (i, expected_word) in expected.iter().enumerate() {
+            let word_index = 22 + i;
+            let base = word_index * 4;
+            let actual = u32::from_le_bytes([
+                bytes[base],
+                bytes[base + 1],
+                bytes[base + 2],
+                bytes[base + 3],
+            ]);
+            assert_eq!(
+                actual, *expected_word,
+                ".advance word {word_index} drifted from scan-past-NUL canonical"
             );
         }
     }
