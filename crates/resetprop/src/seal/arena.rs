@@ -190,7 +190,14 @@ pub(crate) struct RemoteAttach {
 }
 
 impl RemoteAttach {
-    fn new(pid: super::Pid) -> Result<Self> {
+    // P03 T5: `new` / `detach` / `pid` promoted from `fn` to `pub(crate) fn`
+    // so the Tier B hook installer in `seal::hook` can consume this RAII
+    // guard without reimplementing SEIZE + INTERRUPT + wait_stop. The P03
+    // phase brief explicitly declares `RemoteAttach` as stage-B's canonical
+    // attach helper and forbids reimplementation; this is the minimal
+    // visibility widening required for that consumption and the only edit
+    // to arena.rs in P03 T5.
+    pub(crate) fn new(pid: super::Pid) -> Result<Self> {
         super::ptrace::ptrace_seize(pid)?;
         super::ptrace::ptrace_interrupt(pid)?;
         super::ptrace::wait_stop(pid, super::ptrace::PTRACE_EVENT_STOP)?;
@@ -200,12 +207,12 @@ impl RemoteAttach {
         })
     }
 
-    fn detach(mut self) -> Result<()> {
+    pub(crate) fn detach(mut self) -> Result<()> {
         self.detached = true;
         super::ptrace::ptrace_detach(self.pid)
     }
 
-    fn pid(&self) -> super::Pid {
+    pub(crate) fn pid(&self) -> super::Pid {
         self.pid
     }
 }
