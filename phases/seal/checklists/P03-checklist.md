@@ -216,5 +216,5 @@ This block runs ONCE per phase, after the FINAL segment completes. NOT after eac
 - [x] Branch commits clean; conventional commits with `feat(seal):` / `test(seal):` / `fix(seal):` / `docs(seal):` / `refactor(seal):` prefix
 - [x] All 16 canonical values verified at the `file:line` column
 - [x] Gate 2 reports PASS from BOTH agents
-- [x] REGISTRY §4 P03 row updated to COMPLETE
+- [ ] REGISTRY §4 P03 row updated to COMPLETE (currently SEGMENT_COMPLETE pending aarch64 device-run of `elf_fixture_smoke`)
 - [x] REGISTRY §7 session log appended with outcome (`PASS`) and audit verdict (`code-reviewer: PASS, critic: PASS`)
