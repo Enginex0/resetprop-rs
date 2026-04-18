@@ -29,10 +29,15 @@
 
 #![cfg(target_arch = "aarch64")]
 
-use resetprop::seal::ptrace::NR_GETPID;
+use resetprop::seal::ptrace::PTRACE_EVENT_STOP;
 use resetprop::seal::{
     ptrace_detach, ptrace_interrupt, ptrace_seize, remote_syscall, wait_stop,
 };
+
+/// AArch64 syscall number for `getpid()`; local to this test so the syscall
+/// table does not leak onto the `resetprop::seal::ptrace` public surface.
+/// source: asm-generic/unistd.h:461 (`__NR_getpid = 172`).
+const NR_GETPID: u64 = 172;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers (verbatim from phases/seal/references/test-harness-patterns.md §3)
@@ -147,12 +152,14 @@ fn remote_getpid_returns_child_pid() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // (4) SEIZE + INTERRUPT + wait_stop consumes the initial group-stop
-    // (event byte = 128). wait_stop only enforces WIFSTOPPED && WSTOPSIG ==
-    // SIGTRAP; remote_syscall adds the event-byte=0 check on its own
-    // waitpid to reject anything other than the brk trap.
+    // (event byte == PTRACE_EVENT_STOP == 128). wait_stop verifies
+    // WIFSTOPPED && WSTOPSIG == SIGTRAP && event == expected_event — so the
+    // expected_event argument is how the caller selects which stop kind is
+    // legal at this point. remote_syscall passes 0 internally to pin its
+    // own waitpid to brk-traps only.
     ptrace_seize(guard.pid()).expect("ptrace_seize");
     ptrace_interrupt(guard.pid()).expect("ptrace_interrupt");
-    wait_stop(guard.pid()).expect("wait_stop (initial SEIZE stop)");
+    wait_stop(guard.pid(), PTRACE_EVENT_STOP).expect("wait_stop (initial SEIZE stop)");
 
     // (5) Round-trip getpid() inside the child via the remote-syscall
     // injector. Expected return: the child's own PID as i64.

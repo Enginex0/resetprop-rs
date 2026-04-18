@@ -13,6 +13,8 @@ pub enum Error {
     InvalidKey,
     PersistCorrupt(String),
     PtraceAttach(std::io::Error),
+    PtraceOp(std::io::Error),
+    PtraceUnexpectedStatus(i32),
     PtraceScope,
     ArenaAlreadySealed(PathBuf),
     ArenaNotMapped(PathBuf),
@@ -35,6 +37,11 @@ impl fmt::Display for Error {
             Self::InvalidKey => write!(f, "invalid property key"),
             Self::PersistCorrupt(msg) => write!(f, "corrupt persist file: {msg}"),
             Self::PtraceAttach(e) => write!(f, "ptrace attach failed: {e}"),
+            Self::PtraceOp(e) => write!(f, "ptrace operation failed: {e}"),
+            Self::PtraceUnexpectedStatus(status) => write!(
+                f,
+                "ptrace received unexpected wait status: 0x{status:x}"
+            ),
             Self::PtraceScope => write!(
                 f,
                 "ptrace blocked by /proc/sys/kernel/yama/ptrace_scope; root required or echo 0 into the file"
@@ -52,7 +59,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PermissionDenied(e) | Self::Io(e) => Some(e),
-            Self::PtraceAttach(e) => Some(e),
+            Self::PtraceAttach(e) | Self::PtraceOp(e) => Some(e),
             _ => None,
         }
     }

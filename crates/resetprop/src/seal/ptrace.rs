@@ -41,6 +41,18 @@ pub const PTRACE_SEIZE: c_int = 0x4206;
 /// `PTRACE_INTERRUPT` — request synchronous stop on seized tracee. source: linux/ptrace.h:30
 pub const PTRACE_INTERRUPT: c_int = 0x4207;
 
+/// `PTRACE_O_TRACESYSGOOD` — when set via the `data` arg of `PTRACE_SEIZE`,
+/// makes syscall-stops distinguishable from regular `SIGTRAP` via status
+/// `stopsig == 0x85`. Required for safe operation against multi-threaded
+/// tracees (e.g. init in P04) where concurrent syscall-stops would otherwise
+/// alias brk-traps. source: linux/ptrace.h:100
+pub const PTRACE_O_TRACESYSGOOD: c_int = 1;
+
+/// `PTRACE_EVENT_STOP` — upper-byte marker of the initial `PTRACE_SEIZE +
+/// PTRACE_INTERRUPT` group-stop. Distinct from brk-trap (event == 0).
+/// source: linux/ptrace.h:99
+pub const PTRACE_EVENT_STOP: u32 = 128;
+
 /// `NT_PRSTATUS` — note type selecting general-purpose regs for REGSET ops.
 /// source: linux/elf.h:301
 pub const NT_PRSTATUS: c_int = 1;
@@ -50,21 +62,16 @@ pub const NT_PRSTATUS: c_int = 1;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `svc #0` — AArch64 supervisor call, little-endian bytes `01 00 00 d4`.
+/// `pub(crate)` scope because only [`remote_syscall`] consumes this; the
+/// ARM64 encoder in P04 (`seal/hook.rs`) re-derives its own encodings.
 /// source: ARM ARM C6.2.304; linux-arm64-abi.md §2
-pub const ARM64_SVC_0: u32 = 0xd400_0001;
+pub(crate) const ARM64_SVC_0: u32 = 0xd400_0001;
 
 /// `brk #0` — AArch64 software breakpoint (delivers SIGTRAP),
-/// little-endian bytes `00 00 20 d4`.
+/// little-endian bytes `00 00 20 d4`. `pub(crate)` for the same reason as
+/// [`ARM64_SVC_0`].
 /// source: ARM ARM C6.2.41; linux-arm64-abi.md §2
-pub const ARM64_BRK_0: u32 = 0xd420_0000;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ARM64 syscall numbers (asm-generic/unistd.h)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `__NR_getpid` — AArch64 syscall number for `getpid()`.
-/// source: asm-generic/unistd.h:461 (`__NR_getpid`)
-pub const NR_GETPID: u64 = 172;
+pub(crate) const ARM64_BRK_0: u32 = 0xd420_0000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UserPtRegs — AArch64 general-purpose register set exchanged via NT_PRSTATUS
@@ -107,12 +114,15 @@ const _: () = assert!(core::mem::size_of::<UserPtRegs>() == 272);
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Wrap the current `errno` as [`Error::PtraceAttach`].
+/// Wrap the current `errno` as [`Error::PtraceOp`].
 ///
-/// Used by every wrapper except `ptrace_seize`, which additionally classifies
-/// `EPERM` against `/proc/sys/kernel/yama/ptrace_scope`.
-fn last_ptrace_err() -> Error {
-    Error::PtraceAttach(io::Error::last_os_error())
+/// Used by post-attach ptrace, `waitpid`, and `process_vm_*` call sites — the
+/// operation-failure catch-all. [`ptrace_seize`] uses
+/// [`classify_seize_err`] instead so attach-phase failures surface as
+/// [`Error::PtraceAttach`] (with yama classification) rather than
+/// [`Error::PtraceOp`].
+fn last_ptrace_op_err() -> Error {
+    Error::PtraceOp(io::Error::last_os_error())
 }
 
 /// Classify a failed `PTRACE_SEIZE` (`ptrace_scope >= 1` → `PtraceScope`,
@@ -140,18 +150,29 @@ fn classify_seize_err() -> Error {
 // ptrace primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `PTRACE_SEIZE` — attach without stopping the tracee.
+/// `PTRACE_SEIZE` — attach without stopping the tracee. Sets
+/// `PTRACE_O_TRACESYSGOOD` atomically via the `data` argument so subsequent
+/// syscall-stops (status `0x85`) are distinguishable from brk-traps
+/// (status `0x05`, event 0) — required for multi-threaded tracees per
+/// linux-arm64-abi.md §6 step 1.
 ///
 /// On `EPERM` the wrapper reads `/proc/sys/kernel/yama/ptrace_scope`; any
 /// restrictive value (>= 1) is surfaced as [`Error::PtraceScope`] so the CLI
 /// can print the remediation. Other failures map to
 /// [`Error::PtraceAttach`] with the raw `errno` preserved.
 pub fn ptrace_seize(pid: Pid) -> Result<()> {
-    // SAFETY: `libc::ptrace` is a well-defined FFI. `addr`/`data` are NULL
-    // per the PTRACE_SEIZE contract; the call has no tracer-side memory
-    // effect — failure only sets `errno` which we read immediately.
-    let rc =
-        unsafe { libc::ptrace(PTRACE_SEIZE as _, pid, 0 as *mut c_void, 0 as *mut c_void) };
+    // SAFETY: `libc::ptrace` is a well-defined FFI. `addr` is NULL per the
+    // PTRACE_SEIZE contract; `data` carries the options bitmask (treated as
+    // an integer-in-pointer by ptrace, standard pattern). The call has no
+    // tracer-side memory effect — failure only sets `errno`.
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_SEIZE as _,
+            pid,
+            0 as *mut c_void,
+            PTRACE_O_TRACESYSGOOD as *mut c_void,
+        )
+    };
     if rc == -1 {
         return Err(classify_seize_err());
     }
@@ -172,33 +193,35 @@ pub fn ptrace_interrupt(pid: Pid) -> Result<()> {
         )
     };
     if rc == -1 {
-        return Err(last_ptrace_err());
+        return Err(last_ptrace_op_err());
     }
     Ok(())
 }
 
-/// `waitpid(pid, &status, __WALL)` — block until a ptrace-stop arrives.
+/// `waitpid(pid, &status, __WALL)` — block until a ptrace-stop arrives and
+/// verify it matches the caller's expected stop kind.
 ///
-/// Verifies `WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP` and returns
-/// the raw status word on success; unexpected stop kinds surface as
-/// [`Error::PtraceAttach`] wrapping an `io::Error` that carries the raw
-/// status value for debugging.
-pub fn wait_stop(pid: Pid) -> Result<i32> {
+/// Verifies `WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP` AND that the
+/// upper event byte equals `expected_event`. Callers pass
+/// [`PTRACE_EVENT_STOP`] (128) to consume the initial SEIZE+INTERRUPT
+/// group-stop, or `0` to consume a brk-trap (post-`svc`). Any mismatch
+/// surfaces as [`Error::PtraceUnexpectedStatus`] carrying the raw status
+/// bits for diagnosis. `waitpid` syscall failure maps to
+/// [`Error::PtraceOp`] via [`last_ptrace_op_err`].
+pub fn wait_stop(pid: Pid, expected_event: u32) -> Result<i32> {
     let mut status: i32 = 0;
     // SAFETY: `status` lives on the stack for the duration of the call;
     // `waitpid` writes through the pointer only while blocked, returns
     // pid on success or -1 on error (captured via errno).
     let rc = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
     if rc == -1 {
-        return Err(last_ptrace_err());
+        return Err(last_ptrace_op_err());
     }
     let is_stopped = libc::WIFSTOPPED(status);
     let sig = libc::WSTOPSIG(status);
-    if !is_stopped || sig != libc::SIGTRAP {
-        return Err(Error::PtraceAttach(io::Error::new(
-            io::ErrorKind::Other,
-            format!("unexpected wait status: 0x{status:x}"),
-        )));
+    let event = ((status >> 16) & 0xffff) as u32;
+    if !is_stopped || sig != libc::SIGTRAP || event != expected_event {
+        return Err(Error::PtraceUnexpectedStatus(status));
     }
     Ok(status)
 }
@@ -226,7 +249,7 @@ pub fn getregset(pid: Pid) -> Result<UserPtRegs> {
         )
     };
     if rc == -1 {
-        return Err(last_ptrace_err());
+        return Err(last_ptrace_op_err());
     }
     Ok(regs)
 }
@@ -251,7 +274,7 @@ pub fn setregset(pid: Pid, regs: &UserPtRegs) -> Result<()> {
         )
     };
     if rc == -1 {
-        return Err(last_ptrace_err());
+        return Err(last_ptrace_op_err());
     }
     Ok(())
 }
@@ -268,7 +291,7 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
         )
     };
     if rc == -1 {
-        return Err(last_ptrace_err());
+        return Err(last_ptrace_op_err());
     }
     Ok(())
 }
@@ -283,7 +306,7 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
 /// See linux-arm64-abi.md §10: partial transfers are legal, so callers must
 /// advance and retry until the requested length is satisfied. A zero-byte
 /// return with bytes still outstanding is treated as a stalled transfer and
-/// surfaces as [`Error::PtraceAttach`].
+/// surfaces as [`Error::PtraceOp`].
 ///
 /// # Safety
 ///
@@ -309,10 +332,10 @@ unsafe fn read_remote(pid: Pid, remote_addr: u64, buf: &mut [u8]) -> Result<()> 
         // `flags` must be 0 per the man page; we pass one iovec per side.
         let n = unsafe { process_vm_readv(pid, &local, 1, &remote, 1, 0) };
         if n == -1 {
-            return Err(last_ptrace_err());
+            return Err(last_ptrace_op_err());
         }
         if n == 0 {
-            return Err(Error::PtraceAttach(io::Error::new(
+            return Err(Error::PtraceOp(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
                     "process_vm_readv stalled: {transferred}/{} bytes transferred",
@@ -333,11 +356,14 @@ unsafe fn read_remote(pid: Pid, remote_addr: u64, buf: &mut [u8]) -> Result<()> 
 ///
 /// # Safety
 ///
-/// Caller guarantees `remote_addr..remote_addr + buf.len()` is writable in
-/// the tracee (kernel's `process_vm_writev` path bypasses VMA write bits for
-/// ptrace-attached writers, so an rx page backing executable code is
-/// acceptable as long as the caller owns its content for the duration of
-/// the call) and that the tracee is ptrace-stopped.
+/// Caller guarantees `remote_addr..remote_addr + buf.len()` covers a VMA in
+/// the tracee with write permission (per `man 2 process_vm_writev`: the call
+/// respects VMA write bits and returns `EFAULT` on non-writable pages; it
+/// does NOT bypass page-table protection like `PTRACE_POKEDATA` or
+/// `/proc/<pid>/mem` do). For RX-only targets (e.g. `libc.so` code), callers
+/// must either `mprotect` the VMA writable remotely first or use a different
+/// transport. Caller also guarantees the tracee is ptrace-stopped so the
+/// write is not racing concurrent execution.
 unsafe fn write_remote(pid: Pid, remote_addr: u64, buf: &[u8]) -> Result<()> {
     let mut transferred: usize = 0;
     while transferred < buf.len() {
@@ -355,10 +381,10 @@ unsafe fn write_remote(pid: Pid, remote_addr: u64, buf: &[u8]) -> Result<()> {
         // writable by the function's safety contract. `flags` is 0.
         let n = unsafe { process_vm_writev(pid, &local, 1, &remote, 1, 0) };
         if n == -1 {
-            return Err(last_ptrace_err());
+            return Err(last_ptrace_op_err());
         }
         if n == 0 {
-            return Err(Error::PtraceAttach(io::Error::new(
+            return Err(Error::PtraceOp(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
                     "process_vm_writev stalled: {transferred}/{} bytes transferred",
@@ -442,23 +468,14 @@ pub unsafe fn remote_syscall(
         )
     };
     if rc == -1 {
-        return Err(last_ptrace_err());
+        return Err(last_ptrace_op_err());
     }
 
-    // (§7 step 7) Wait for the brk trap. `wait_stop` already verifies
-    // `WIFSTOPPED && WSTOPSIG == SIGTRAP`; the event-byte-zero check below
-    // completes the brk-trap classification per linux-arm64-abi.md §9
-    // (excludes group-stop=128 and PTRACE_EVENT_* codes 1..=7).
-    let status = wait_stop(pid)?;
-    let event = (status >> 16) & 0xffff;
-    if event != 0 {
-        return Err(Error::PtraceAttach(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "remote_syscall: unexpected event byte 0x{event:x} in status 0x{status:x}"
-            ),
-        )));
-    }
+    // (§7 step 7) Wait for the brk trap. `wait_stop` verifies
+    // `WIFSTOPPED && WSTOPSIG == SIGTRAP && event == 0` atomically per its
+    // contract — group-stops (event=128) and syscall-stops (signal=0x85) are
+    // rejected as `Error::PtraceUnexpectedStatus`.
+    wait_stop(pid, 0)?;
 
     // (§7 step 8) Read x0 from the post-trap register state.
     let out = getregset(pid)?;
@@ -498,9 +515,10 @@ mod tests {
         assert_eq!(PTRACE_SETREGSET, 0x4205);
         assert_eq!(PTRACE_SEIZE, 0x4206);
         assert_eq!(PTRACE_INTERRUPT, 0x4207);
+        assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
+        assert_eq!(PTRACE_EVENT_STOP, 128);
         assert_eq!(NT_PRSTATUS, 1);
         assert_eq!(ARM64_SVC_0, 0xd400_0001);
         assert_eq!(ARM64_BRK_0, 0xd420_0000);
-        assert_eq!(NR_GETPID, 172);
     }
 }
