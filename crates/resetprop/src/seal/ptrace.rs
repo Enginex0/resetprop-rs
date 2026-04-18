@@ -41,6 +41,21 @@ pub const PTRACE_SEIZE: c_int = 0x4206;
 /// `PTRACE_INTERRUPT` — request synchronous stop on seized tracee. source: linux/ptrace.h:30
 pub const PTRACE_INTERRUPT: c_int = 0x4207;
 
+/// `PTRACE_PEEKDATA` — read one word from tracee memory, bypassing VMA read
+/// bits via the ptrace_access_vm path. Pair with [`PTRACE_POKEDATA`] for
+/// bootstrap staging of a first `svc` into an `r-xp` libc.text NOP slide,
+/// since `process_vm_readv` respects VMA permissions while PEEK/POKE do not.
+/// source: linux/ptrace.h:12
+pub const PTRACE_PEEKDATA: c_int = 2;
+
+/// `PTRACE_POKEDATA` — write one word (u64 on AArch64) into tracee memory,
+/// bypassing VMA write bits. Used exclusively to stage the bootstrap
+/// `svc #0 ; brk #0` blob at a libc.text scratch PC in P02's Tier A seal
+/// flow; subsequent writes go through [`write_remote`] once a fresh
+/// `MAP_PRIVATE|MAP_ANON` RWX page has been acquired.
+/// source: linux/ptrace.h:15
+pub const PTRACE_POKEDATA: c_int = 5;
+
 /// `PTRACE_O_TRACESYSGOOD` — when set via the `data` arg of `PTRACE_SEIZE`,
 /// makes syscall-stops distinguishable from regular `SIGTRAP` via status
 /// `stopsig == 0x85`. Required for safe operation against multi-threaded
@@ -297,6 +312,69 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Word-granularity tracee memory IO — PTRACE_PEEKDATA / PTRACE_POKEDATA
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `PTRACE_PEEKDATA` — read one 64-bit word from `addr` in the tracee.
+///
+/// The ptrace PEEKDATA contract returns -1 both for a valid word of all ones
+/// AND for an error; the caller MUST clear `errno` before the call and
+/// inspect it afterward, per `man 2 ptrace` ("On error, all these calls
+/// return -1, and errno is set appropriately. Since the value returned by a
+/// successful PTRACE_PEEK* request may be -1, the caller must clear errno
+/// before the call, and check it afterward").
+pub fn ptrace_peektext(pid: Pid, addr: u64) -> Result<u64> {
+    // SAFETY: The errno reset is scoped to this call; `libc::ptrace` returns
+    // a `c_long` which on LP64 AArch64 is 64 bits wide — exactly one word.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    let word = unsafe {
+        libc::ptrace(
+            PTRACE_PEEKDATA as _,
+            pid,
+            addr as *mut c_void,
+            std::ptr::null_mut::<c_void>(),
+        )
+    };
+    if word == -1 {
+        let errno = unsafe { *libc::__errno_location() };
+        if errno != 0 {
+            return Err(last_ptrace_op_err());
+        }
+    }
+    Ok(word as u64)
+}
+
+/// `PTRACE_POKEDATA` — write a 64-bit `value` to `addr` in the tracee.
+///
+/// Unlike [`write_remote`] (which uses `process_vm_writev` and respects VMA
+/// write bits), POKEDATA goes through the ptrace_access_vm kernel path and
+/// bypasses write protection. This is the ONLY safe way to stage an initial
+/// `svc ; brk` blob into an `r-xp` mapping (e.g., a libc.text NOP slide) when
+/// no RWX scratch page exists yet. Once P02 has used one POKEDATA-staged
+/// `mmap` syscall to acquire a fresh `MAP_PRIVATE|MAP_ANON` RWX page,
+/// subsequent staging uses `write_remote` on the new page.
+pub fn ptrace_poketext(pid: Pid, addr: u64, value: u64) -> Result<()> {
+    // SAFETY: `libc::ptrace` FFI. `addr` and `value` are caller-verified
+    // integer-in-pointer arguments per the PTRACE_POKEDATA contract. The
+    // call writes exactly one `c_long`-sized word; on AArch64 LP64 that is
+    // 64 bits so the full `u64` is delivered in one call.
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_POKEDATA as _,
+            pid,
+            addr as *mut c_void,
+            value as *mut c_void,
+        )
+    };
+    if rc == -1 {
+        return Err(last_ptrace_op_err());
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Cross-process memory IO — process_vm_{readv,writev} partial-transfer loops
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -314,7 +392,7 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
 /// the tracee's address space (typically a verified mapping from
 /// [`super::maps::parse_maps`]) and that the tracee is ptrace-stopped so the
 /// read is not racing concurrent mutation.
-unsafe fn read_remote(pid: Pid, remote_addr: u64, buf: &mut [u8]) -> Result<()> {
+pub(crate) unsafe fn read_remote(pid: Pid, remote_addr: u64, buf: &mut [u8]) -> Result<()> {
     let mut transferred: usize = 0;
     while transferred < buf.len() {
         let remaining = buf.len() - transferred;
@@ -361,7 +439,7 @@ unsafe fn read_remote(pid: Pid, remote_addr: u64, buf: &mut [u8]) -> Result<()> 
 /// must either `mprotect` the VMA writable remotely first or use a different
 /// transport. Caller also guarantees the tracee is ptrace-stopped so the
 /// write is not racing concurrent execution.
-unsafe fn write_remote(pid: Pid, remote_addr: u64, buf: &[u8]) -> Result<()> {
+pub(crate) unsafe fn write_remote(pid: Pid, remote_addr: u64, buf: &[u8]) -> Result<()> {
     let mut transferred: usize = 0;
     while transferred < buf.len() {
         let remaining = buf.len() - transferred;
@@ -509,10 +587,76 @@ mod tests {
         assert_eq!(PTRACE_SETREGSET, 0x4205);
         assert_eq!(PTRACE_SEIZE, 0x4206);
         assert_eq!(PTRACE_INTERRUPT, 0x4207);
+        assert_eq!(PTRACE_PEEKDATA, 2);
+        assert_eq!(PTRACE_POKEDATA, 5);
         assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
         assert_eq!(PTRACE_EVENT_STOP, 128);
         assert_eq!(NT_PRSTATUS, 1);
         assert_eq!(ARM64_SVC_0, 0xd400_0001);
         assert_eq!(ARM64_BRK_0, 0xd420_0000);
+    }
+
+    /// Fork a child, SEIZE + INTERRUPT it, then PEEK a parent-allocated word
+    /// (child inherits the VA via COW), POKE a new value, PEEK back, and
+    /// assert the round-trip. Gated behind `#[ignore]` because it requires
+    /// `/proc/sys/kernel/yama/ptrace_scope <= 1` and the `aarch64`
+    /// target (the POKEDATA word width matches `c_long`, which on LP64
+    /// AArch64 is 64 bits — the width our `u64` API contract assumes).
+    #[cfg(target_os = "linux")]
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "requires ptrace_scope<=1; run with --ignored --test-threads=1"]
+    fn peek_poke_roundtrip_on_self() {
+        /// RAII guard: SIGKILL + reap on drop so the child never outlives
+        /// the test even if an assertion panics mid-flow.
+        struct ChildGuard(libc::pid_t);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    let mut status: i32 = 0;
+                    libc::waitpid(self.0, &mut status, 0);
+                }
+            }
+        }
+
+        // Parent-owned word on the heap, shared with the child via COW on fork.
+        let slot: Box<u64> = Box::new(0x1111_2222_3333_4444);
+        let slot_addr = Box::into_raw(slot) as u64;
+
+        // SAFETY: `fork` is async-signal-safe; the child branch only calls
+        // async-signal-safe syscalls (`pause`) before being reaped.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            // Child: park until the parent SIGKILLs us.
+            unsafe { libc::pause() };
+            unsafe { libc::_exit(0) };
+        }
+
+        let guard = ChildGuard(pid);
+
+        ptrace_seize(pid).expect("seize");
+        ptrace_interrupt(pid).expect("interrupt");
+        wait_stop(pid, PTRACE_EVENT_STOP).expect("wait_stop");
+
+        let peeked_before = ptrace_peektext(pid, slot_addr).expect("peek before");
+        assert_eq!(peeked_before, 0x1111_2222_3333_4444);
+
+        let new_value: u64 = 0xdead_beef_cafe_babe;
+        ptrace_poketext(pid, slot_addr, new_value).expect("poke");
+
+        let peeked_after = ptrace_peektext(pid, slot_addr).expect("peek after");
+        assert_eq!(peeked_after, new_value);
+
+        ptrace_detach(pid).expect("detach");
+        drop(guard);
+
+        // Reclaim the heap word so miri/leak sanitizers stay clean.
+        // SAFETY: `slot_addr` came from `Box::into_raw` above; no other owner exists.
+        unsafe {
+            drop(Box::from_raw(slot_addr as *mut u64));
+        }
     }
 }

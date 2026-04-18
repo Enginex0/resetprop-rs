@@ -8,9 +8,9 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+pub mod arena;
 pub mod maps;
 pub mod ptrace;
-pub mod arena;
 
 /// Process identifier alias matching the libc type used by ptrace/waitpid.
 pub type Pid = libc::pid_t;
@@ -36,10 +36,8 @@ pub enum SealTier {
     Prop,
 }
 
-pub use maps::{MapEntry, parse_maps};
+pub use maps::{parse_maps, MapEntry};
 pub use ptrace::{
-    UserPtRegs,
-    ptrace_seize, ptrace_interrupt, wait_stop,
-    getregset, setregset, ptrace_detach,
-    remote_syscall,
+    getregset, ptrace_detach, ptrace_interrupt, ptrace_peektext, ptrace_poketext, ptrace_seize,
+    remote_syscall, setregset, wait_stop, UserPtRegs,
 };

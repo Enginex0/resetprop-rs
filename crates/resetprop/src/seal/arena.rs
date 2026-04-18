@@ -46,6 +46,44 @@ pub(crate) fn find_arena_mapping(pid: libc::pid_t, arena_path: &Path) -> Result<
     find_arena_mapping_in(&entries, arena_path)
 }
 
+/// AArch64 `nop` instruction encoding: `d503201f` little-endian bytes
+/// `[0x1f, 0x20, 0x03, 0xd5]`. Source: ARM ARM C6.2.203.
+#[allow(dead_code)] // consumed by T3 seal_arena orchestrator next session
+pub(crate) const ARM64_NOP: u32 = 0xd503_201f;
+
+/// Scan `bytes` for the first 8-byte-aligned offset where at least four
+/// consecutive `ARM64_NOP` words (16 bytes) appear.
+///
+/// Returns the offset into `bytes`. Callers add it to the mapping's start
+/// address to get a scratch PC that is (a) inside an executable mapping,
+/// (b) inside a benign nop run so restoring the original bytes after the
+/// bootstrap `svc+brk` is trivial, and (c) 8-byte aligned so a two-word
+/// blob writes atomically via a single PTRACE_POKEDATA.
+///
+/// Returns `None` if no qualifying run exists in `bytes`. The caller surfaces
+/// this as `Error::HookInstallFailed` because the absence of a NOP slide in
+/// init's libc.text is an environment failure, not a programming error.
+#[allow(dead_code)] // consumed by T3 seal_arena orchestrator next session
+pub(crate) fn find_nop_slide(bytes: &[u8]) -> Option<usize> {
+    const NOP_BYTES: [u8; 4] = ARM64_NOP.to_le_bytes();
+    if bytes.len() < 16 {
+        return None;
+    }
+    let mut off = 0;
+    while off + 16 <= bytes.len() {
+        if off % 8 == 0
+            && bytes[off..off + 4] == NOP_BYTES
+            && bytes[off + 4..off + 8] == NOP_BYTES
+            && bytes[off + 8..off + 12] == NOP_BYTES
+            && bytes[off + 12..off + 16] == NOP_BYTES
+        {
+            return Some(off);
+        }
+        off += 4; // ARM64 instruction stride; 8-byte alignment filter applied above
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +132,49 @@ mod tests {
             Err(Error::ArenaNotMapped(p)) => assert_eq!(p, arena.to_path_buf()),
             other => panic!("expected ArenaNotMapped, got {other:?}"),
         }
+    }
+
+    /// Build a byte buffer with `n` consecutive ARM64_NOP words at `offset`.
+    fn with_nop_run(prefix_len: usize, nop_words: usize, suffix_len: usize) -> Vec<u8> {
+        let nop = ARM64_NOP.to_le_bytes();
+        let mut buf = vec![0xFFu8; prefix_len];
+        for _ in 0..nop_words {
+            buf.extend_from_slice(&nop);
+        }
+        buf.extend(std::iter::repeat_n(0xFFu8, suffix_len));
+        buf
+    }
+
+    #[test]
+    fn find_nop_slide_locates_first_aligned_run() {
+        // 32 bytes of 0xFF, then 4 NOP words (16 bytes), then 16 bytes of 0xFF.
+        // First qualifying 8-byte-aligned 4-NOP run starts at offset 32.
+        let buf = with_nop_run(32, 4, 16);
+        assert_eq!(find_nop_slide(&buf), Some(32));
+    }
+
+    #[test]
+    fn find_nop_slide_returns_none_when_no_run_exists() {
+        let buf = vec![0xFFu8; 64];
+        assert!(find_nop_slide(&buf).is_none());
+    }
+
+    #[test]
+    fn find_nop_slide_prefers_aligned_run_over_earlier_unaligned() {
+        // Layout: [4 bytes 0xFF][4 NOPs at offset 4 — UNALIGNED][12 bytes 0xFF]
+        //         [4 NOPs at offset 32 — ALIGNED][trailing 0xFF]
+        // The unaligned run must be skipped; the aligned run at 32 wins.
+        let nop = ARM64_NOP.to_le_bytes();
+        let mut buf = vec![0xFFu8; 4];
+        for _ in 0..4 {
+            buf.extend_from_slice(&nop);
+        }
+        buf.extend(std::iter::repeat_n(0xFFu8, 12));
+        assert_eq!(buf.len(), 32);
+        for _ in 0..4 {
+            buf.extend_from_slice(&nop);
+        }
+        buf.extend(std::iter::repeat_n(0xFFu8, 16));
+        assert_eq!(find_nop_slide(&buf), Some(32));
     }
 }
