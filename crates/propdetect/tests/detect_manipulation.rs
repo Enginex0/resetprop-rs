@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use resetprop::PropArea;
 
@@ -42,8 +42,8 @@ fn populate_realistic(area: &PropArea) {
     }
 }
 
-fn areas_from(path: &PathBuf) -> Vec<(PathBuf, PropArea)> {
-    vec![(path.clone(), PropArea::open(path).unwrap())]
+fn areas_from(path: &Path) -> Vec<(PathBuf, PropArea)> {
+    vec![(path.to_path_buf(), PropArea::open(path).unwrap())]
 }
 
 #[test]

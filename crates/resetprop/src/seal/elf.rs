@@ -754,12 +754,12 @@ mod tests {
     ///
     /// Layout (offsets relative to bytes[0]):
     ///   * `[0..16]`  GNU_HASH header (nbuckets, symoffset=1, bloom_size,
-    ///                bloom_shift=6).
+    ///     bloom_shift=6).
     ///   * `[16..16 + 8 * bloom_size]` bloom table (all-ones — never rejects).
     ///   * `[bucket_base..chain_base]` buckets (single bucket pointing at sym 1).
     ///   * `[chain_base..chain_base + 4]` one chain slot: `(h & !1) | 1`.
     ///   * `[symtab_offset..]` two `Elf64_Sym`s — index 0 is the ELF-mandated
-    ///                zero entry; index 1 is the test subject.
+    ///     zero entry; index 1 is the test subject.
     ///   * `[strtab_offset..]` `target_name` followed by NUL.
     fn build_synthetic_view(
         target_name: &str,
@@ -838,8 +838,9 @@ mod tests {
     /// not returned — bionic `linker_relocate.h:60-74`.
     #[test]
     fn gnu_lookup_rejects_local_symbol() {
-        // bind = STB_LOCAL (0), type = STT_FUNC (2). st_info = (bind << 4) | type.
-        let st_info = (0u8 << 4) | STT_FUNC;
+        // bind = STB_LOCAL (0), type = STT_FUNC (2). st_info = (bind << 4) | type,
+        // which reduces to just STT_FUNC when bind is 0.
+        let st_info = STT_FUNC;
         let view = build_synthetic_view("target", st_info, 1 /* defined */, 1);
         assert!(
             gnu_lookup(&view, "target").is_none(),

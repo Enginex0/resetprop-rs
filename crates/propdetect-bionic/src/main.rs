@@ -51,7 +51,7 @@ extern "C" fn foreach_cb(pi: *const prop_info, cookie: *mut c_void) {
     }
 
     unsafe {
-        __system_property_read_callback(pi, read_cb, cookie as *mut c_void);
+        __system_property_read_callback(pi, read_cb, cookie);
     }
 }
 

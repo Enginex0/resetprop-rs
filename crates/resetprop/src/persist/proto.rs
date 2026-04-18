@@ -246,7 +246,7 @@ mod tests {
         let records = vec![Record { name: "persist.x".into(), value: "y".into() }];
         let mut encoded = encode(&records);
         // append an unknown varint field (field 15, wire type 0, value 42)
-        encoded.push((15 << 3) | 0);
+        encoded.push(15 << 3);
         encoded.push(42);
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded.len(), 1);

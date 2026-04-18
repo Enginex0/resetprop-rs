@@ -614,3 +614,60 @@ Segment P04.2 (Gate 2 round-1 CRITICALs + one symmetry MAJOR). Each fix task MUS
   three bytes — handle now sees an empty list.
   (iii) Name not present — early return via the `position(...)?`
   propagation; fill is never reached. Buffer unmodified.
+
+### Self-Audit Gate T5 — Pre-existing clippy cleanup
+
+- [x] **Optimality**: Considered three scopes for the cleanup.
+  (a) Fix every `cargo clippy --workspace --all-targets -- -D warnings`
+      error surfaced by Rust 1.92 — chosen. Keeps CI green across the
+      whole workspace (resetprop lib + propdetect + propdetect-bionic)
+      under the strictest lint setting. The prior P04.2 closure noted
+      5 lints in resetprop; the workspace scan uncovered 2 more in
+      propdetect / propdetect-bionic that the REGISTRY entry had not
+      enumerated. All 7 are in test helpers, doc comments, or
+      diagnostic binaries — zero production library behaviour changes.
+  (b) Restrict to the 5 resetprop lints and `#[allow]` the
+      propdetect / propdetect-bionic ones. Rejected — `#[allow]`
+      annotations rot, and the two newly-surfaced lints (ptr_arg,
+      unnecessary_cast) are one-line fixes with no downside.
+  (c) Bump the rust-toolchain pin to 1.91 to hide the new lints.
+      Rejected — the whole point of Gate 2 is keeping the bar high;
+      pinning backward defeats that.
+- [x] **Completeness**: Seven fixes across four files.
+  (i) `context.rs:408` — `buf.len() % 4 != 0` →
+      `!buf.len().is_multiple_of(4)` (`manual_is_multiple_of`, in the
+      `align4` test helper inside `#[cfg(test)] mod tests`).
+  (ii) `persist/proto.rs:249` — `(15 << 3) | 0` → `15 << 3`
+       (`identity_op`; the `| 0` was a no-op carryover from a
+       copy-paste template).
+  (iii) `seal/elf.rs:757` — continuation indent 15 sp → 5 sp
+        (`doc_overindented_list_items` in the `build_synthetic_view`
+        test helper doc comment).
+  (iv) `seal/elf.rs:762` — same lint as (iii), different list item.
+  (v) `seal/elf.rs:842` — `(0u8 << 4) | STT_FUNC` → `STT_FUNC`
+      (`identity_op`; comment extended to explain why the st_info
+      formula collapses when bind is 0).
+  (vi) `propdetect/tests/detect_manipulation.rs:45` — `&PathBuf` →
+       `&Path` + `path.to_path_buf()` at the call site; `Path`
+       added to the `use std::path::...` list (`ptr_arg`).
+  (vii) `propdetect-bionic/src/main.rs:54` — `cookie as *mut c_void`
+        → `cookie` (already typed `*mut c_void` at the fn signature;
+        `unnecessary_cast`).
+  Final verification: `cargo clippy --workspace --all-targets --
+  -D warnings` exits 0; `cargo test --workspace` passes (118
+  resetprop lib + 5 propdetect + 2 doc tests, zero failures).
+- [x] **Correctness**: Walked the semantic equivalence of each fix.
+  (i) `is_multiple_of(4)` is exactly `n % 4 == 0` for any `usize`; the
+  negation flips it to the same condition the original `!= 0` checked.
+  (ii) `(15 << 3) | 0` equals `15 << 3` for any integer type by
+  identity of bitwise-OR with zero.
+  (iii-iv) Doc-only reindent — no code semantics; rustdoc's markdown
+  parser accepts both forms, clippy just prefers the tighter one.
+  (v) `(0 << 4) | STT_FUNC` = `0 | STT_FUNC` = `STT_FUNC` by identity.
+  (vi) `&Path` is a strictly more permissive accepted type than
+  `&PathBuf` — all existing callers passing `&PathBuf` auto-deref to
+  `&Path`. The body's `path.to_path_buf()` returns the same owned
+  `PathBuf` the previous `path.clone()` did.
+  (vii) `cookie` is declared `*mut c_void` on the fn signature at
+  `main.rs:44`; casting `*mut c_void as *mut c_void` is the identity
+  cast clippy flagged.
