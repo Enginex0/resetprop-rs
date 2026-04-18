@@ -16,6 +16,10 @@ pub mod ptrace;
 /// Process identifier alias matching the libc type used by ptrace/waitpid.
 pub type Pid = libc::pid_t;
 
+/// Android init's fixed pid — the only Tier A / Tier B target in v1.
+/// Extracted so future refactors touch one line, not N call sites.
+pub(crate) const INIT_PID: Pid = 1;
+
 /// In-memory record describing a single sealed property or arena.
 ///
 /// Populated by P02 (Tier A — arena-level records) and P04 (Tier B — per-prop records).

@@ -551,7 +551,11 @@ impl PropSystem {
         self.set_stealth(name, value)?;
 
         let mirror_path = self.derive_mirror_path(&primary_path, filename);
-        seal::arena::seal_arena_with_mirror(1, &primary_path, mirror_path.as_deref())?;
+        seal::arena::seal_arena_with_mirror(
+            seal::INIT_PID,
+            &primary_path,
+            mirror_path.as_deref(),
+        )?;
 
         let record = SealRecord {
             name: name.to_string(),
@@ -573,7 +577,11 @@ impl PropSystem {
         }
 
         let mirror_path = self.derive_mirror_path(&primary_path, filename);
-        seal::arena::unseal_arena_with_mirror(1, &primary_path, mirror_path.as_deref())?;
+        seal::arena::unseal_arena_with_mirror(
+            seal::INIT_PID,
+            &primary_path,
+            mirror_path.as_deref(),
+        )?;
 
         Ok(remove_seal_record(name))
     }
