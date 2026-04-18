@@ -157,6 +157,23 @@ fn run() -> Result<(), String> {
         }
     }
 
+    let seal_flag_count = [
+        seal.is_some(),
+        seal_arena.is_some(),
+        unseal.is_some(),
+        unseal_arena.is_some(),
+        list_seals,
+    ]
+    .iter()
+    .filter(|&&flag| flag)
+    .count();
+    if seal_flag_count > 1 {
+        return Err(
+            "seal flags are mutually exclusive: pick one of --seal, --seal-arena, --unseal, --unseal-arena, --seals"
+                .to_string(),
+        );
+    }
+
     if list_seals {
         let records = sys.seals().map_err(|e| format!("seals failed: {e}"))?;
         for r in records {
