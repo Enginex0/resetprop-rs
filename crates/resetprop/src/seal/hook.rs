@@ -29,7 +29,10 @@ use crate::error::{Error, Result};
 use crate::seal;
 use crate::seal::arena::{find_scratch_slot, NR_MMAP, NR_MUNMAP};
 use crate::seal::maps::MapEntry;
-use crate::seal::ptrace::{read_remote, remote_syscall_via_poke, write_remote};
+use crate::seal::ptrace::{
+    getregset, ptrace_peektext, ptrace_poketext, read_remote, remote_syscall_via_poke, setregset,
+    wait_stop, write_remote, PTRACE_CONT,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage-B constants (REGISTRY §1 canonical flag values)
@@ -53,6 +56,33 @@ const HOOK_PAGE_SIZE: u64 = 4096;
 /// slot. Matches `seal::arena::LIBC_SCAN_LIMIT` (64 KiB) so the two stage
 /// pipelines share identical scan behaviour.
 const LIBC_SCAN_LIMIT: usize = 64 * 1024;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P04 T3 — hook-page layout and i-cache sync constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Hook page byte offset of the lock-list base (empty-list sentinel NUL byte
+/// lives at offset 0, written by P03 stage-B at `hook.rs:310-312`).
+/// Reference: `P04-tier-b-part2.md §Approach item 4`.
+pub(crate) const LOCK_LIST_OFFSET: u64 = 0;
+
+/// Hook page byte offset where [`build_hook_body_bytes`]'s 92-byte body
+/// lands. Byte 0 is the empty-list sentinel NUL; bytes 1..=3 are zero
+/// alignment padding; the body starts at byte 4. Reference:
+/// `P04-tier-b-part2.md §Approach item 4`.
+pub(crate) const HOOK_BODY_OFFSET: u64 = 4;
+
+/// `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE` — kernel cmd byte for
+/// cross-core instruction-cache synchronisation after writing instruction
+/// bytes into another process's VMA. Primary i-cache sync path after the
+/// trampoline write. Reference:
+/// `references/arm64-a64-encoding.md §i-cache invalidation options`
+/// (linux/membarrier.h cmd enum value).
+pub(crate) const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 0x80;
+
+/// `__NR_membarrier` on AArch64 Linux. Source:
+/// `asm-generic/unistd.h:683` cited by `linux-arm64-abi.md §1` line 29.
+pub(crate) const NR_MEMBARRIER: u64 = 283;
 
 /// Per-prop Tier B hook handle.
 ///
@@ -295,11 +325,7 @@ fn remote_mmap_hook_page(pid: libc::pid_t, scratch_pc: u64) -> Result<u64> {
 ///
 /// Runs under the caller's `RemoteAttach`. Returning `Err` is the trigger
 /// for the caller's best-effort remote `munmap` cleanup path (M6 fix).
-fn finish_stage_b_locked(
-    pid: libc::pid_t,
-    hook_page: u64,
-    target_fn: u64,
-) -> Result<[u8; 16]> {
+fn finish_stage_b_locked(pid: libc::pid_t, hook_page: u64, target_fn: u64) -> Result<[u8; 16]> {
     // Write the 4-byte zero sentinel (lock-list length = 0). The hook
     // page is PROT_READ | WRITE | EXEC per the mmap args, so
     // `process_vm_writev` inside `write_remote` respects the W bit
@@ -641,6 +667,240 @@ pub fn build_hook_body_bytes(
     body[LOCK_LIST_LIT + 1] = (lock_list_vaddr >> 32) as u32;
 
     body.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P04 T3 — trampoline installer + i-cache sync
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Execute a single `isb` in the tracee by staging `isb ; brk #0` at
+/// `scratch_pc`, flipping `pc`, resuming, waiting for the brk trap, and
+/// restoring the original word and registers.
+///
+/// Mirrors the structural skeleton of
+/// [`crate::seal::ptrace::remote_syscall_via_poke`] (at `ptrace.rs:627-705`)
+/// but carries an instruction payload rather than a syscall payload — the
+/// tracee never enters the kernel, so there is no `x8`, no args, no `x0`
+/// decode. This is the fallback path for `install_trampoline`'s i-cache
+/// sync when `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)` returns `EINVAL`
+/// (cmd missing) or `EPERM` (registration missing).
+///
+/// Errors after the POKE (wait_stop, regs restore) trigger a best-effort
+/// restore of both the scratch word and the saved registers before the
+/// original cause propagates; this matches the pattern in
+/// `remote_syscall_via_poke` so libc.text is never left poisoned.
+///
+/// # Safety
+///
+/// Caller holds a live `RemoteAttach` on `pid`; `scratch_pc` is 4-byte
+/// aligned, lies inside an executable mapping with at least 8 bytes of
+/// room, and no other thread in the tracee is racing on those 8 bytes.
+unsafe fn execute_remote_isb(pid: libc::pid_t, scratch_pc: u64) -> Result<()> {
+    let payload: u64 = (encoder::ISB_SY as u64) | ((encoder::BRK_0 as u64) << 32);
+
+    let saved_word = ptrace_peektext(pid, scratch_pc)?;
+    ptrace_poketext(pid, scratch_pc, payload)?;
+
+    let saved_regs = getregset(pid)?;
+    let mut work = saved_regs;
+    work.pc = scratch_pc;
+    setregset(pid, &work)?;
+
+    // SAFETY: `libc::ptrace` FFI; `addr` / `data` are NULL per PTRACE_CONT
+    // contract; tracee is ptrace-stopped via the caller's RemoteAttach.
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_CONT as _,
+            pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    if rc == -1 {
+        let _ = ptrace_poketext(pid, scratch_pc, saved_word);
+        let _ = setregset(pid, &saved_regs);
+        return Err(Error::PtraceOp(std::io::Error::last_os_error()));
+    }
+
+    let wait_result = wait_stop(pid, 0);
+    if wait_result.is_err() {
+        let _ = ptrace_poketext(pid, scratch_pc, saved_word);
+        let _ = setregset(pid, &saved_regs);
+    }
+    wait_result?;
+
+    setregset(pid, &saved_regs)?;
+    ptrace_poketext(pid, scratch_pc, saved_word)?;
+    Ok(())
+}
+
+/// Best-effort revert of a partial trampoline write.
+///
+/// Called only from `install_trampoline`'s error paths after the 16-byte
+/// trampoline POKE sequence has begun. Restores the original prologue by
+/// decoding `saved_prologue` as two little-endian `u64` words and issuing
+/// two `PTRACE_POKEDATA` writes. Errors are logged via `eprintln!` and
+/// never returned — the caller is already propagating the original cause
+/// and a second error would only obscure it.
+fn revert_trampoline(pid: libc::pid_t, target_fn: u64, saved_prologue: &[u8; 16]) {
+    let lo = u64::from_le_bytes([
+        saved_prologue[0],
+        saved_prologue[1],
+        saved_prologue[2],
+        saved_prologue[3],
+        saved_prologue[4],
+        saved_prologue[5],
+        saved_prologue[6],
+        saved_prologue[7],
+    ]);
+    let hi = u64::from_le_bytes([
+        saved_prologue[8],
+        saved_prologue[9],
+        saved_prologue[10],
+        saved_prologue[11],
+        saved_prologue[12],
+        saved_prologue[13],
+        saved_prologue[14],
+        saved_prologue[15],
+    ]);
+    if let Err(e) = ptrace_poketext(pid, target_fn, lo) {
+        eprintln!("resetprop: revert_trampoline lo word failed: {e}");
+    }
+    if let Err(e) = ptrace_poketext(pid, target_fn + 8, hi) {
+        eprintln!("resetprop: revert_trampoline hi word failed: {e}");
+    }
+}
+
+/// Install the 16-byte absolute-target trampoline at `handle.target_fn`
+/// and the 92-byte hook body at `handle.hook_page + HOOK_BODY_OFFSET`.
+///
+/// Write order is load-bearing: the hook body must be fully materialised
+/// before the trampoline's `br x16` can land on a valid target, so the
+/// body is written first (step 4) and the trampoline second (step 5). If
+/// init is scheduled onto the trampoline mid-install, it sees either the
+/// old prologue (trampoline not yet written) or a fully-formed hook
+/// (trampoline written, body already in place) — never a half-formed
+/// body.
+///
+/// After both writes land, the instruction cache on each core must be
+/// synchronised with the updated data cache or the tracee may execute
+/// stale bytes fetched before our POKEs. The primary path issues a
+/// remote `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)` (one syscall, no
+/// symbol resolution); on `EINVAL` / `EPERM` (kernel lacks the cmd or
+/// the tracee never registered) it falls back to
+/// [`execute_remote_isb`].
+///
+/// On success, `handle.trampoline_installed` is flipped to `true` so
+/// [`HookHandle::drop`] skips the `munmap` — init is now executing
+/// inside the hook page.
+///
+/// # Error cleanup
+///
+/// Any failure after the trampoline write has begun (steps 5-7) triggers
+/// a best-effort [`revert_trampoline`] under the same attach window
+/// before the error propagates, so the tracee is not left running a
+/// half-written trampoline.
+pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
+    // Step 1: compute addresses.
+    let lock_list_vaddr = handle.hook_page + LOCK_LIST_OFFSET;
+    let hook_body_vaddr = handle.hook_page + HOOK_BODY_OFFSET;
+    let resume_addr = handle.target_fn + 16;
+
+    // Step 2: pure helper emits the 92-byte hook body.
+    let body_bytes = build_hook_body_bytes(handle.saved_prologue, lock_list_vaddr, resume_addr);
+
+    // Step 3: acquire attach RAII guard.
+    let attach = seal::arena::RemoteAttach::new(handle.pid)
+        .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: attach: {e}")))?;
+
+    // Steps 4-7 run under the attach. A failure in any of 5-7 must revert
+    // the trampoline write before the error unwinds. Using a closure lets
+    // `?` propagate cleanly while a trailing `match` runs the cleanup.
+    let trampoline_result = (|| -> Result<()> {
+        // Step 4: write hook body to the fresh PROT_RWX hook page.
+        //
+        // SAFETY: `handle.hook_page` is the fresh PROT_READ|WRITE|EXEC page
+        // that P03 stage-B mmap'd via `remote_syscall_via_poke`
+        // (`hook.rs:269-291`); the W bit is set so `process_vm_writev`
+        // inside `write_remote` succeeds. The tracee is ptrace-stopped via
+        // `attach`.
+        unsafe { write_remote(handle.pid, hook_body_vaddr, &body_bytes) }.map_err(|e| {
+            Error::HookInstallFailed(format!("install_trampoline: write body: {e}"))
+        })?;
+
+        // Step 5: write the 16-byte trampoline at `target_fn`.
+        //
+        // `target_fn` lives inside libc.text `r-xp`, so `process_vm_writev`
+        // EFAULTs. `PTRACE_POKEDATA` bypasses VMA write bits via
+        // `ptrace_access_vm`. The trampoline is two LP64 words: word_lo
+        // packs `ldr x16, [pc, #8]` (low 4 bytes) with `br x16` (high 4
+        // bytes); word_hi is the absolute 64-bit literal target.
+        let word_lo = (encoder::LDR_X16_PC8 as u64) | ((encoder::BR_X16 as u64) << 32);
+        let word_hi = hook_body_vaddr;
+        ptrace_poketext(handle.pid, handle.target_fn, word_lo).map_err(|e| {
+            Error::HookInstallFailed(format!("install_trampoline: poke tramp lo: {e}"))
+        })?;
+        ptrace_poketext(handle.pid, handle.target_fn + 8, word_hi).map_err(|e| {
+            Error::HookInstallFailed(format!("install_trampoline: poke tramp hi: {e}"))
+        })?;
+
+        // Step 6: i-cache sync via remote membarrier (primary path).
+        //
+        // SAFETY: `handle.scratch_pc` is the 8-byte-aligned slot inside
+        // libc.text cached at P03 install time (`hook.rs:218`); the tracee
+        // is ptrace-stopped via `attach`; `remote_syscall_via_poke` saves
+        // and restores both the scratch word and the saved-regs snapshot
+        // internally before returning.
+        let membarrier_ret = unsafe {
+            remote_syscall_via_poke(
+                handle.pid,
+                handle.scratch_pc,
+                NR_MEMBARRIER,
+                [MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0, 0, 0, 0, 0],
+            )
+        }
+        .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: membarrier: {e}")))?;
+
+        // Step 7: decode membarrier return, falling back to ISB staging
+        // when the kernel rejects the cmd (EINVAL) or the tracee has not
+        // registered (EPERM).
+        if membarrier_ret >= 0 {
+            return Ok(());
+        }
+        let einval_neg = -(libc::EINVAL as i64);
+        let eperm_neg = -(libc::EPERM as i64);
+        if membarrier_ret == einval_neg || membarrier_ret == eperm_neg {
+            // SAFETY: same invariants as step 6 — `attach` holds the tracee
+            // stopped; `handle.scratch_pc` is the cached libc.text slot.
+            return unsafe { execute_remote_isb(handle.pid, handle.scratch_pc) };
+        }
+        if (-4095..=-1).contains(&membarrier_ret) {
+            return Err(Error::HookInstallFailed(format!(
+                "install_trampoline: membarrier returned -errno={}",
+                -membarrier_ret
+            )));
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = trampoline_result {
+        revert_trampoline(handle.pid, handle.target_fn, &handle.saved_prologue);
+        if let Err(detach_err) = attach.detach() {
+            eprintln!("resetprop: detach after install error failed: {detach_err}");
+        }
+        return Err(e);
+    }
+
+    // Step 8: flip typestate so Drop skips the munmap.
+    handle.trampoline_installed = true;
+
+    // Step 9: explicit detach surfaces any failure here at the install site.
+    attach
+        .detach()
+        .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: detach: {e}")))?;
+
+    // Step 10.
+    Ok(())
 }
 
 #[cfg(test)]
