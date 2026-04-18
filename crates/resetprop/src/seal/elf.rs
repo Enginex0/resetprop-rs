@@ -7,9 +7,10 @@
 //! `strtab_offset`, `strtab_size`, and `gnu_hash_offset` (all translated to
 //! file offsets via the PT_LOAD map).
 //!
-//! T2 (`gnu_lookup`) and T3 (`linear_lookup` / `resolve_symbol`) land in the
-//! next dispatchers and will index into `LibcElfView::bytes` via the
-//! `pub(crate)` accessors below.
+//! T2 adds `gnu_hash` + `gnu_lookup` (below): GNU_HASH djb2a form + on-disk
+//! bloom/bucket/chain walk matching bionic `linker_soinfo.cpp::gnu_lookup`.
+//! T3 (`linear_lookup` / `resolve_symbol`) lands in the next dispatcher and
+//! will index into `LibcElfView::bytes` via the `pub(crate)` accessors below.
 //!
 //! Layouts and constants verified against `/usr/include/elf.h` — citations are
 //! inlined at each declaration. No external ELF crate is used per REGISTRY §1
@@ -152,13 +153,12 @@ const _: () = assert!(mem::size_of::<Elf64_Sym>() == 24);
 
 /// Parsed view of an Android arm64 `libc.so`.
 ///
-/// Owns the full file contents so T2/T3 lookup helpers (added next) can index
-/// into the buffer without any mmap / lifetime juggling. libc.so is ~1 MB so
-/// holding the full buffer in memory is cheap and avoids `unsafe`.
-///
-/// Fields are `pub(crate)` and read by the `gnu_lookup` / `linear_lookup`
-/// helpers shipped in P03 Tasks 2–3. This phase only populates them, so the
-/// `allow(dead_code)` keeps the Task 1 build warning-free until Task 2 lands.
+/// Owns the full file contents so `gnu_lookup` (T2) and the upcoming
+/// `linear_lookup` (T3) can index into the buffer without mmap/lifetime
+/// juggling. libc.so is ~1 MB, so holding the full buffer is cheap and
+/// avoids unsafe. `syment` and `strtab_size` are read by T3's linear path;
+/// the T2 lookup uses `symtab_offset`, `strtab_offset`, `strtab_size`, and
+/// `gnu_hash_offset`.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct LibcElfView {
@@ -369,8 +369,175 @@ pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
 }
 
 // -----------------------------------------------------------------------------
+// GNU_HASH lookup (T2)
+// -----------------------------------------------------------------------------
+
+/// Width of a single bloom-filter word, in bits. Matches bionic's
+/// `kBloomMaskBits = sizeof(ElfW(Addr)) * 8` for arm64.
+/// Source: `linker_soinfo.cpp:330`.
+const BLOOM_MASK_BITS: u32 = 64;
+
+/// djb2a hash used by GNU_HASH, bionic form.
+///
+/// `h * 33 + byte`, seeded at `5381`, encoded as
+/// `h + (h << 5) + byte` with wrapping u32 arithmetic.
+/// Source: `linker_gnu_hash.h:46-54`.
+pub(crate) fn gnu_hash(name: &[u8]) -> u32 {
+    let mut h: u32 = 5381;
+    for &b in name {
+        h = h.wrapping_add(h.wrapping_shl(5)).wrapping_add(u32::from(b));
+    }
+    h
+}
+
+/// Read a little-endian `u32` at `off`, returning `None` on OOB.
+///
+/// Used for GNU_HASH header fields and for bucket/chain entries. Safe —
+/// no `unsafe`, no alignment requirement.
+fn u32_le(bytes: &[u8], off: usize) -> Option<u32> {
+    let end = off.checked_add(4)?;
+    if end > bytes.len() {
+        return None;
+    }
+    let slice: [u8; 4] = bytes[off..end].try_into().ok()?;
+    Some(u32::from_le_bytes(slice))
+}
+
+/// Read a little-endian `u64` at `off`, returning `None` on OOB.
+///
+/// Used for bloom-filter words.
+fn u64_le(bytes: &[u8], off: usize) -> Option<u64> {
+    let end = off.checked_add(8)?;
+    if end > bytes.len() {
+        return None;
+    }
+    let slice: [u8; 8] = bytes[off..end].try_into().ok()?;
+    Some(u64::from_le_bytes(slice))
+}
+
+/// Read a NUL-terminated C string starting at `offset`, bounded by both
+/// `offset + max_len` and `bytes.len()`. Returns the byte slice excluding
+/// the NUL, or `None` if no NUL exists within the bound.
+///
+/// Shared by T2 (here) and T3 (linear_lookup) for `strtab` name resolution.
+fn read_cstr_at(bytes: &[u8], offset: usize, max_len: usize) -> Option<&[u8]> {
+    let hard_end = bytes.len().min(offset.checked_add(max_len)?);
+    if offset >= hard_end {
+        return None;
+    }
+    let window = &bytes[offset..hard_end];
+    let nul = window.iter().position(|&b| b == 0)?;
+    Some(&window[..nul])
+}
+
+/// Look up `name` in the view's GNU_HASH table and return the matched
+/// symbol's `st_value`, or `None` if absent / the view has no GNU_HASH /
+/// the table is malformed.
+///
+/// Never panics. Never returns `Err`; the T3 dispatcher wraps `None` into
+/// the crate's `SymbolNotFound` variant. Algorithm matches bionic
+/// `linker_soinfo.cpp:327-377` verbatim:
+///   1. djb2a hash with seed 5381.
+///   2. Bloom double-check at bits `h % 64` and `(h >> bloom_shift) % 64`.
+///   3. Bucket `h % nbuckets`; zero bucket means absent.
+///   4. Chain walk comparing `((chain[n] ^ h) >> 1) == 0`, terminating on
+///      `chain[n] & 1`.
+pub fn gnu_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
+    let hash_offset = view.gnu_hash_offset?;
+    let bytes = &view.bytes;
+    let target = name.as_bytes();
+
+    // Header: nbuckets, symoffset, bloom_size, bloom_shift (4 x u32 LE).
+    let nbuckets = u32_le(bytes, hash_offset)?;
+    let symoffset = u32_le(bytes, hash_offset.checked_add(4)?)?;
+    let bloom_size = u32_le(bytes, hash_offset.checked_add(8)?)?;
+    let bloom_shift = u32_le(bytes, hash_offset.checked_add(12)?)?;
+
+    if nbuckets == 0 || bloom_size == 0 {
+        return None;
+    }
+
+    let bloom_base = hash_offset.checked_add(16)?;
+    let bucket_base = bloom_base.checked_add((bloom_size as usize).checked_mul(8)?)?;
+    let chain_base = bucket_base.checked_add((nbuckets as usize).checked_mul(4)?)?;
+
+    let h = gnu_hash(target);
+
+    // Step 1: bloom filter double-check.
+    let word_idx = ((h / BLOOM_MASK_BITS) & (bloom_size - 1)) as usize;
+    let word_off = bloom_base.checked_add(word_idx.checked_mul(8)?)?;
+    let word = u64_le(bytes, word_off)?;
+    let m1 = 1u64 << (h % BLOOM_MASK_BITS);
+    let m2 = 1u64 << ((h >> bloom_shift) % BLOOM_MASK_BITS);
+    if (word & m1) == 0 || (word & m2) == 0 {
+        return None;
+    }
+
+    // Step 2: bucket lookup. Bucket zero means "definitely absent".
+    let bucket_off = bucket_base.checked_add(((h % nbuckets) as usize).checked_mul(4)?)?;
+    let mut n = u32_le(bytes, bucket_off)?;
+    if n == 0 {
+        return None;
+    }
+
+    // Guard against malformed tables where the first bucket index is below
+    // symoffset (the chain is indexed by `n - symoffset`).
+    if n < symoffset {
+        return None;
+    }
+
+    // Step 3: chain walk. `((c ^ h) >> 1) == 0` is the hash-match candidate;
+    // `(c & 1) != 0` marks the end of the chain.
+    loop {
+        let chain_idx = (n - symoffset) as usize;
+        let chain_off = chain_base.checked_add(chain_idx.checked_mul(4)?)?;
+        let c = u32_le(bytes, chain_off)?;
+
+        if ((c ^ h) >> 1) == 0 {
+            let sym_off = view
+                .symtab_offset
+                .checked_add((n as usize).checked_mul(mem::size_of::<Elf64_Sym>())?)?;
+            let sym: Elf64_Sym = read_struct(bytes, sym_off, "Sym").ok()?;
+            let name_off = view.strtab_offset.checked_add(sym.st_name as usize)?;
+            let cand = read_cstr_at(bytes, name_off, view.strtab_size)?;
+            if cand == target {
+                return Some(sym.st_value);
+            }
+        }
+
+        if (c & 1) != 0 {
+            return None;
+        }
+        n = n.checked_add(1)?;
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+#[cfg(test)]
+impl LibcElfView {
+    /// Build a view directly from pre-resolved offsets, without parsing a
+    /// real ELF file. Test-only; exists so T2's bloom-rejects path can be
+    /// exercised with a hand-crafted GNU_HASH section.
+    pub(crate) fn from_parts(
+        bytes: Vec<u8>,
+        symtab_offset: usize,
+        strtab_offset: usize,
+        strtab_size: usize,
+        gnu_hash_offset: Option<usize>,
+    ) -> Self {
+        Self {
+            bytes,
+            symtab_offset,
+            strtab_offset,
+            strtab_size,
+            gnu_hash_offset,
+            syment: mem::size_of::<Elf64_Sym>(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -453,5 +620,41 @@ mod tests {
             Error::ElfParse(msg) => assert_eq!(msg, "e_machine != EM_AARCH64"),
             other => panic!("expected ElfParse(\"e_machine != EM_AARCH64\"), got {other:?}"),
         }
+    }
+
+    /// djb2a seed and first-byte step match bionic's `linker_gnu_hash.h:46-54`.
+    #[test]
+    fn gnu_hash_seed_5381() {
+        assert_eq!(gnu_hash(b""), 5381);
+        let expected = 5381u32.wrapping_mul(33).wrapping_add(u32::from(b'_'));
+        assert_eq!(gnu_hash(b"_"), expected);
+    }
+
+    /// Build a minimal GNU_HASH section where the bloom filter is all zeros,
+    /// which must reject every lookup before reaching bucket/chain. Verifies
+    /// the "definitely absent" short-circuit and that `gnu_lookup` never
+    /// panics on a pathological-but-well-formed header.
+    #[test]
+    fn gnu_lookup_absent_returns_none() {
+        // Layout: 16 B header, 8 B bloom (bloom_size=1), 4 B bucket (nbuckets=1),
+        // 4 B chain terminator. Total 32 B.
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // nbuckets
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // symoffset
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // bloom_size
+        bytes.extend_from_slice(&6u32.to_le_bytes()); // bloom_shift
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // bloom[0] — rejects all
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // buckets[0]
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // chain[0], terminator
+
+        let view = LibcElfView::from_parts(
+            bytes,
+            /* symtab_offset */ 0,
+            /* strtab_offset */ 0,
+            /* strtab_size   */ 0,
+            /* gnu_hash_offset */ Some(0),
+        );
+
+        assert!(gnu_lookup(&view, "whatever").is_none());
     }
 }
