@@ -24,7 +24,6 @@ pub(crate) const AT_FDCWD: u64 = -100_i64 as u64; // sign-extended to 64 bits
 pub(crate) const O_RDONLY_NOFOLLOW: u64 = 0x20000;
 pub(crate) const O_RDWR_NOFOLLOW: u64 = 0x20002;
 pub(crate) const PROT_RW: u64 = 0x3;
-pub(crate) const PROT_RWX: u64 = 0x7;
 pub(crate) const MAP_PRIVATE_FIXED: u64 = 0x12;
 pub(crate) const MAP_SHARED_FIXED: u64 = 0x11;
 pub(crate) const MAP_PRIVATE_ANON: u64 = 0x22;
@@ -244,7 +243,7 @@ pub(crate) unsafe fn remote_remap_private(
                     .as_deref()
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains("libc"))
+                    .is_some_and(|n| n == "libc.so" || n.starts_with("libc.so."))
         })
         .ok_or_else(|| Error::HookInstallFailed("no libc.so r-x mapping in target".into()))?;
 
@@ -275,7 +274,7 @@ pub(crate) unsafe fn remote_remap_private(
         work.regs[8] = NR_MMAP;
         work.regs[0] = 0; // addr = NULL
         work.regs[1] = BOOTSTRAP_PAGE_SIZE; // len  = 4096
-        work.regs[2] = PROT_RWX; // prot
+        work.regs[2] = PROT_RW; // prot — page is data-only; no execmem required
         work.regs[3] = MAP_PRIVATE_ANON; // flags
         work.regs[4] = (-1_i64) as u64; // fd = -1
         work.regs[5] = 0; // offset
@@ -330,20 +329,19 @@ pub(crate) unsafe fn remote_remap_private(
             path_nul.len()
         )));
     }
-    // SAFETY: `bootstrap_page` is the fresh `PROT_RWX` page we just mapped;
+    // SAFETY: `bootstrap_page` is the fresh `PROT_RW` page we just mapped;
     // process_vm_writev respects VMA write bits and the page is writable.
     // Tracee remains ptrace-stopped for the duration (guarded above).
     unsafe { super::ptrace::write_remote(pid, bootstrap_page, &path_nul)? };
 
     // --- openat(AT_FDCWD, bootstrap_page, flags.open_flags(), 0, 0, 0) ---
-    // SAFETY: `bootstrap_page` is a PROT_RWX page inside the tracee; the
-    // P01 `remote_syscall` contract is satisfied — scratch_pc points into
-    // an executable mapping with at least 8 bytes that may be clobbered
-    // and restored. Tracee is stopped per the RemoteAttach contract.
+    // SAFETY: scratch_pc points into libc.text r-xp; PEEK/POKEDATA bypasses
+    // VMA write bits; tracee stopped by RemoteAttach; bootstrap_page is
+    // PROT_RW and holds the NUL-terminated pathname at its base.
     let fd_ret = unsafe {
-        super::ptrace::remote_syscall(
+        super::ptrace::remote_syscall_via_poke(
             pid,
-            bootstrap_page,
+            scratch_pc,
             NR_OPENAT,
             [AT_FDCWD, bootstrap_page, flags.open_flags(), 0, 0, 0],
         )?
@@ -359,9 +357,9 @@ pub(crate) unsafe fn remote_remap_private(
     // --- mmap(mapping.start, len, PROT_RW, flags.mmap_flags(), fd, 0) ----
     // SAFETY: same rationale as the openat call above.
     let mmap_ret = unsafe {
-        super::ptrace::remote_syscall(
+        super::ptrace::remote_syscall_via_poke(
             pid,
-            bootstrap_page,
+            scratch_pc,
             NR_MMAP,
             [
                 mapping.start,
@@ -377,7 +375,7 @@ pub(crate) unsafe fn remote_remap_private(
         // Best-effort close; diagnostic wins over tidy here.
         // SAFETY: same rationale as the openat call above.
         let _ = unsafe {
-            super::ptrace::remote_syscall(pid, bootstrap_page, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
+            super::ptrace::remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
         };
         return Err(Error::HookInstallFailed(format!(
             "mmap returned {mmap_ret:#x}, expected {:#x}",
@@ -386,9 +384,11 @@ pub(crate) unsafe fn remote_remap_private(
     }
 
     // --- close(fd) -------------------------------------------------------
-    // SAFETY: same rationale as the openat call above.
+    // SAFETY: scratch_pc is in libc.text r-xp; PEEK/POKEDATA bypasses write bits.
+    // Close failure here is benign — the seal is already applied, and a retry
+    // would leak a second bootstrap page. Diagnostic over tidy.
     let _ = unsafe {
-        super::ptrace::remote_syscall(pid, bootstrap_page, NR_CLOSE, [fd, 0, 0, 0, 0, 0])?
+        super::ptrace::remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
     };
 
     // Bootstrap page intentionally leaked: munmap would require a second
@@ -575,7 +575,6 @@ mod tests {
         assert_eq!(O_RDONLY_NOFOLLOW, 0x20000);
         assert_eq!(O_RDWR_NOFOLLOW, 0x20002);
         assert_eq!(PROT_RW, 0x3);
-        assert_eq!(PROT_RWX, 0x7);
         assert_eq!(MAP_PRIVATE_FIXED, 0x12);
         assert_eq!(MAP_SHARED_FIXED, 0x11);
         assert_eq!(MAP_PRIVATE_ANON, 0x22);

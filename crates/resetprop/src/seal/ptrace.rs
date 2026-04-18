@@ -564,6 +564,94 @@ pub unsafe fn remote_syscall(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// remote_syscall_via_poke — same as remote_syscall, but PEEK/POKEDATA scratch
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Execute `syscall_no(args...)` inside `pid` by staging an 8-byte
+/// `svc #0 ; brk #0` blob at `scratch_pc` via [`ptrace_peektext`] /
+/// [`ptrace_poketext`] (word-granularity PEEK/POKEDATA) rather than
+/// [`read_remote`] / [`write_remote`] (process_vm_readv/writev).
+///
+/// Rationale: `process_vm_writev` respects VMA write bits and EFAULTs on
+/// `r-xp` libc.text; `PTRACE_POKEDATA` bypasses the write bit via the
+/// `ptrace_access_vm` kernel path. Use this variant when `scratch_pc` lives
+/// inside a libc.text NOP slide (i.e. always, in P02's post-bootstrap flow).
+///
+/// Behavior and return semantics are otherwise identical to
+/// [`remote_syscall`] — caller contract matches verbatim.
+///
+/// # Safety
+///
+/// Caller guarantees (a) the tracee is ptrace-stopped at entry, (b)
+/// `scratch_pc` is 4-byte aligned and points inside an executable mapping
+/// with at least 8 bytes of readable+executable room, (c) no other thread
+/// in the tracee is racing on those 8 bytes. Unlike [`remote_syscall`] the
+/// scratch VMA does NOT need to be writable: PEEK/POKEDATA bypass VMA
+/// write bits, so an `r-xp` libc.text NOP slide is a legal target.
+pub(crate) unsafe fn remote_syscall_via_poke(
+    pid: Pid,
+    scratch_pc: u64,
+    syscall_no: u64,
+    args: [u64; 6],
+) -> Result<i64> {
+    // Payload: `svc #0 ; brk #0` little-endian packed into one 64-bit word.
+    // Same byte pattern `[0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4]`
+    // as [`remote_syscall`]; construction differs only in transport.
+    let svc_brk: u64 = (ARM64_SVC_0 as u64) | ((ARM64_BRK_0 as u64) << 32);
+
+    // Save the 8 bytes we are about to clobber (one PEEKDATA word on LP64).
+    let saved_word = ptrace_peektext(pid, scratch_pc)?;
+
+    // Stage the svc+brk blob via POKEDATA — bypasses VMA write bits so the
+    // scratch may be an `r-xp` libc.text NOP slide.
+    ptrace_poketext(pid, scratch_pc, svc_brk)?;
+
+    // Snapshot registers so we can restore on exit.
+    let saved_regs = getregset(pid)?;
+
+    // Build the work register set: pc=scratch, x8=syscall, x0..x5=args.
+    // Leave sp/pstate/lr untouched — kernel uses its own stack.
+    let mut work = saved_regs;
+    work.pc = scratch_pc;
+    work.regs[8] = syscall_no;
+    work.regs[0..6].copy_from_slice(&args);
+
+    // Install the work regs, then resume.
+    setregset(pid, &work)?;
+
+    // SAFETY: `libc::ptrace` FFI. `addr`/`data` are NULL per PTRACE_CONT
+    // contract. Tracee is guaranteed ptrace-stopped by the function's own
+    // safety contract, so a CONT is legal here.
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_CONT as _,
+            pid,
+            std::ptr::null_mut::<c_void>(),
+            std::ptr::null_mut::<c_void>(),
+        )
+    };
+    if rc == -1 {
+        return Err(last_ptrace_op_err());
+    }
+
+    // Wait for the brk trap. `wait_stop` verifies
+    // `WIFSTOPPED && WSTOPSIG == SIGTRAP && event == 0` atomically.
+    wait_stop(pid, 0)?;
+
+    // Read x0 from the post-trap register state.
+    let out = getregset(pid)?;
+    let ret = out.regs[0] as i64;
+
+    // Restore in order: regs first (so pc points back at the caller's resume
+    // address), then the scratch word (so a subsequent
+    // `remote_syscall_via_poke` sees pristine memory to clobber).
+    setregset(pid, &saved_regs)?;
+    ptrace_poketext(pid, scratch_pc, saved_word)?;
+
+    Ok(ret)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────────
 
