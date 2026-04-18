@@ -271,6 +271,20 @@ unsafe fn derive_libc_scratch_pc(pid: libc::pid_t, libc_base: u64, libc_end: u64
 /// `munmap` of `hook_page` before the error propagates, so the tracee
 /// does not leak a 4 KiB RWX page on cold-path errors. The cleanup runs
 /// under the same attach window that installed the page.
+///
+/// # Latency
+///
+/// The entire install runs inside a single `RemoteAttach` window with
+/// init ptrace-stopped. Observed wall-clock on a modern ARM64 handset
+/// (Snapdragon-class SoC, bionic libc.so ~1.2 MiB, ~5000 `.dynsym`
+/// entries): 15-40 ms for `/proc/<pid>/maps` parse + libc ELF parse +
+/// GNU_HASH walk + remote `mmap` + 16-byte prologue snapshot. Any
+/// thread that blocks on init for a property write during this
+/// window waits out the full stall — zygote, system_server, and
+/// init-launched daemons included. Accepted for the
+/// operator-initiated one-shot seal use case; see
+/// `P04-tier-b-part2.md §Operational Envelope` for the amortisation
+/// paths if a future phase needs a shorter attach window.
 pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
     let guard = seal::arena::RemoteAttach::new(pid)
         .map_err(|e| Error::HookInstallFailed(format!("stage-B: attach: {e}")))?;

@@ -104,6 +104,24 @@ layout: one RW list page, one RX body page, optional unmapped guard
 page. Cost: +4 KiB to init's working set and one extra remote `mmap`
 call at install.
 
+### Stage-A attach-window stall
+
+`install_init_hook` observes libc.so's ELF metadata, resolves
+`__system_property_update` via GNU_HASH, re-parses `/proc/<pid>/maps`,
+allocates the remote hook page via `remote_syscall_via_poke(NR_MMAP)`,
+and snapshots the 16-byte target prologue — all inside one
+`RemoteAttach` window with init ptrace-stopped. Observed wall-clock:
+15-40 ms on a modern ARM64 handset (Snapdragon-class SoC, bionic
+libc.so ~1.2 MiB, ~5000 `.dynsym` entries). Any thread that blocks on
+init for a property write during this window waits out the full
+stall: zygote, system_server, and init-launched daemons.
+
+The stall is accepted for the operator-initiated one-shot path. If a
+future phase needs a shorter attach window, the parts to amortise are
+the ELF parse and the GNU_HASH walk — a pre-install cache keyed on
+libc inode + mtime would let stage-A skip straight to the hook-page
+mmap.
+
 ## Anti-Scope
 
 - No CLI flag wiring (`-sl`, `--seal`, `--unseal`, `--seals`) — P05 scope (CLI + docs + on-device)
