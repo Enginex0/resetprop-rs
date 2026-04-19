@@ -326,15 +326,13 @@ NEIGHBOR_PROP="ro.telephony.call_ring.delay"
 ORIG=$(getprop "$TEL_PROP")
 NEIGHBOR_ORIG=$(getprop "$NEIGHBOR_PROP")
 
-# Pre-flight: does this shell context have SELinux permission to write the neighbor?
-# ro.telephony.* is labelled telephony_prop, which many production policies reject for
-# shell/su. Without this guard, Test 21 would report a false FAIL on enforcing devices
-# where the neighbor probe never lands regardless of seal state.
-setprop "$NEIGHBOR_PROP" "SELINUX_PROBE" 2>/dev/null
-sleep 0.1
+# Neighbor writability is derived from the actual post-seal setprop below, not a
+# pre-flight probe. A pre-flight probe would consume the one write that AOSP's
+# property_service allows on a `ro.*` prop (`PropertySet` in property_service.cpp
+# rejects any write where `__system_property_find(name) != nullptr` with
+# PROP_ERROR_READ_ONLY_PROPERTY), leaving the prop pinned to the probe value and
+# the real neighbor assertion impossible.
 NEIGHBOR_WRITABLE=0
-[ "$(getprop "$NEIGHBOR_PROP")" = "SELINUX_PROBE" ] && NEIGHBOR_WRITABLE=1
-setprop "$NEIGHBOR_PROP" "$NEIGHBOR_ORIG" 2>/dev/null
 
 if $RP -sl "$TEL_PROP" "0" 2>/dev/null; then
     for i in $(seq 1 50); do
@@ -343,7 +341,9 @@ if $RP -sl "$TEL_PROP" "0" 2>/dev/null; then
     done
     SEALED_FINAL=$(getprop "$TEL_PROP")
 
-    setprop "$NEIGHBOR_PROP" "7" 2>/dev/null
+    if setprop "$NEIGHBOR_PROP" "7" 2>/dev/null; then
+        NEIGHBOR_WRITABLE=1
+    fi
     sleep 0.1
     NEIGHBOR_FINAL=$(getprop "$NEIGHBOR_PROP")
 
@@ -355,7 +355,7 @@ if $RP -sl "$TEL_PROP" "0" 2>/dev/null; then
                 fail "Test 21: seal Tier B — sealed='0' but neighbor='$NEIGHBOR_FINAL' (expected '7')"
             fi
         else
-            pass "Test 21: seal Tier B — sealed held at '0' (neighbor assertion skipped: SELinux blocks shell writes on '$NEIGHBOR_PROP')"
+            pass "Test 21: seal Tier B — sealed held at '0' (neighbor assertion skipped: setprop on '$NEIGHBOR_PROP' rejected by init — SELinux denial or ro.* write-once)"
         fi
     else
         fail "Test 21: seal Tier B — sealed='$SEALED_FINAL' (expected '0')"
