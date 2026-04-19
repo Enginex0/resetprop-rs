@@ -29,16 +29,14 @@ mod inner {
     #[allow(clippy::missing_transmute_annotations)]
     fn init() -> Option<BionicFns> {
         unsafe {
-            let handle = libc::dlopen(b"libc.so\0".as_ptr().cast(), libc::RTLD_NOLOAD);
+            let handle = libc::dlopen(c"libc.so".as_ptr(), libc::RTLD_NOLOAD);
             if handle.is_null() {
                 return None;
             }
 
-            let find_ptr = libc::dlsym(handle, b"__system_property_find\0".as_ptr().cast());
-            let read_cb_ptr =
-                libc::dlsym(handle, b"__system_property_read_callback\0".as_ptr().cast());
-            let foreach_ptr =
-                libc::dlsym(handle, b"__system_property_foreach\0".as_ptr().cast());
+            let find_ptr = libc::dlsym(handle, c"__system_property_find".as_ptr());
+            let read_cb_ptr = libc::dlsym(handle, c"__system_property_read_callback".as_ptr());
+            let foreach_ptr = libc::dlsym(handle, c"__system_property_foreach".as_ptr());
 
             // All three required symbols must exist
             if find_ptr.is_null() || read_cb_ptr.is_null() || foreach_ptr.is_null() {
@@ -50,7 +48,7 @@ mod inner {
             let read_callback: ReadCallbackFn = std::mem::transmute(read_cb_ptr);
             let foreach: ForeachFn = std::mem::transmute(foreach_ptr);
 
-            let wait_ptr = libc::dlsym(handle, b"__system_property_wait\0".as_ptr().cast());
+            let wait_ptr = libc::dlsym(handle, c"__system_property_wait".as_ptr());
             let wait: Option<WaitFn> = if wait_ptr.is_null() {
                 None
             } else {
