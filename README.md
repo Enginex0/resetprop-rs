@@ -223,6 +223,40 @@ resetprop-rs --seals
 # [ro.telephony.default_network]: [Prop] /dev/__properties__/u:object_r:telephony_prop:s0
 ```
 
+`SealRecord` lives in process memory only, so `--seals` always reports empty
+from a fresh invocation. To confirm a seal is active on the device, inspect
+init's mappings and read the prop back:
+
+```sh
+# Tier B leaves a file-backed hook page in init as a deleted inode.
+adb shell 'grep "resetprop-rs" /proc/1/maps'
+# 7f8036b000-7f8036c000 r-xp ... /data/adb/resetprop-rs/hook-1-<nanos>.bin (deleted)
+
+# Confirm the prop value is pinned to the sealed value.
+adb shell 'getprop ro.telephony.default_network'
+# 0
+```
+
+Seals do not persist across reboots — they live only in the running init's
+memory. To keep a prop sealed across boots, re-apply from a KSU/Magisk
+module's `post-fs-data.sh`:
+
+```sh
+#!/system/bin/sh
+# /data/adb/modules/my-telephony-lock/post-fs-data.sh
+/data/adb/modules/my-telephony-lock/bin/resetprop-rs \
+  --seal ro.telephony.default_network 0 \
+  || /data/adb/modules/my-telephony-lock/bin/resetprop-rs \
+       --seal-arena ro.telephony.default_network 0
+```
+
+The `||` chain falls back to Tier A if Tier B refuses — useful on builds
+where init's `libc.so` shape breaks the ELF walker (`HookInstallFailed`,
+`ElfParse`, or `SymbolNotFound` error classes). Tier A freezes every prop
+in the same arena as a side effect; for `ro.telephony.default_network` on
+stock Xiaomi the arena is `telephony_prop`, so all `ro.telephony.*` reads
+would then return their pre-seal values.
+
 ### Deleting properties
 
 ```sh
