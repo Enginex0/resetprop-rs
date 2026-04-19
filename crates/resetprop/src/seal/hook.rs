@@ -200,13 +200,33 @@ fn stage_a_locked(pid: libc::pid_t) -> Result<(u64, u64, u64)> {
 
     let libc_base = libc_row.start;
     let libc_end = libc_row.end;
-    let map_path = format!(
-        "/proc/{}/map_files/{:x}-{:x}",
-        pid, libc_row.start, libc_row.end
-    );
 
-    let file = File::open(&map_path)
-        .map_err(|e| Error::HookInstallFailed(format!("stage-A: open {map_path}: {e}")))?;
+    // Some Android kernels (observed on Xiaomi 2409BRN2CA, Android 15, kernel
+    // 6.6.58) expose /proc/<pid>/map_files at VMA granularity while
+    // /proc/<pid>/maps splits by permission region — so libc_row.end may not
+    // match the map_files entry's end (the kernel fuses the r-xp region with
+    // an adjacent guard-page hole under the same VMA). Locate the entry by
+    // its start address, which is stable across both views.
+    let map_files_dir = format!("/proc/{pid}/map_files");
+    let start_prefix = format!("{libc_base:x}-");
+    let map_path = std::fs::read_dir(&map_files_dir)
+        .map_err(|e| Error::HookInstallFailed(format!("stage-A: read_dir {map_files_dir}: {e}")))?
+        .filter_map(std::result::Result::ok)
+        .find(|ent| {
+            ent.file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with(&start_prefix))
+        })
+        .ok_or_else(|| {
+            Error::HookInstallFailed(format!(
+                "stage-A: no map_files entry starting at {libc_base:x} in {map_files_dir}"
+            ))
+        })?
+        .path();
+
+    let file = File::open(&map_path).map_err(|e| {
+        Error::HookInstallFailed(format!("stage-A: open {}: {e}", map_path.display()))
+    })?;
 
     let view = seal::elf::parse_libc_elf(&file)
         .map_err(|e| Error::HookInstallFailed(format!("stage-A: parse_libc_elf: {e}")))?;
