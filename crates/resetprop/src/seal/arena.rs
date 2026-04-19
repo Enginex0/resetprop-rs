@@ -22,9 +22,12 @@ pub(crate) const NR_MUNMAP: u64 = 215;
 
 // fcntl/mman constants (asm-generic/fcntl.h, asm-generic/mman-common.h)
 pub(crate) const AT_FDCWD: u64 = -100_i64 as u64; // sign-extended to 64 bits
+pub(crate) const O_RDONLY: u64 = 0;
 pub(crate) const O_RDONLY_NOFOLLOW: u64 = 0x20000;
 pub(crate) const O_RDWR_NOFOLLOW: u64 = 0x20002;
 pub(crate) const PROT_RW: u64 = 0x3;
+pub(crate) const PROT_RX: u64 = 0x5;
+pub(crate) const MAP_PRIVATE: u64 = 0x2;
 pub(crate) const MAP_PRIVATE_FIXED: u64 = 0x12;
 pub(crate) const MAP_SHARED_FIXED: u64 = 0x11;
 pub(crate) const MAP_PRIVATE_ANON: u64 = 0x22;
@@ -659,9 +662,12 @@ mod tests {
 
         // fcntl / mman flags
         assert_eq!(AT_FDCWD, (-100_i64) as u64);
+        assert_eq!(O_RDONLY, 0);
         assert_eq!(O_RDONLY_NOFOLLOW, 0x20000);
         assert_eq!(O_RDWR_NOFOLLOW, 0x20002);
         assert_eq!(PROT_RW, 0x3);
+        assert_eq!(PROT_RX, 0x5);
+        assert_eq!(MAP_PRIVATE, 0x2);
         assert_eq!(MAP_PRIVATE_FIXED, 0x12);
         assert_eq!(MAP_SHARED_FIXED, 0x11);
         assert_eq!(MAP_PRIVATE_ANON, 0x22);

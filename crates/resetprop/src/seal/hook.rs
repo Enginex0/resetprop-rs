@@ -24,10 +24,16 @@
 //! `"stage-B: <step>: <cause>"`) per the P03 checklist FR-18 / FR-19.
 
 use std::fs::File;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::seal;
-use crate::seal::arena::{find_scratch_slot, NR_MMAP, NR_MUNMAP};
+use crate::seal::arena::{
+    find_scratch_slot, AT_FDCWD, MAP_PRIVATE, MAP_PRIVATE_ANON, NR_CLOSE, NR_MMAP, NR_MUNMAP,
+    NR_OPENAT, O_RDONLY, PROT_RW, PROT_RX,
+};
 use crate::seal::maps::MapEntry;
 use crate::seal::ptrace::{
     getregset, ptrace_peektext, ptrace_poketext, read_remote, remote_syscall_via_poke, setregset,
@@ -38,19 +44,25 @@ use crate::seal::ptrace::{
 // Stage-B constants (REGISTRY §1 canonical flag values)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `PROT_READ | PROT_WRITE | PROT_EXEC` — the hook page must be executable
-/// so P04's trampoline can be landed in it, writable so we can stamp the
-/// zero sentinel + future lock-list entries, and readable for load paths.
-const PROT_RWX: u64 = 0x7;
-
-/// `MAP_PRIVATE | MAP_ANONYMOUS` — anonymous RWX page in the tracee.
-const MAP_PRIVATE_ANON: u64 = 0x22;
-
 /// 4 KiB — one base page on AArch64. Mirrors `BOOTSTRAP_PAGE_SIZE` in
 /// `seal::arena` but kept local to keep the stage-B constant block self-
 /// contained. Kept as `u64` because the remote-syscall ABI is 64-bit and
 /// the value flows straight into `remote_syscall_via_poke` args.
 const HOOK_PAGE_SIZE: u64 = 4096;
+
+/// Host directory that receives the stage-B hook body before it is mmap'd
+/// file-backed into init. Auto-labels as `u:object_r:adb_data_file:s0` on
+/// write, which matches init's `adb_data_file:file { execute map }` allow
+/// rule and so avoids the `execmem` denial that anonymous `PROT_READ |
+/// PROT_EXEC` would hit on OEMs stripping `process:execmem` from init.
+const HOOK_FILE_DIR: &str = "/data/adb/resetprop-rs";
+
+/// Byte offset inside `lock_list_page` where the host-written hook file
+/// path is staged before the remote `openat`. Lives past
+/// [`LOCK_LIST_CAPACITY`] = 1024 so the hook body's in-page walker never
+/// observes the staged path bytes; the bytes are abandoned in place after
+/// `openat` returns.
+const PATH_STAGE_OFFSET: u64 = 2048;
 
 /// Upper bound on how much of libc.text is read while hunting for a scratch
 /// slot. Matches `seal::arena::LIBC_SCAN_LIMIT` (64 KiB) so the two stage
@@ -61,31 +73,21 @@ const LIBC_SCAN_LIMIT: usize = 64 * 1024;
 // P04 T3 — hook-page layout and i-cache sync constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Hook page byte offset of the lock-list base (empty-list sentinel NUL byte
-/// lives at offset 0, written by P03 stage-B at `hook.rs:310-312`).
-/// Reference: `P04-tier-b-part2.md §Approach item 4`.
-pub(crate) const LOCK_LIST_OFFSET: u64 = 0;
-
 /// Hook page byte offset where [`build_hook_body_bytes`]'s 140-byte body
-/// lands. Bytes 0..=1023 are reserved for the lock-list region (initial
-/// empty-list sentinel NUL at offset 0, per `LOCK_LIST_OFFSET = 0`); the
-/// hook body occupies bytes 1024..=1163, leaving bytes 1164..=4095 spare.
-///
-/// The 1024-byte list capacity matches the P04 spec's own
-/// "P03 reserved the first 1024 bytes of the 4 KB hook page for the list"
-/// clause in §Approach item 4 (spec's literal `HOOK_BODY_OFFSET = 4` was a
-/// typo in the same paragraph — a 4-byte offset would leave zero capacity
-/// for any lock-list entry before the body, corrupting init's trampoline
-/// target on the first seal). Reference: `P04-tier-b-part2.md §Approach
-/// item 4`.
+/// lands in the file-backed mapping. Held at 1024 rather than 0 to keep
+/// binary compatibility with existing trampoline encoders and tests that
+/// reference the canonical offset; the preceding 1024 bytes of the hook
+/// page are zero-padding.
 pub(crate) const HOOK_BODY_OFFSET: u64 = 1024;
 
-/// Lock-list byte capacity inside the hook page. Bytes 0..=1023 of the
-/// page are reserved for name entries (per `HOOK_BODY_OFFSET = 1024`).
+/// Lock-list byte capacity on `lock_list_page`. Entries live at offsets
+/// `0..LOCK_LIST_CAPACITY`; install-time path staging reuses the same
+/// page at [`PATH_STAGE_OFFSET`] (= 2048), comfortably beyond this
+/// capacity.
+///
 /// [`seal_prop`] refuses to append when the resulting list would exceed
-/// this capacity; exceeding it would clobber the body's first
-/// instruction (word 0 of the 140-byte hook body at `hook_page + 1024`),
-/// crashing init on its next trampoline entry.
+/// this capacity. Staying under the capacity keeps the hook body's
+/// in-page walker bounded away from the staged path bytes.
 ///
 /// Practical envelope: each entry costs `name_len + 1` bytes (name +
 /// NUL separator); the list also ends in a trailing sentinel NUL. At
@@ -142,7 +144,18 @@ pub(crate) const NR_MEMBARRIER: u64 = 283;
 #[allow(dead_code)]
 pub struct HookHandle {
     pub(crate) pid: libc::pid_t,
+    /// File-backed `PROT_READ | PROT_EXEC` page in the tracee holding the
+    /// 140-byte hook body at [`HOOK_BODY_OFFSET`]. Source file is
+    /// [`HOOK_FILE_DIR`]`/hook-<pid>-<nanos>.bin`, unlinked immediately
+    /// after mmap (kernel retains the mapping via the deleted-inode
+    /// mechanism, same as bionic's seccomp filter page).
     pub(crate) hook_page: u64,
+    /// Anonymous `PROT_READ | PROT_WRITE` page in the tracee holding the
+    /// variable-length lock list at offset 0 (up to [`LOCK_LIST_CAPACITY`]
+    /// bytes). Written by [`seal_prop`] / [`unseal_prop`] via
+    /// `process_vm_writev`; read by the hook body via a PC-relative
+    /// literal baked in at install time.
+    pub(crate) lock_list_page: u64,
     pub(crate) lock_list_len: u32,
     pub(crate) target_fn: u64,
     pub(crate) saved_prologue: [u8; 16],
@@ -152,9 +165,10 @@ pub struct HookHandle {
     /// Typestate guard for Drop.
     ///
     /// Flipped to `true` by P04 after the trampoline is live at `target_fn`.
-    /// Once true, Drop MUST NOT unmap `hook_page` — init executes inside
-    /// that page. P04 is responsible for reverting the trampoline and
-    /// unmapping the page explicitly before the handle is dropped.
+    /// Once true, Drop MUST NOT unmap either page — init is executing
+    /// inside `hook_page` and reading the lock list from `lock_list_page`
+    /// on every property update. P04 reverts the trampoline and unmaps
+    /// both pages explicitly before the handle is dropped.
     pub(crate) trampoline_installed: bool,
 }
 
@@ -277,76 +291,79 @@ unsafe fn derive_libc_scratch_pc(pid: libc::pid_t, libc_base: u64, libc_end: u64
 
 /// Install the per-prop hook in the target process.
 ///
-/// All tracee observations — `/proc/<pid>/maps`, the libc ELF parse, the
-/// symbol resolution, the scratch-PC scan, the remote `mmap`, the sentinel
-/// write, and the prologue snapshot — execute inside a single
-/// `RemoteAttach` window so the tracee's address space cannot shift
-/// (APEX hot-swap, Mainline update) between observation and use. The
-/// returned handle owns the remote page via [`HookHandle`]'s `Drop` impl
-/// (best-effort `munmap` via `remote_syscall_via_poke`).
+/// Runs under a single `RemoteAttach` window so the tracee's address
+/// space cannot shift (APEX hot-swap, Mainline update) between
+/// observation and use. The returned handle owns two remote pages
+/// whose lifecycle is tracked by [`HookHandle::drop`].
+///
+/// # Page layout
+///
+/// * `lock_list_page` — anonymous `PROT_READ | PROT_WRITE`. Holds the
+///   runtime lock list at offset 0 (up to [`LOCK_LIST_CAPACITY`] bytes)
+///   and temporarily stages the hook file path at [`PATH_STAGE_OFFSET`]
+///   during this install only.
+/// * `hook_page` — file-backed `PROT_READ | PROT_EXEC`, sourced from
+///   [`HOOK_FILE_DIR`]`/hook-<pid>-<nanos>.bin` (written and unlinked
+///   within this function). Contains the 140-byte hook body at
+///   [`HOOK_BODY_OFFSET`]; zero padding elsewhere.
+///
+/// The file-backed page is what lets stage-B run on OEMs that strip
+/// `process:execmem` from init's SELinux domain: init keeps the
+/// `adb_data_file:file { execute map }` allow rule regardless, so a
+/// file written under [`HOOK_FILE_DIR`] (auto-labels as
+/// `adb_data_file`) is mmap'able `PROT_R|X` inside init without an
+/// SELinux denial. The host file is unlinked immediately after mmap;
+/// the kernel retains the mapping via the deleted-inode mechanism.
 ///
 /// # Error cleanup
 ///
-/// Failures after the `mmap` succeeds trigger a best-effort remote
-/// `munmap` of `hook_page` before the error propagates, so the tracee
-/// does not leak a 4 KiB RWX page on cold-path errors. The cleanup runs
-/// under the same attach window that installed the page.
+/// Any error after `lock_list_page` is mapped issues a best-effort
+/// remote `munmap` of `lock_list_page` under the same attach window,
+/// so the tracee does not leak a 4 KiB page on cold paths. Host file
+/// cleanup happens inside the file-backed installer regardless of
+/// outcome.
 ///
 /// # Latency
 ///
-/// The entire install runs inside a single `RemoteAttach` window with
-/// init ptrace-stopped. Observed wall-clock on a modern ARM64 handset
-/// (Snapdragon-class SoC, bionic libc.so ~1.2 MiB, ~5000 `.dynsym`
-/// entries): 15-40 ms for `/proc/<pid>/maps` parse + libc ELF parse +
-/// GNU_HASH walk + remote `mmap` + 16-byte prologue snapshot. Any
-/// thread that blocks on init for a property write during this
-/// window waits out the full stall — zygote, system_server, and
-/// init-launched daemons included. Accepted for the
-/// operator-initiated one-shot seal use case; see
-/// `P04-tier-b-part2.md §Operational Envelope` for the amortisation
-/// paths if a future phase needs a shorter attach window.
+/// The install runs inside one `RemoteAttach` window. Observed
+/// wall-clock on a modern ARM64 handset (Snapdragon-class SoC, bionic
+/// libc.so ~1.2 MiB, ~5000 `.dynsym` entries): 20-50 ms for the full
+/// sequence — `/proc/<pid>/maps` + libc ELF parse + GNU_HASH walk +
+/// lock-list mmap + prologue snapshot + host file write + remote
+/// openat / mmap / close + unlink. Any thread that blocks on init
+/// for a property write during this window waits out the full stall.
 pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
     let guard = seal::arena::RemoteAttach::new(pid)
         .map_err(|e| Error::HookInstallFailed(format!("stage-B: attach: {e}")))?;
 
-    // C1 fix: stage-A runs INSIDE the attach window — no TOCTOU gap.
     let (libc_base, libc_end, target_fn) = stage_a_locked(pid)?;
 
-    // SAFETY: `guard` holds the tracee ptrace-stopped for this block;
-    // `libc_base..libc_end` is the `r-xp` libc row just returned by
-    // stage-A on the same process. `remote_syscall_via_poke`'s contract
-    // is satisfied by the resulting scratch PC (8-byte-aligned, inside
-    // an executable mapping, guarded against concurrent threads by the
-    // seize).
+    // SAFETY: `guard` holds the tracee ptrace-stopped; `libc_base..libc_end`
+    // is the `r-xp` row just returned by stage-A on the same process.
     let scratch_pc = unsafe { derive_libc_scratch_pc(pid, libc_base, libc_end) }?;
 
-    let hook_page = remote_mmap_hook_page(pid, scratch_pc)?;
+    let lock_list_page = remote_mmap_anon_rw_page(pid, scratch_pc)?;
 
-    // M6 fix: any error past this point leaks `hook_page` unless we
-    // explicitly unmap. Wrap the remaining stage-B steps in a closure
-    // and, on error, issue a best-effort remote munmap before
-    // propagating — the tracee is still ptrace-stopped via `guard`.
-    let saved_prologue = match finish_stage_b_locked(pid, hook_page, target_fn) {
-        Ok(p) => p,
-        Err(e) => {
-            // SAFETY: tracee still ptrace-stopped via `guard`; munmap
-            // is legal in this window. We discard the result because
-            // best-effort cleanup must not mask the original error.
-            let _ = unsafe {
-                remote_syscall_via_poke(
-                    pid,
-                    scratch_pc,
-                    NR_MUNMAP,
-                    [hook_page, HOOK_PAGE_SIZE, 0, 0, 0, 0],
-                )
-            };
-            return Err(e);
-        }
-    };
+    let saved_prologue =
+        match write_sentinel_and_snapshot_prologue(pid, lock_list_page, target_fn) {
+            Ok(p) => p,
+            Err(e) => {
+                best_effort_remote_munmap(pid, scratch_pc, lock_list_page);
+                return Err(e);
+            }
+        };
 
-    // Explicit detach — reads cleaner than leaving it to Drop, and surfaces
-    // any detach failure at the install site rather than swallowing it in
-    // `RemoteAttach::drop`.
+    let body_bytes = build_hook_body_bytes(saved_prologue, lock_list_page, target_fn + 16);
+
+    let hook_page =
+        match install_file_backed_hook_page(pid, scratch_pc, lock_list_page, &body_bytes) {
+            Ok(addr) => addr,
+            Err(e) => {
+                best_effort_remote_munmap(pid, scratch_pc, lock_list_page);
+                return Err(e);
+            }
+        };
+
     guard
         .detach()
         .map_err(|e| Error::HookInstallFailed(format!("stage-B: detach: {e}")))?;
@@ -354,6 +371,7 @@ pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
     Ok(HookHandle {
         pid,
         hook_page,
+        lock_list_page,
         lock_list_len: 0,
         target_fn,
         saved_prologue,
@@ -364,96 +382,254 @@ pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
     })
 }
 
-/// Issue the remote `mmap` for `hook_page` and decode its return.
-///
-/// Linux returns `-errno` in `[-4095, -1]` and a valid address otherwise
-/// (linux-arm64-abi.md §11). Any value in the errno window fails the
-/// install regardless of sign bit.
-fn remote_mmap_hook_page(pid: libc::pid_t, scratch_pc: u64) -> Result<u64> {
-    // SAFETY: see `derive_libc_scratch_pc` for the scratch-PC invariants;
-    // `remote_syscall_via_poke` saves / restores both the 8-byte scratch
-    // word and the saved-regs snapshot before returning (ptrace.rs:669-705),
-    // so no outer restore wrapper is required here.
+/// Allocate a fresh 4 KiB `PROT_READ | PROT_WRITE` anonymous page in the
+/// tracee. Used for both the runtime lock list and as the staging buffer
+/// for the hook file path during install.
+fn remote_mmap_anon_rw_page(pid: libc::pid_t, scratch_pc: u64) -> Result<u64> {
+    // SAFETY: scratch_pc is validated by `derive_libc_scratch_pc`;
+    // `remote_syscall_via_poke` saves / restores scratch word + regs.
     let ret = unsafe {
         remote_syscall_via_poke(
             pid,
             scratch_pc,
             NR_MMAP,
-            [0, HOOK_PAGE_SIZE, PROT_RWX, MAP_PRIVATE_ANON, u64::MAX, 0],
+            [0, HOOK_PAGE_SIZE, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0],
         )
     }
-    .map_err(|e| Error::HookInstallFailed(format!("stage-B: mmap: {e}")))?;
+    .map_err(|e| Error::HookInstallFailed(format!("stage-B: mmap anon RW: {e}")))?;
 
     if (-4095..=-1).contains(&ret) {
         return Err(Error::HookInstallFailed(format!(
-            "stage-B: mmap returned -errno={}",
+            "stage-B: mmap anon RW returned -errno={}",
             -ret
         )));
     }
     Ok(ret as u64)
 }
 
-/// Finish stage-B after a successful `mmap`: write the zero sentinel on
-/// `hook_page` and snapshot the 16-byte prologue at `target_fn`.
-///
-/// Runs under the caller's `RemoteAttach`. Returning `Err` is the trigger
-/// for the caller's best-effort remote `munmap` cleanup path (M6 fix).
-fn finish_stage_b_locked(pid: libc::pid_t, hook_page: u64, target_fn: u64) -> Result<[u8; 16]> {
-    // Write the 4-byte zero sentinel (lock-list length = 0). The hook
-    // page is PROT_READ | WRITE | EXEC per the mmap args, so
-    // `process_vm_writev` inside `write_remote` respects the W bit
-    // without needing a POKE transport.
-    //
-    // SAFETY: `hook_page` was just returned by a successful `mmap` in the
-    // tracee; tracee remains ptrace-stopped via the caller's guard.
-    let sentinel = [0u8; 4];
-    unsafe { write_remote(pid, hook_page, &sentinel) }
+/// Write the 4-byte empty-list sentinel to `lock_list_page + 0` and
+/// snapshot the 16-byte prologue at `target_fn`.
+fn write_sentinel_and_snapshot_prologue(
+    pid: libc::pid_t,
+    lock_list_page: u64,
+    target_fn: u64,
+) -> Result<[u8; 16]> {
+    // SAFETY: `lock_list_page` is the fresh PROT_RW page; tracee stopped.
+    unsafe { write_remote(pid, lock_list_page, &[0u8; 4]) }
         .map_err(|e| Error::HookInstallFailed(format!("stage-B: write sentinel: {e}")))?;
 
-    // Snapshot the 16-byte prologue at `target_fn`. P04's trampoline
-    // encoder overwrites exactly this window, so preserving the originals
-    // lets us revert (or, later, single-step-over) the hook cleanly.
-    //
-    // SAFETY: `target_fn` points inside libc.text `r-xp`; `read_remote`
-    // uses `process_vm_readv` which needs only the R bit.
+    // SAFETY: `target_fn` is inside libc.text r-xp; read_remote needs R only.
     let mut saved_prologue = [0u8; 16];
     unsafe { read_remote(pid, target_fn, &mut saved_prologue) }
         .map_err(|e| Error::HookInstallFailed(format!("stage-B: read prologue: {e}")))?;
-
     Ok(saved_prologue)
 }
 
+/// Materialise the hook body as a file-backed `PROT_READ | PROT_EXEC`
+/// mapping in the tracee, using `stage_page + PATH_STAGE_OFFSET` as a
+/// scratch buffer for the `openat` pathname.
+///
+/// Host file is always removed before this returns (success or failure);
+/// init retains the successful mapping via the deleted-inode mechanism.
+fn install_file_backed_hook_page(
+    pid: libc::pid_t,
+    scratch_pc: u64,
+    stage_page: u64,
+    body_bytes: &[u8],
+) -> Result<u64> {
+    let host_path = write_host_hook_file(pid, body_bytes)?;
+    let result = mmap_file_backed_in_tracee(pid, scratch_pc, stage_page, &host_path);
+    let _ = std::fs::remove_file(&host_path);
+    result
+}
+
+/// Write the 4 KiB hook page image to disk under [`HOOK_FILE_DIR`].
+///
+/// File layout: zero-padded 4 KiB, with `body_bytes` placed at
+/// [`HOOK_BODY_OFFSET`]. Auto-labels as `adb_data_file` so init can
+/// open + mmap `PROT_R|X` without an SELinux denial.
+fn write_host_hook_file(pid: libc::pid_t, body_bytes: &[u8]) -> Result<PathBuf> {
+    let dir = Path::new(HOOK_FILE_DIR);
+    std::fs::create_dir_all(dir).map_err(|e| {
+        Error::HookInstallFailed(format!("stage-B: mkdir_p {}: {e}", dir.display()))
+    })?;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: clock skew: {e}")))?
+        .as_nanos();
+
+    let host_path = dir.join(format!("hook-{pid}-{nanos}.bin"));
+    let file_bytes = layout_hook_page_bytes(body_bytes)?;
+    std::fs::write(&host_path, &file_bytes).map_err(|e| {
+        Error::HookInstallFailed(format!("stage-B: write {}: {e}", host_path.display()))
+    })?;
+    Ok(host_path)
+}
+
+/// Pure helper: assemble a 4 KiB page image with `body_bytes` placed at
+/// [`HOOK_BODY_OFFSET`], zero-padded elsewhere. Errors if the body
+/// would overflow the page.
+fn layout_hook_page_bytes(body_bytes: &[u8]) -> Result<Vec<u8>> {
+    let body_start = HOOK_BODY_OFFSET as usize;
+    let body_end = body_start.checked_add(body_bytes.len()).ok_or_else(|| {
+        Error::HookInstallFailed("stage-B: hook body offset overflow".into())
+    })?;
+    if body_end > HOOK_PAGE_SIZE as usize {
+        return Err(Error::HookInstallFailed(format!(
+            "stage-B: hook body ({} bytes) exceeds page capacity at offset {}",
+            body_bytes.len(),
+            HOOK_BODY_OFFSET
+        )));
+    }
+    let mut bytes = vec![0u8; HOOK_PAGE_SIZE as usize];
+    bytes[body_start..body_end].copy_from_slice(body_bytes);
+    Ok(bytes)
+}
+
+/// Open the host file inside the tracee, map it `PROT_R|X`, and close
+/// the fd. Caller unlinks the host file.
+fn mmap_file_backed_in_tracee(
+    pid: libc::pid_t,
+    scratch_pc: u64,
+    stage_page: u64,
+    host_path: &Path,
+) -> Result<u64> {
+    stage_path_in_tracee(pid, stage_page, host_path)?;
+    let path_vaddr = stage_page + PATH_STAGE_OFFSET;
+
+    let fd = remote_openat_rdonly(pid, scratch_pc, path_vaddr)?;
+    let mmap_result = remote_mmap_file_backed_rx(pid, scratch_pc, fd);
+
+    // SAFETY: best-effort close; tracee still stopped. Close errors are
+    // diagnostic-only because the fd leaks to init's fd table at worst,
+    // which self-reclaims on next exec.
+    let _ = unsafe {
+        remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
+    };
+    mmap_result
+}
+
+/// POKE the NUL-terminated host path into the tracee at
+/// `stage_page + PATH_STAGE_OFFSET`.
+fn stage_path_in_tracee(pid: libc::pid_t, stage_page: u64, host_path: &Path) -> Result<()> {
+    let path_bytes = host_path.as_os_str().as_bytes();
+    let max_bytes = HOOK_PAGE_SIZE
+        .saturating_sub(PATH_STAGE_OFFSET)
+        .saturating_sub(1);
+    if (path_bytes.len() as u64) > max_bytes {
+        return Err(Error::HookInstallFailed(format!(
+            "stage-B: host path too long for stage slot ({} bytes, max {})",
+            path_bytes.len(),
+            max_bytes
+        )));
+    }
+    let mut nul_path = Vec::with_capacity(path_bytes.len() + 1);
+    nul_path.extend_from_slice(path_bytes);
+    nul_path.push(0);
+    // SAFETY: `stage_page` is the fresh PROT_RW anon page; tracee stopped.
+    unsafe { write_remote(pid, stage_page + PATH_STAGE_OFFSET, &nul_path) }
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: stage path: {e}")))
+}
+
+/// `openat(AT_FDCWD, path_vaddr, O_RDONLY, 0)` in the tracee.
+fn remote_openat_rdonly(pid: libc::pid_t, scratch_pc: u64, path_vaddr: u64) -> Result<u64> {
+    // SAFETY: scratch_pc invariants as in `remote_mmap_anon_rw_page`.
+    let ret = unsafe {
+        remote_syscall_via_poke(
+            pid,
+            scratch_pc,
+            NR_OPENAT,
+            [AT_FDCWD, path_vaddr, O_RDONLY, 0, 0, 0],
+        )
+    }
+    .map_err(|e| Error::HookInstallFailed(format!("stage-B: openat: {e}")))?;
+
+    if ret < 0 {
+        return Err(Error::HookInstallFailed(format!(
+            "stage-B: openat returned -errno={}",
+            -ret
+        )));
+    }
+    Ok(ret as u64)
+}
+
+/// `mmap(NULL, 4096, PROT_R|X, MAP_PRIVATE, fd, 0)` in the tracee.
+fn remote_mmap_file_backed_rx(pid: libc::pid_t, scratch_pc: u64, fd: u64) -> Result<u64> {
+    // SAFETY: scratch_pc invariants as in `remote_mmap_anon_rw_page`.
+    let ret = unsafe {
+        remote_syscall_via_poke(
+            pid,
+            scratch_pc,
+            NR_MMAP,
+            [0, HOOK_PAGE_SIZE, PROT_RX, MAP_PRIVATE, fd, 0],
+        )
+    }
+    .map_err(|e| Error::HookInstallFailed(format!("stage-B: mmap file-backed: {e}")))?;
+
+    if (-4095..=-1).contains(&ret) {
+        return Err(Error::HookInstallFailed(format!(
+            "stage-B: mmap file-backed returned -errno={}",
+            -ret
+        )));
+    }
+    Ok(ret as u64)
+}
+
+/// Best-effort remote `munmap` for cleanup paths. Errors are swallowed.
+fn best_effort_remote_munmap(pid: libc::pid_t, scratch_pc: u64, addr: u64) {
+    // SAFETY: caller holds the tracee ptrace-stopped.
+    let _ = unsafe {
+        remote_syscall_via_poke(
+            pid,
+            scratch_pc,
+            NR_MUNMAP,
+            [addr, HOOK_PAGE_SIZE, 0, 0, 0, 0],
+        )
+    };
+}
+
 impl HookHandle {
-    /// Best-effort remote `munmap` of the hook page during `Drop`.
+    /// Best-effort remote `munmap` of both pages during `Drop`.
     ///
     /// Reuses `self.scratch_pc` (cached at install time) instead of
-    /// re-parsing `/proc/<pid>/maps` and re-scanning libc.text. This
-    /// removes the Drop-time TOCTOU window: even if libc was hot-swapped
-    /// between install and drop, we do not re-derive into a different
-    /// VMA. The remaining stale-scratch edge case (hot-swap AFTER
-    /// install so the old PC is no longer executable) surfaces as
-    /// EFAULT/ESRCH from `remote_syscall_via_poke`, which the caller
-    /// swallows under best-effort semantics. Drop is inherently
-    /// fallible; this is an acceptable failure mode.
+    /// re-parsing `/proc/<pid>/maps`, so Drop cannot be thrown off by
+    /// a post-install libc hot-swap into a new VMA. The remaining
+    /// stale-scratch edge case (libc hot-swap AFTER install so the old
+    /// PC is no longer executable) surfaces as EFAULT/ESRCH from
+    /// `remote_syscall_via_poke`, which the caller swallows under
+    /// best-effort semantics.
+    ///
+    /// Both munmaps run under a single `RemoteAttach`. If the first
+    /// munmap errors the second still executes, so a failing
+    /// `lock_list_page` unmap does not leak `hook_page`.
     fn drop_best_effort(&self) -> Result<()> {
         let guard = seal::arena::RemoteAttach::new(self.pid)?;
 
-        // SAFETY: `guard` holds the tracee ptrace-stopped.
-        // `self.scratch_pc` was validated at install time as an
-        // 8-byte-aligned offset inside the tracee's `r-xp` libc
-        // mapping; `remote_syscall_via_poke` bypasses VMA write bits
-        // via PEEK/POKEDATA. `self.hook_page` was returned by
-        // stage-B's mmap and is the only argument threaded into munmap.
-        unsafe {
+        // SAFETY: `guard` holds the tracee ptrace-stopped; `scratch_pc` is
+        // the cached install-time libc.text slot; both pages were returned
+        // by successful remote mmaps inside `install_init_hook`.
+        let list_ret = unsafe {
+            remote_syscall_via_poke(
+                self.pid,
+                self.scratch_pc,
+                NR_MUNMAP,
+                [self.lock_list_page, HOOK_PAGE_SIZE, 0, 0, 0, 0],
+            )
+        };
+        // SAFETY: same invariants as above.
+        let hook_ret = unsafe {
             remote_syscall_via_poke(
                 self.pid,
                 self.scratch_pc,
                 NR_MUNMAP,
                 [self.hook_page, HOOK_PAGE_SIZE, 0, 0, 0, 0],
-            )?;
-        }
+            )
+        };
 
         guard.detach()?;
+        list_ret?;
+        hook_ret?;
         Ok(())
     }
 }
@@ -462,17 +638,21 @@ impl Drop for HookHandle {
     fn drop(&mut self) {
         // Typestate guards (M5):
         //
-        // * `hook_page == 0` — stage-B never completed, nothing to unmap.
-        //   Covers the checklist edge case "Drop fires before stage-B
-        //   completes".
-        // * `trampoline_installed` — P04 has patched the prologue and
-        //   init is executing inside `hook_page`. Unmapping here would
-        //   crash init. P04 is responsible for reverting the trampoline
-        //   and unmapping the page explicitly before the handle drops.
+        // * `trampoline_installed` — init is executing inside `hook_page`
+        //   and reading the lock list from `lock_list_page` on every
+        //   property update. Unmapping either page would crash init. P04
+        //   reverts the trampoline and unmaps both pages explicitly
+        //   before the handle is dropped.
+        // * Either page == 0 — stage-B never produced a fully constructed
+        //   handle (test factory or abandoned error path). Nothing to
+        //   unmap in the tracee.
         //
         // Errors from the best-effort path are swallowed: Drop cannot
         // propagate, and panicking here would abort on unwind.
-        if self.hook_page == 0 || self.trampoline_installed {
+        if self.trampoline_installed {
+            return;
+        }
+        if self.hook_page == 0 || self.lock_list_page == 0 {
             return;
         }
         let _ = self.drop_best_effort();
@@ -922,34 +1102,22 @@ fn revert_trampoline(pid: libc::pid_t, target_fn: u64, saved_prologue: &[u8; 16]
 /// before the error propagates, so the tracee is not left running a
 /// half-written trampoline.
 pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
-    // Step 1: compute addresses.
-    let lock_list_vaddr = handle.hook_page + LOCK_LIST_OFFSET;
+    // Step 1: compute the trampoline's branch target. The 140-byte hook body
+    // already lives at `hook_page + HOOK_BODY_OFFSET` — `install_init_hook`
+    // materialised it as a file-backed PROT_R|X mapping, so no runtime
+    // body write is required here.
     let hook_body_vaddr = handle.hook_page + HOOK_BODY_OFFSET;
-    let resume_addr = handle.target_fn + 16;
 
-    // Step 2: pure helper emits the 140-byte hook body.
-    let body_bytes = build_hook_body_bytes(handle.saved_prologue, lock_list_vaddr, resume_addr);
-
-    // Step 3: acquire attach RAII guard.
+    // Step 2: acquire attach RAII guard.
     let attach = seal::arena::RemoteAttach::new(handle.pid)
         .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: attach: {e}")))?;
 
-    // Steps 4-7 run under the attach. A failure in any of 5-7 must revert
-    // the trampoline write before the error unwinds. Using a closure lets
-    // `?` propagate cleanly while a trailing `match` runs the cleanup.
+    // Steps 3-5 run under the attach. A failure after the trampoline write
+    // has begun must revert the trampoline before the error unwinds. Using
+    // a closure lets `?` propagate cleanly while a trailing `match` runs
+    // the cleanup.
     let trampoline_result = (|| -> Result<()> {
-        // Step 4: write hook body to the fresh PROT_RWX hook page.
-        //
-        // SAFETY: `handle.hook_page` is the fresh PROT_READ|WRITE|EXEC page
-        // that P03 stage-B mmap'd via `remote_syscall_via_poke`
-        // (`hook.rs:269-291`); the W bit is set so `process_vm_writev`
-        // inside `write_remote` succeeds. The tracee is ptrace-stopped via
-        // `attach`.
-        unsafe { write_remote(handle.pid, hook_body_vaddr, &body_bytes) }.map_err(|e| {
-            Error::HookInstallFailed(format!("install_trampoline: write body: {e}"))
-        })?;
-
-        // Step 5: write the 16-byte trampoline at `target_fn`.
+        // Step 3: write the 16-byte trampoline at `target_fn`.
         //
         // `target_fn` lives inside libc.text `r-xp`, so `process_vm_writev`
         // EFAULTs. `PTRACE_POKEDATA` bypasses VMA write bits via
@@ -965,7 +1133,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
             Error::HookInstallFailed(format!("install_trampoline: poke tramp hi: {e}"))
         })?;
 
-        // Step 6: i-cache sync via remote membarrier — REGISTER then SYNC_CORE.
+        // Step 4: i-cache sync via remote membarrier — REGISTER then SYNC_CORE.
         //
         // SYNC_CORE (0x80) returns -EPERM unconditionally until the calling
         // task has registered intent via REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
@@ -978,7 +1146,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
         // Reference: references/arm64-a64-encoding.md line 422.
         //
         // SAFETY: `handle.scratch_pc` is the 8-byte-aligned slot inside
-        // libc.text cached at P03 install time (`hook.rs:218`); the tracee
+        // libc.text cached at install time by `derive_libc_scratch_pc`; the tracee
         // is ptrace-stopped via `attach`; `remote_syscall_via_poke` saves
         // and restores both the scratch word and the saved-regs snapshot
         // internally before returning.
@@ -1012,7 +1180,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
             )));
         }
 
-        // Step 7: issue SYNC_CORE. Post-register, -EPERM is no longer the
+        // Step 5: issue SYNC_CORE. Post-register, -EPERM is no longer the
         // expected "not registered" result, so any non-zero return other
         // than -EINVAL (which still indicates missing kernel support for
         // the cmd) is treated as a hard failure.
@@ -1048,15 +1216,14 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
         return Err(e);
     }
 
-    // Step 8: flip typestate so Drop skips the munmap.
+    // Step 6: flip typestate so Drop skips the munmap.
     handle.trampoline_installed = true;
 
-    // Step 9: explicit detach surfaces any failure here at the install site.
+    // Step 7: explicit detach surfaces any failure here at the install site.
     attach
         .detach()
         .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: detach: {e}")))?;
 
-    // Step 10.
     Ok(())
 }
 
@@ -1161,11 +1328,12 @@ pub fn seal_prop(handle: &mut HookHandle, name: &str) -> Result<()> {
 
     let mut buffer = vec![0u8; LOCK_LIST_CAPACITY as usize];
 
-    // SAFETY: `handle.hook_page` was allocated PROT_RWX by P03 stage-B
-    // and is still mapped in the tracee; `LOCK_LIST_CAPACITY` bytes at
-    // offset 0 lie inside the 4 KiB page. Tracee is ptrace-stopped via
-    // `attach`, so no concurrent mutation races the read.
-    unsafe { read_remote(handle.pid, handle.hook_page, &mut buffer) }
+    // SAFETY: `handle.lock_list_page` was allocated PROT_RW anonymous by
+    // `install_init_hook` and is still mapped in the tracee;
+    // `LOCK_LIST_CAPACITY` bytes at offset 0 lie inside the 4 KiB page.
+    // Tracee is ptrace-stopped via `attach`, so no concurrent mutation
+    // races the read.
+    unsafe { read_remote(handle.pid, handle.lock_list_page, &mut buffer) }
         .map_err(|e| Error::HookInstallFailed(format!("seal_prop: read_remote: {e}")))?;
 
     let new_len = lock_list_append_bytes(
@@ -1192,7 +1360,7 @@ pub fn seal_prop(handle: &mut HookHandle, name: &str) -> Result<()> {
     unsafe {
         write_remote(
             handle.pid,
-            handle.hook_page + write_start as u64,
+            handle.lock_list_page + write_start as u64,
             &buffer[write_start..write_end],
         )
     }
@@ -1229,7 +1397,7 @@ pub fn unseal_prop(handle: &mut HookHandle, name: &str) -> Result<bool> {
 
     // SAFETY: see `seal_prop`'s read SAFETY block — same page and attach
     // invariants apply.
-    unsafe { read_remote(handle.pid, handle.hook_page, &mut buffer) }
+    unsafe { read_remote(handle.pid, handle.lock_list_page, &mut buffer) }
         .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: read_remote: {e}")))?;
 
     let new_len = match lock_list_remove_bytes(&mut buffer, handle.lock_list_len, name.as_bytes()) {
@@ -1249,7 +1417,7 @@ pub fn unseal_prop(handle: &mut HookHandle, name: &str) -> Result<bool> {
     // pushes both the compacted payload and the zeroed stale tail back to
     // the tracee, so the hook body never sees leftover bytes past the new
     // sentinel.
-    unsafe { write_remote(handle.pid, handle.hook_page, &buffer[0..write_end]) }
+    unsafe { write_remote(handle.pid, handle.lock_list_page, &buffer[0..write_end]) }
         .map_err(|e| Error::HookInstallFailed(format!("unseal_prop: write_remote: {e}")))?;
 
     // Counter-before-detach: mirrors the `seal_prop` invariant — the
@@ -1287,6 +1455,7 @@ mod tests {
         let h = HookHandle {
             pid: 42,
             hook_page: 0xdeadbeef_cafebabe,
+            lock_list_page: 0xfacefeed_12345678,
             lock_list_len: 7,
             target_fn: 0x1234_5678_9abc_def0,
             saved_prologue: [0xAB; 16],
@@ -1297,6 +1466,7 @@ mod tests {
         };
         assert_eq!(h.pid, 42);
         assert_eq!(h.hook_page, 0xdeadbeef_cafebabe);
+        assert_eq!(h.lock_list_page, 0xfacefeed_12345678);
         assert_eq!(h.lock_list_len, 7);
         assert_eq!(h.target_fn, 0x1234_5678_9abc_def0);
         assert_eq!(h.saved_prologue, [0xAB; 16]);
@@ -1732,12 +1902,13 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     /// Builds a dummy `HookHandle` for NUL-rejection paths that never reach
-    /// ptrace. `hook_page == 0` short-circuits [`HookHandle::drop`] so no
-    /// spurious remote work fires at end of scope.
+    /// ptrace. Both `hook_page == 0` and `lock_list_page == 0` short-circuit
+    /// [`HookHandle::drop`] so no spurious remote work fires at end of scope.
     fn dummy_handle_for_pre_attach_reject() -> HookHandle {
         HookHandle {
             pid: 0,
             hook_page: 0,
+            lock_list_page: 0,
             lock_list_len: 0,
             target_fn: 0,
             saved_prologue: [0u8; 16],
