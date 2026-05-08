@@ -560,7 +560,9 @@ mod tests {
 
         let serial_after = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
         let counter_after = serial_after & 0x00FE_FFFE;
-        assert_eq!(counter_after, 0, "counter bumped by stealth_write_value");
+        // Bionic compose: (((0|1)+1) & 0xFFFFFF) = 2. Counter zero would be
+        // a propdetect leak (non-init-prefix + counter=0 + value="0").
+        assert_eq!(counter_after, 2, "counter must bionic-bump from 0 to 2");
 
         let length_byte = (serial_after >> 24) & 0xFF;
         assert_eq!(length_byte, 1, "length byte should be 1 for value '0'");
@@ -744,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn set_stealth_zeroed_serial() {
+    fn set_stealth_bionic_serial() {
         let mock = MockArea::new();
         let area = mock.open();
 
@@ -753,13 +755,15 @@ mod tests {
 
         let (pi_off, _) = crate::trie::find(&area, "ro.test.prop").unwrap();
         let serial_before = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
-        let counter_before = serial_before & 0x00FE_FFFE;
-        assert_ne!(counter_before, 0, "counter should be non-zero after overwrite");
+        let counter_before = serial_before & 0x00FFFFFF;
+        assert_eq!(counter_before, 2, "counter after two writes via write_value: 0 -> 2");
 
         area.set_stealth("ro.test.prop", "world").unwrap();
 
+        // Bionic compose advances 2 -> 4: (((2|1)+1) & 0xFFFFFF) = 4
         let serial_after = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(serial_after, 5u32 << 24, "serial should be (5<<24) for 'world' with zeroed counter");
+        let expected = (5u32 << 24) | 4;
+        assert_eq!(serial_after, expected, "stealth must bionic-bump counter, not zero it");
         assert_eq!(area.get("ro.test.prop").unwrap(), "world");
     }
 
