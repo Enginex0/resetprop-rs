@@ -20,6 +20,7 @@ fn run() -> Result<(), String> {
     let mut persist = false;
     let mut persist_read = false;
     let mut stealth = false;
+    let mut quiet = false;
     let mut compact = false;
     let mut dir: Option<String> = None;
     let mut delete: Option<String> = None;
@@ -43,7 +44,7 @@ fn run() -> Result<(), String> {
             "--init" => init = true,
             "-p" => persist = true,
             "-P" => persist_read = true,
-            "-n" => {}
+            "-n" => quiet = true,
             "-d" | "--delete" => {
                 i += 1;
                 delete = Some(arg_val(&args, i, "-d")?);
@@ -74,7 +75,7 @@ fn run() -> Result<(), String> {
                 unseal_arena = Some(arg_val(&args, i, "--unseal-arena")?);
             }
             "--seals" => list_seals = true,
-            "--compact" => compact = true,
+            "-c" | "--compact" => compact = true,
             "--dir" => {
                 i += 1;
                 dir = Some(arg_val(&args, i, "--dir")?);
@@ -83,7 +84,7 @@ fn run() -> Result<(), String> {
                 i += 1;
                 file = Some(arg_val(&args, i, "-f")?);
             }
-            "--wait" => {
+            "-w" | "--wait" => {
                 i += 1;
                 wait_name = Some(arg_val(&args, i, "--wait")?);
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
@@ -254,6 +255,8 @@ fn run() -> Result<(), String> {
                 sys.set_stealth(&positional[0], &positional[1])
             } else if init {
                 sys.set_init(&positional[0], &positional[1])
+            } else if quiet {
+                sys.set_quiet(&positional[0], &positional[1])
             } else {
                 sys.set(&positional[0], &positional[1])
             }
@@ -267,6 +270,8 @@ fn run() -> Result<(), String> {
                     "(stealth)"
                 } else if init {
                     "(init)"
+                } else if quiet {
+                    "(quiet)"
                 } else {
                     ""
                 };
@@ -358,8 +363,9 @@ fn print_usage() {
 Usage:
   resetprop                          List all properties
   resetprop NAME                     Get property value
-  resetprop [-n] NAME VALUE          Set property (direct mmap)
-  resetprop --init NAME VALUE        Set property with zeroed serial counter
+  resetprop NAME VALUE               Set property (triggers listeners)
+  resetprop -n NAME VALUE            Set property without triggering listeners (no serial bump, no futex wake)
+  resetprop --init NAME VALUE        Set property with bionic-correct serial (init-style)
   resetprop -p NAME VALUE            Set in both prop_area and persist file
   resetprop -d NAME                  Delete property
   resetprop -p -d NAME               Delete from both prop_area and persist file
@@ -384,8 +390,9 @@ Usage:
 Options:
   -p          Persist mode (write to both prop_area and disk)
   -P          Disk-only read (read from persist file, not prop_area)
-  --init      Zero the serial counter (mimics init for ro.* props)
-  --stealth, -st  Suppress serial bump and futex wake (init-time appearance)
+  -n          Quiet write: preserve serial, no futex wake, no global notify
+  --init      Bionic-correct compose, init-style allocation path
+  --stealth, -st  Stealth write: bionic compose, no futex wake, no global notify
   --seal, -sl     Tier B seal: stealth write + per-prop hook on __system_property_update in init
   --seal-arena, -sla  Tier A seal: stealth write + remap init's arena as MAP_PRIVATE|MAP_FIXED
   --unseal NAME   Remove NAME from the in-init Tier B lock list

@@ -16,6 +16,7 @@ pub enum Error {
     PtraceOp(std::io::Error),
     PtraceUnexpectedStatus(i32),
     PtraceScope,
+    PtraceTracerBusy { tracer_pid: libc::pid_t },
     ArenaAlreadySealed(PathBuf),
     ArenaNotMapped(PathBuf),
     ElfParse(String),
@@ -45,6 +46,10 @@ impl fmt::Display for Error {
             Self::PtraceScope => write!(
                 f,
                 "ptrace blocked by /proc/sys/kernel/yama/ptrace_scope; root required or echo 0 into the file"
+            ),
+            Self::PtraceTracerBusy { tracer_pid } => write!(
+                f,
+                "ptrace target already traced by pid {tracer_pid}; pause that module and retry"
             ),
             Self::ArenaAlreadySealed(p) => write!(f, "arena already sealed: {}", p.display()),
             Self::ArenaNotMapped(p) => write!(f, "arena not mapped in target process: {}", p.display()),

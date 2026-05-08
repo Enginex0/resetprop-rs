@@ -92,6 +92,21 @@ impl PropArea {
         }
     }
 
+    /// Quiet write: preserves the per-prop serial counter, suppresses futex wake.
+    /// For an existing prop, only the value bytes and length-byte change; counter
+    /// stays exactly where init left it. Missing props go through the standard
+    /// `add` path (bionic-baseline serial).
+    pub fn set_quiet(&self, name: &str, value: &str) -> Result<()> {
+        match trie::find(self, name) {
+            Ok((pi_offset, _)) => {
+                let pi = info::PropInfo::at(self, pi_offset)?;
+                pi.write_value_quiet_preserve_serial(value)
+            }
+            Err(Error::NotFound) => self.add(name, value),
+            Err(e) => Err(e),
+        }
+    }
+
     fn validate_key(name: &str) -> Result<()> {
         if name.is_empty() || name.starts_with('.') || name.ends_with('.') || name.contains("..") {
             return Err(Error::InvalidKey);
@@ -498,6 +513,23 @@ impl PropSystem {
         )))
     }
 
+    pub fn set_quiet(&self, name: &str, value: &str) -> Result<()> {
+        if let Some((idx, area)) = self.find_area(name) {
+            area.set_quiet(name, value)?;
+            self.appcompat_write(idx, |m| { let _ = m.set_quiet(name, value); });
+            return Ok(());
+        }
+        if let Some((idx, area)) = self.find_writable(name) {
+            area.set_quiet(name, value)?;
+            self.appcompat_write(idx, |m| { let _ = m.set_quiet(name, value); });
+            return Ok(());
+        }
+        Err(Error::PermissionDenied(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no writable property area",
+        )))
+    }
+
     pub fn delete(&self, name: &str) -> Result<bool> {
         if let Some((idx, area)) = self.find_area(name) {
             let deleted = area.delete(name)?;
@@ -526,6 +558,20 @@ impl PropSystem {
         store.set(name, value)
     }
 
+    /// Pre-seal write that matches what real init would emit for this prop class.
+    /// `ro.*` properties have no listeners, so a `FUTEX_WAKE` would be a
+    /// detectable anomaly — those go through `set_stealth`. Everything else
+    /// (persist/sys/service/...) has real listeners that expect a wake on every
+    /// update, so withholding one is the anomaly — those go through `set_init`.
+    /// Single source of truth for both `seal_arena` and `seal`.
+    fn seal_write(&self, name: &str, value: &str) -> Result<()> {
+        if name.starts_with("ro.") {
+            self.set_stealth(name, value)
+        } else {
+            self.set_init(name, value)
+        }
+    }
+
     /// Tier A seal: remap init's writable view of this property's arena file
     /// as `MAP_PRIVATE|MAP_FIXED`, so subsequent writes from init (PID 1) do
     /// not propagate to the backing inode or to other processes.
@@ -536,8 +582,11 @@ impl PropSystem {
     ///    (REGISTRY §1 "Arenas NOT to touch").
     /// 2. Resolve the arena filename via `PropertyContext::resolve`, falling
     ///    back to a linear scan over `self.areas` when no context is loaded.
-    /// 3. `set_stealth(name, value)` — writes the target value with no serial
-    ///    bump, matching the existing `-st` semantics.
+    /// 3. `seal_write(name, value)` — emits the write through the channel
+    ///    real init would use for this prop class: `set_stealth` for `ro.*`
+    ///    (no listeners → wake would be a detection signal) and `set_init`
+    ///    for everything else (real listeners → silent write would be the
+    ///    anomaly).
     /// 4. If an appcompat mirror exists for the primary filename, derive the
     ///    mirror path via the REGISTRY-locked convention and pass both paths
     ///    to `seal::arena::seal_arena_with_mirror(1, primary, mirror)`.
@@ -551,7 +600,7 @@ impl PropSystem {
             return Err(Error::InvalidKey);
         }
 
-        self.set_stealth(name, value)?;
+        self.seal_write(name, value)?;
 
         let mirror_path = self.derive_mirror_path(&primary_path, filename);
         seal::arena::seal_arena_with_mirror(
@@ -599,9 +648,10 @@ impl PropSystem {
     ///    guard and REGISTRY §1 "Arenas NOT to touch". Keeps the Tier A /
     ///    Tier B boundary consistent even though the hook path does not
     ///    touch the serial counter directly.
-    /// 2. `set_stealth(name, value)` — writes the target value with no
-    ///    serial bump, matching `-st` semantics. Runs BEFORE any ptrace
-    ///    work so a misconfigured context fails fast.
+    /// 2. `seal_write(name, value)` — emits the write through the channel
+    ///    real init would use for this prop class (`set_stealth` for `ro.*`,
+    ///    `set_init` otherwise). Runs BEFORE any ptrace work so a
+    ///    misconfigured context fails fast.
     /// 3. Lazily initialise the shared `HookHandle` under the per-process
     ///    `OnceLock<Mutex<Option<HookHandle>>>`. `install_init_hook` walks
     ///    init's `/proc/1/maps` + libc ELF, then `install_trampoline`
@@ -627,7 +677,7 @@ impl PropSystem {
             return Err(Error::InvalidKey);
         }
 
-        self.set_stealth(name, value)?;
+        self.seal_write(name, value)?;
 
         let slot = self.hook_handle.get_or_init(|| Mutex::new(None));
         let mut guard = slot.lock().unwrap_or_else(|poisoned| {

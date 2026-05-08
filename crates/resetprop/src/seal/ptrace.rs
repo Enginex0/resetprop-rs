@@ -140,19 +140,41 @@ fn last_ptrace_op_err() -> Error {
     Error::PtraceOp(io::Error::last_os_error())
 }
 
-/// Classify a failed `PTRACE_SEIZE` (`ptrace_scope >= 1` → `PtraceScope`,
-/// else → `PtraceAttach`). Called only from `ptrace_seize`.
-fn classify_seize_err() -> Error {
+/// Read `TracerPid:` from `/proc/<pid>/status`. Returns `0` when the line is
+/// absent, the file is unreadable, or the value is unparseable — i.e. callers
+/// should treat any `Ok(0)` as "no concurrent tracer detected" rather than
+/// "definitely none". Used by [`classify_seize_err`] to disambiguate `EPERM`
+/// from yama vs. an existing tracer holding the tracee.
+pub(crate) fn read_tracer_pid(pid: Pid) -> Pid {
+    let path = format!("/proc/{pid}/status");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("TracerPid:") {
+            return rest.trim().parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Classify a failed `PTRACE_SEIZE`. Order:
+/// 1. `EPERM` + nonzero `TracerPid` → `PtraceTracerBusy` (another module holds
+///    the tracee — most actionable diagnostic).
+/// 2. `EPERM` + `ptrace_scope >= 1` → `PtraceScope`.
+/// 3. Anything else → `PtraceAttach`.
+/// Called only from `ptrace_seize`.
+fn classify_seize_err(pid: Pid) -> Error {
     let err = io::Error::last_os_error();
     if err.raw_os_error() == Some(libc::EPERM) {
-        // Yama may be the gate. Read the scope file; if it indicates any
-        // restriction (>= 1), surface PtraceScope so the CLI can suggest
-        // `echo 0 > /proc/sys/kernel/yama/ptrace_scope`. Otherwise the EPERM
-        // is likely SELinux / uid-mismatch and stays an attach failure.
+        let tracer_pid = read_tracer_pid(pid);
+        if tracer_pid != 0 {
+            return Error::PtraceTracerBusy { tracer_pid };
+        }
         if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
             let trimmed = s.trim();
             match trimmed.bytes().next() {
-                Some(b'0') => {} // scope==0: fall through to PtraceAttach
+                Some(b'0') => {}
                 Some(_) => return Error::PtraceScope,
                 None => {}
             }
@@ -189,7 +211,7 @@ pub fn ptrace_seize(pid: Pid) -> Result<()> {
         )
     };
     if rc == -1 {
-        return Err(classify_seize_err());
+        return Err(classify_seize_err(pid));
     }
     Ok(())
 }

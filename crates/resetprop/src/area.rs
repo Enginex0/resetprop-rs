@@ -195,7 +195,7 @@ impl PropArea {
     pub fn bump_serial_and_wake(&self) {
         let s = self.serial();
         let old = s.load(Ordering::Acquire);
-        s.store(old.wrapping_add(2), Ordering::Release);
+        s.store(old.wrapping_add(1), Ordering::Release);
         self.futex_wake(4);
     }
 

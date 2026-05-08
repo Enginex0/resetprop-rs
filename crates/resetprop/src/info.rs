@@ -202,7 +202,8 @@ impl<'a> PropInfo<'a> {
             *ptr.add(value.len()) = 0;
         }
 
-        let new_serial = (value.len() as u32) << 24;
+        let counter = (((serial & 0x00FFFFFF) | 1).wrapping_add(1)) & 0x00FFFFFF;
+        let new_serial = counter | ((value.len() as u32) << 24);
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
         self.area.futex_wake(self.offset);
@@ -256,7 +257,8 @@ impl<'a> PropInfo<'a> {
             *ptr.add(value.len()) = 0;
         }
 
-        let new_serial = ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
+        let counter = (((serial & 0x00FFFFFF) | 1).wrapping_add(1)) & 0x00FFFFFF;
+        let new_serial = counter | ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
         self.area.futex_wake(self.offset);
@@ -291,7 +293,8 @@ impl<'a> PropInfo<'a> {
             *ptr.add(value.len()) = 0;
         }
 
-        let new_serial = (value.len() as u32) << 24;
+        let counter = (((serial & 0x00FFFFFF) | 1).wrapping_add(1)) & 0x00FFFFFF;
+        let new_serial = counter | ((value.len() as u32) << 24);
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
 
@@ -317,9 +320,62 @@ impl<'a> PropInfo<'a> {
             *ptr.add(value.len()) = 0;
         }
 
-        let new_serial = ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
+        let counter = (((serial & 0x00FFFFFF) | 1).wrapping_add(1)) & 0x00FFFFFF;
+        let new_serial = counter | ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
+
+        Ok(())
+    }
+
+    pub(crate) fn write_value_quiet_preserve_serial(&self, value: &str) -> Result<()> {
+        if !self.area.writable() {
+            return Err(Error::PermissionDenied(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "area opened read-only",
+            )));
+        }
+
+        let serial = self.read_serial_stable();
+        if self.is_long(serial) {
+            return self.write_long_value_quiet_preserve_serial(value, serial);
+        }
+
+        if value.len() >= PROP_VALUE_MAX {
+            return Err(Error::ValueTooLong { len: value.len() });
+        }
+
+        unsafe {
+            let ptr = self.area.base().add(self.offset + 4);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
+            *ptr.add(value.len()) = 0;
+        }
+
+        let new_serial = (serial & 0x00FFFFFF) | ((value.len() as u32) << 24);
+        std::sync::atomic::fence(Ordering::Release);
+        self.serial_atomic().store(new_serial, Ordering::Release);
+
+        Ok(())
+    }
+
+    fn write_long_value_quiet_preserve_serial(&self, value: &str, serial: u32) -> Result<()> {
+        let long_offset_pos = self.offset + 4 + LONG_PROP_ERROR_SIZE;
+        let rel_offset = self.area.read_u32(long_offset_pos) as usize;
+        let abs = self.offset + rel_offset;
+
+        if abs + value.len() + 1 > self.area.len() {
+            return Err(Error::ValueTooLong { len: value.len() });
+        }
+
+        unsafe {
+            let ptr = self.area.base().add(abs);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
+            *ptr.add(value.len()) = 0;
+        }
+
+        let new_serial = (serial & 0x00FFFFFF) | ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
+        std::sync::atomic::fence(Ordering::Release);
+        self.serial_atomic().store(new_serial, Ordering::Release);
 
         Ok(())
     }
@@ -399,8 +455,8 @@ impl<'a> PropInfo<'a> {
             *ptr = b'0';
         }
 
-        // length=1 in top byte, clear dirty (bit 0) + kLongFlag (bit 16), preserve counter
-        let new_serial = (1u32 << 24) | (serial & 0x00FE_FFFE);
+        let counter = (((serial & 0x00FFFFFF) | 1).wrapping_add(1)) & 0x00FFFFFF;
+        let new_serial = counter | (1u32 << 24);
         self.serial_atomic().store(new_serial, Ordering::Release);
 
         Ok(())

@@ -201,13 +201,42 @@ impl RemoteAttach {
     // visibility widening required for that consumption and the only edit
     // to arena.rs in P03 T5.
     pub(crate) fn new(pid: super::Pid) -> Result<Self> {
-        super::ptrace::ptrace_seize(pid)?;
+        Self::seize_with_retry(pid)?;
         super::ptrace::ptrace_interrupt(pid)?;
         super::ptrace::wait_stop(pid, super::ptrace::PTRACE_EVENT_STOP)?;
         Ok(Self {
             pid,
             detached: false,
         })
+    }
+
+    /// SEIZE with bounded retry to ride out transient tracer contention from
+    /// other modules (Magisk/KSU style hooks that inject and detach in a tight
+    /// window). After the final attempt the original error is propagated so
+    /// `Error::PtraceTracerBusy` still reaches the caller with the holder's
+    /// PID intact.
+    fn seize_with_retry(pid: super::Pid) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 3;
+        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+        let mut last_err: Option<Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match super::ptrace::ptrace_seize(pid) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let is_contention = matches!(
+                        err,
+                        Error::PtraceTracerBusy { .. } | Error::PtraceAttach(_)
+                    );
+                    last_err = Some(err);
+                    if !is_contention || attempt + 1 == MAX_ATTEMPTS {
+                        break;
+                    }
+                    std::thread::sleep(BACKOFF);
+                }
+            }
+        }
+        Err(last_err.expect("seize_with_retry without an error after the loop"))
     }
 
     pub(crate) fn detach(mut self) -> Result<()> {
