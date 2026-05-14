@@ -427,6 +427,26 @@ impl<'a> PropInfo<'a> {
         Ok(())
     }
 
+    /// Rewrites the current short-value of this prop with itself, advancing
+    /// the serial counter via init-style bionic math. Skips long props by
+    /// returning `Ok(false)`, mirroring Treat-Wheel's `fix_serial_callback`
+    /// (see `treat-wheel-zygisk/src/cmd/utils.c:83-95`). Returns `Ok(true)`
+    /// when a rewrite occurred.
+    ///
+    /// Intended for normalizing per-prop serial counters that have drifted
+    /// after repeated spoof writes — the bionic-style counter advance
+    /// replays one `__system_property_update`-equivalent step so the
+    /// resulting serial matches what real init would produce.
+    pub(crate) fn normalize_serial(&self) -> Result<bool> {
+        let serial = self.read_serial_stable();
+        if self.is_long(serial) {
+            return Ok(false);
+        }
+        let value = self.read_short_value(serial);
+        self.write_value_init(&value)?;
+        Ok(true)
+    }
+
     pub(crate) fn stealth_write_value(&self) -> Result<()> {
         if !self.area.writable() {
             return Err(Error::PermissionDenied(std::io::Error::new(

@@ -261,6 +261,51 @@ impl PropArea {
         compact::compact(self)
     }
 
+    /// Walks every property in this area and rewrites short `ro.*` props with
+    /// their own value, advancing each serial counter via init-style bionic
+    /// math. Long props and non-`ro.*` props are skipped. Returns the number
+    /// of properties whose serial was normalized.
+    ///
+    /// Mirrors Treat-Wheel's `fix_serials()` (see
+    /// `treat-wheel-zygisk/src/cmd/utils.c:97-99`). The rewrite preserves the
+    /// value byte-for-byte (modulo the existing UTF-8 round-trip used by all
+    /// of resetprop-rs's read/write API); only the serial counter changes.
+    pub fn normalize_serial(&self) -> Result<usize> {
+        if !self.writable() {
+            return Err(Error::PermissionDenied(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "area opened read-only",
+            )));
+        }
+        let mut count = 0usize;
+        let mut first_err: Option<Error> = None;
+        trie::foreach(self, |pi_offset| {
+            if first_err.is_some() {
+                return;
+            }
+            let pi = match info::PropInfo::at(self, pi_offset) {
+                Ok(p) => p,
+                Err(e) => {
+                    first_err = Some(e);
+                    return;
+                }
+            };
+            let name = pi.read_name();
+            if !name.starts_with("ro.") {
+                return;
+            }
+            match pi.normalize_serial() {
+                Ok(true) => count += 1,
+                Ok(false) => {}
+                Err(e) => first_err = Some(e),
+            }
+        });
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(count)
+    }
+
     /// Count-preserving stealth delete: removes the property, inserts a plausible
     /// replacement, and compacts the arena. Returns `Ok(false)` if not found.
     pub fn nuke(&self, name: &str) -> Result<bool> {
@@ -804,6 +849,29 @@ impl PropSystem {
         for (_, area) in &self.areas {
             if area.writable() && area.compact()? {
                 count += 1;
+            }
+        }
+        if count > 0 {
+            self.notify();
+        }
+        Ok(count)
+    }
+
+    /// Walks every writable area and rewrites each short `ro.*` property with
+    /// its own value, advancing the per-prop serial counter via init-style
+    /// bionic math. Long props and non-`ro.*` props are skipped. Returns the
+    /// total count of properties whose serial was normalized across all
+    /// writable areas. Notifies via the global serial when any property was
+    /// touched, matching `compact`'s post-condition.
+    ///
+    /// Pure-Rust analog of Treat-Wheel's `fix_serials()`
+    /// (`treat-wheel-zygisk/src/cmd/utils.c:97-99`) and bionic's
+    /// `__system_property_foreach` + `__system_property_update` walk pattern.
+    pub fn normalize_serial(&self) -> Result<usize> {
+        let mut count = 0usize;
+        for (_, area) in &self.areas {
+            if area.writable() {
+                count += area.normalize_serial()?;
             }
         }
         if count > 0 {

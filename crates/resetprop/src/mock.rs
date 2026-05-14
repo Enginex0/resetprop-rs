@@ -795,4 +795,182 @@ mod tests {
         area.foreach(|_, _| count += 1);
         assert_eq!(count, 1);
     }
+
+    #[test]
+    fn normalize_serial_advances_counter_bionic_style() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        // First set creates the prop via alloc_prop_info (counter=0).
+        // Second set overwrites via write_value (+2), counter -> 2.
+        area.set("ro.product.brand", "Pixel").unwrap();
+        area.set("ro.product.brand", "Pixel").unwrap();
+
+        let (pi_off, _) = crate::trie::find(&area, "ro.product.brand").unwrap();
+        let before = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let counter_before = before & 0x00FF_FFFF;
+        assert_eq!(counter_before, 2, "two `set` calls (alloc + write_value) produce counter=2");
+
+        let count = area.normalize_serial().unwrap();
+        assert_eq!(count, 1);
+
+        let after = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let counter_after = after & 0x00FF_FFFF;
+        // init-style bump: (((2 | 1) + 1) & 0xFFFFFF) = ((3+1) & 0xFFFFFF) = 4
+        assert_eq!(counter_after, 4, "normalize_serial must bionic-bump counter from 2 to 4");
+
+        let len_byte = (after >> 24) & 0xFF;
+        assert_eq!(len_byte, 5, "length byte preserved (value 'Pixel' = 5 bytes)");
+        assert_eq!(after & 1, 0, "dirty bit cleared after normalize_serial");
+        assert_eq!(after & (1 << 16), 0, "long flag not set");
+
+        // value must be unchanged
+        assert_eq!(area.get("ro.product.brand").unwrap(), "Pixel");
+    }
+
+    #[test]
+    fn normalize_serial_skips_non_ro_props() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("vendor.display.config", "auto").unwrap();
+        area.set("persist.sys.timezone", "UTC").unwrap();
+        area.set("dalvik.vm.heapsize", "512m").unwrap();
+
+        // snapshot serials before
+        let (vd_off, _) = crate::trie::find(&area, "vendor.display.config").unwrap();
+        let (ps_off, _) = crate::trie::find(&area, "persist.sys.timezone").unwrap();
+        let (dv_off, _) = crate::trie::find(&area, "dalvik.vm.heapsize").unwrap();
+        let vd_before = area.atomic_u32(vd_off).load(std::sync::atomic::Ordering::Relaxed);
+        let ps_before = area.atomic_u32(ps_off).load(std::sync::atomic::Ordering::Relaxed);
+        let dv_before = area.atomic_u32(dv_off).load(std::sync::atomic::Ordering::Relaxed);
+
+        let count = area.normalize_serial().unwrap();
+        assert_eq!(count, 0, "no ro.* props, no rewrites");
+
+        // serials must be untouched
+        let vd_after = area.atomic_u32(vd_off).load(std::sync::atomic::Ordering::Relaxed);
+        let ps_after = area.atomic_u32(ps_off).load(std::sync::atomic::Ordering::Relaxed);
+        let dv_after = area.atomic_u32(dv_off).load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(vd_before, vd_after);
+        assert_eq!(ps_before, ps_after);
+        assert_eq!(dv_before, dv_after);
+    }
+
+    #[test]
+    fn normalize_serial_counts_only_ro_short_props() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        area.set("ro.product.brand", "Pixel").unwrap();
+        area.set("ro.product.model", "Pixel 8").unwrap();
+        area.set("ro.build.type", "user").unwrap();
+        area.set("vendor.display.config", "auto").unwrap();
+        area.set("persist.sys.timezone", "UTC").unwrap();
+
+        let count = area.normalize_serial().unwrap();
+        assert_eq!(count, 3, "exactly the 3 ro.* short props get normalized");
+    }
+
+    #[test]
+    fn normalize_serial_preserves_values() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        let pairs = [
+            ("ro.product.brand", "Pixel"),
+            ("ro.product.model", "Pixel 8"),
+            ("ro.build.type", "user"),
+            ("ro.build.fingerprint", "google/shiba/shiba:14/UQ1A.231205.015/11084887:user/release-keys"),
+        ];
+        for (name, value) in &pairs {
+            area.set(name, value).unwrap();
+        }
+
+        area.normalize_serial().unwrap();
+
+        for (name, value) in &pairs {
+            assert_eq!(
+                &area.get(name).unwrap(),
+                value,
+                "value of {name} changed by normalize_serial",
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_serial_idempotent_pattern() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        // One set: alloc_prop_info path, counter starts at 0.
+        area.set("ro.product.brand", "Pixel").unwrap();
+
+        let (pi_off, _) = crate::trie::find(&area, "ro.product.brand").unwrap();
+        let counter_initial = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed) & 0x00FF_FFFF;
+        assert_eq!(counter_initial, 0, "freshly alloc'd prop starts at counter=0");
+
+        // first normalize: 0 -> (((0|1)+1) & 0xFFFFFF) = 2
+        area.normalize_serial().unwrap();
+        let c1 = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed) & 0x00FF_FFFF;
+        assert_eq!(c1, 2);
+
+        // second normalize: 2 -> (((2|1)+1) & 0xFFFFFF) = 4
+        area.normalize_serial().unwrap();
+        let c2 = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed) & 0x00FF_FFFF;
+        assert_eq!(c2, 4);
+
+        // third normalize: 4 -> (((4|1)+1) & 0xFFFFFF) = 6
+        area.normalize_serial().unwrap();
+        let c3 = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed) & 0x00FF_FFFF;
+        assert_eq!(c3, 6);
+    }
+
+    #[test]
+    fn normalize_serial_readonly_rejects() {
+        let mock = MockArea::new();
+        // populate via writable handle, then drop and reopen read-only
+        {
+            let area = mock.open();
+            area.set("ro.product.brand", "Pixel").unwrap();
+        }
+        let ro = mock.open_ro();
+        let result = ro.normalize_serial();
+        assert!(result.is_err(), "normalize_serial on RO area must error");
+    }
+
+    #[test]
+    fn normalize_serial_empty_arena_returns_zero() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        let count = area.normalize_serial().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn normalize_serial_propsystem_aggregates_all_areas() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        // create two mock area files inside one directory so PropSystem::open_dir sees both
+        for name in ["u:object_r:default_prop:s0", "u:object_r:build_prop:s0"] {
+            let path = dir.path().join(name);
+            super::create_empty_area(&path);
+        }
+        let sys = crate::PropSystem::open_dir(dir.path()).expect("open_dir");
+
+        // distribute props across areas by writing through PropSystem::find_writable's
+        // linear-scan fallback (no property_contexts present, so it picks whichever
+        // area accepts the write first).
+        sys.set("ro.product.brand", "Pixel").unwrap();
+        sys.set("ro.product.model", "Pixel 8").unwrap();
+        sys.set("vendor.display.config", "auto").unwrap();
+
+        let count = sys.normalize_serial().unwrap();
+        assert_eq!(count, 2, "PropSystem::normalize_serial counts the 2 ro.* short props");
+
+        // values intact through PropSystem read path
+        assert_eq!(sys.get("ro.product.brand").unwrap(), "Pixel");
+        assert_eq!(sys.get("ro.product.model").unwrap(), "Pixel 8");
+        assert_eq!(sys.get("vendor.display.config").unwrap(), "auto");
+    }
 }
