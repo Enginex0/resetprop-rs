@@ -973,4 +973,81 @@ mod tests {
         assert_eq!(sys.get("ro.product.model").unwrap(), "Pixel 8");
         assert_eq!(sys.get("vendor.display.config").unwrap(), "auto");
     }
+
+    fn fresh_sys() -> (tempfile::TempDir, crate::PropSystem) {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("u:object_r:default_prop:s0");
+        super::create_empty_area(&path);
+        let sys = crate::PropSystem::open_dir(dir.path()).expect("open_dir");
+        (dir, sys)
+    }
+
+    #[test]
+    fn set_if_diff_skips_absent() {
+        let (_dir, sys) = fresh_sys();
+        let acted = sys.set_if_diff("ro.does.not.exist", "anything").unwrap();
+        assert!(!acted);
+        assert!(sys.get("ro.does.not.exist").is_none());
+    }
+
+    #[test]
+    fn set_if_diff_skips_when_equal() {
+        let (_dir, sys) = fresh_sys();
+        sys.set("ro.test.brand", "Pixel").unwrap();
+        let acted = sys.set_if_diff("ro.test.brand", "Pixel").unwrap();
+        assert!(!acted);
+        assert_eq!(sys.get("ro.test.brand").unwrap(), "Pixel");
+    }
+
+    #[test]
+    fn set_if_diff_writes_when_different() {
+        let (_dir, sys) = fresh_sys();
+        sys.set("ro.test.brand", "Pixel").unwrap();
+        let acted = sys.set_if_diff("ro.test.brand", "Galaxy").unwrap();
+        assert!(acted);
+        assert_eq!(sys.get("ro.test.brand").unwrap(), "Galaxy");
+    }
+
+    #[test]
+    fn set_if_match_writes_when_needle_matches() {
+        let (_dir, sys) = fresh_sys();
+        sys.set("ro.bootmode", "unknown").unwrap();
+        let acted = sys
+            .set_if_match("ro.bootmode", "unknown", "recovery")
+            .unwrap();
+        assert!(acted);
+        assert_eq!(sys.get("ro.bootmode").unwrap(), "recovery");
+    }
+
+    #[test]
+    fn set_if_match_skips_when_current_differs() {
+        let (_dir, sys) = fresh_sys();
+        sys.set("ro.bootmode", "normal").unwrap();
+        let acted = sys
+            .set_if_match("ro.bootmode", "unknown", "recovery")
+            .unwrap();
+        assert!(!acted);
+        assert_eq!(sys.get("ro.bootmode").unwrap(), "normal");
+    }
+
+    #[test]
+    fn set_if_match_skips_when_absent() {
+        let (_dir, sys) = fresh_sys();
+        let acted = sys
+            .set_if_match("ro.absent", "anything", "value")
+            .unwrap();
+        assert!(!acted);
+        assert!(sys.get("ro.absent").is_none());
+    }
+
+    #[test]
+    fn set_if_match_skips_when_value_equals_current() {
+        let (_dir, sys) = fresh_sys();
+        sys.set("ro.bootmode", "unknown").unwrap();
+        let acted = sys
+            .set_if_match("ro.bootmode", "unknown", "unknown")
+            .unwrap();
+        assert!(!acted);
+        assert_eq!(sys.get("ro.bootmode").unwrap(), "unknown");
+    }
 }

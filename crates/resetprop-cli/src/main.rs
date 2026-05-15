@@ -35,6 +35,9 @@ fn run() -> Result<(), String> {
     let mut unseal: Option<String> = None;
     let mut unseal_arena: Option<String> = None;
     let mut list_seals = false;
+    let mut if_diff = false;
+    let mut if_match: Option<String> = None;
+    let mut delete_if_exist: Option<String> = None;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -75,6 +78,15 @@ fn run() -> Result<(), String> {
                 unseal_arena = Some(arg_val(&args, i, "--unseal-arena")?);
             }
             "--seals" => list_seals = true,
+            "--if-diff" => if_diff = true,
+            "--if-match" => {
+                i += 1;
+                if_match = Some(arg_val(&args, i, "--if-match")?);
+            }
+            "--delete-if-exist" => {
+                i += 1;
+                delete_if_exist = Some(arg_val(&args, i, "--delete-if-exist")?);
+            }
             "-c" | "--compact" => compact = true,
             "--dir" => {
                 i += 1;
@@ -105,6 +117,51 @@ fn run() -> Result<(), String> {
             _ => positional.push(args[i].clone()),
         }
         i += 1;
+    }
+
+    let conditional_set = if_diff || if_match.is_some();
+    let conditional_delete = delete_if_exist.is_some();
+    let any_conditional = conditional_set || conditional_delete;
+    let any_top_level_op = delete.is_some()
+        || hexpatch.is_some()
+        || nuke.is_some()
+        || compact
+        || file.is_some()
+        || wait_name.is_some()
+        || seal.is_some()
+        || seal_arena.is_some()
+        || unseal.is_some()
+        || unseal_arena.is_some()
+        || list_seals;
+    let any_mode_flag = init || persist || persist_read || stealth || quiet;
+
+    if if_diff && if_match.is_some() {
+        return Err("--if-diff and --if-match are mutually exclusive".to_string());
+    }
+    if conditional_set && conditional_delete {
+        return Err(
+            "--if-diff/--if-match cannot be combined with --delete-if-exist".to_string(),
+        );
+    }
+    if any_conditional && any_top_level_op {
+        return Err(
+            "conditional flags (--if-diff, --if-match, --delete-if-exist) cannot be combined with other top-level operations"
+                .to_string(),
+        );
+    }
+    if any_conditional && any_mode_flag {
+        return Err(
+            "conditional flags cannot be combined with mode flags (-p, -P, -n, --init, --stealth)"
+                .to_string(),
+        );
+    }
+    if conditional_delete && !positional.is_empty() {
+        return Err(
+            "--delete-if-exist takes NAME as its argument; no positional values".to_string(),
+        );
+    }
+    if conditional_set && positional.len() != 2 {
+        return Err("--if-diff and --if-match require NAME VALUE".to_string());
     }
 
     if persist_read {
@@ -141,6 +198,16 @@ fn run() -> Result<(), String> {
             return bool_op(sys.delete_persist(name), name, "deleted(persist)", verbose);
         }
         return bool_op(sys.delete(name), name, "deleted", verbose);
+    }
+
+    if let Some(ref name) = delete_if_exist {
+        let acted = sys
+            .delete(name)
+            .map_err(|e| format!("delete-if-exist failed for {name}: {e}"))?;
+        if verbose {
+            eprintln!("delete-if-exist: [{name}] acted={acted}");
+        }
+        return Ok(());
     }
 
     if let Some(path) = file {
@@ -247,6 +314,30 @@ fn run() -> Result<(), String> {
             None => return Err(format!("property not found: {}", positional[0])),
         },
         2 => {
+            if let Some(ref needle) = if_match {
+                let acted = sys
+                    .set_if_match(&positional[0], needle, &positional[1])
+                    .map_err(|e| format!("failed to set-if-match {}: {e}", positional[0]))?;
+                if verbose {
+                    eprintln!(
+                        "set-if-match: [{}] needle=[{}] new=[{}] acted={}",
+                        positional[0], needle, positional[1], acted
+                    );
+                }
+                return Ok(());
+            }
+            if if_diff {
+                let acted = sys
+                    .set_if_diff(&positional[0], &positional[1])
+                    .map_err(|e| format!("failed to set-if-diff {}: {e}", positional[0]))?;
+                if verbose {
+                    eprintln!(
+                        "set-if-diff: [{}]=[{}] acted={}",
+                        positional[0], positional[1], acted
+                    );
+                }
+                return Ok(());
+            }
             if persist && stealth {
                 sys.set_stealth_persist(&positional[0], &positional[1])
             } else if persist {
@@ -369,6 +460,9 @@ Usage:
   resetprop -p NAME VALUE            Set in both prop_area and persist file
   resetprop -d NAME                  Delete property
   resetprop -p -d NAME               Delete from both prop_area and persist file
+  resetprop --if-diff NAME VALUE     Set only when current value differs (skip if absent)
+  resetprop --if-match NEEDLE NAME VALUE  Set only when current value equals NEEDLE
+  resetprop --delete-if-exist NAME   Delete only when NAME is currently present
   resetprop -P                       List persist properties from disk
   resetprop -P NAME                  Get persist property from disk
   resetprop --stealth|-st NAME VALUE     Set with zeroed serial, no wake signals
@@ -392,6 +486,9 @@ Options:
   -P          Disk-only read (read from persist file, not prop_area)
   -n          Quiet write: preserve serial, no futex wake, no global notify
   --init      Bionic-correct compose, init-style allocation path
+  --if-diff   Conditional set: write NAME=VALUE only when current value differs (skips absent)
+  --if-match NEEDLE  Conditional set: write NAME=VALUE only when current value equals NEEDLE
+  --delete-if-exist NAME  Conditional delete: no-op when NAME is absent
   --stealth, -st  Stealth write: bionic compose, no futex wake, no global notify
   --seal, -sl     Tier B seal: stealth write + per-prop hook on __system_property_update in init
   --seal-arena, -sla  Tier A seal: stealth write + remap init's arena as MAP_PRIVATE|MAP_FIXED

@@ -587,6 +587,27 @@ impl PropSystem {
         Ok(false)
     }
 
+    pub fn set_if_diff(&self, name: &str, value: &str) -> Result<bool> {
+        let Some((_, area)) = self.find_area(name) else {
+            return Ok(false);
+        };
+        match area.get(name) {
+            Some(cur) if cur == value => Ok(false),
+            Some(_) => self.set(name, value).map(|_| true),
+            None => Ok(false),
+        }
+    }
+
+    pub fn set_if_match(&self, name: &str, needle: &str, value: &str) -> Result<bool> {
+        let Some((_, area)) = self.find_area(name) else {
+            return Ok(false);
+        };
+        match area.get(name) {
+            Some(cur) if cur == needle && cur != value => self.set(name, value).map(|_| true),
+            _ => Ok(false),
+        }
+    }
+
     /// Sets a property in both the mmap'd area and the on-disk persist store.
     pub fn set_persist(&self, name: &str, value: &str) -> Result<()> {
         self.set(name, value)?;
