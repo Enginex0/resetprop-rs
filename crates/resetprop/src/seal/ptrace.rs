@@ -163,6 +163,7 @@ pub(crate) fn read_tracer_pid(pid: Pid) -> Pid {
 ///    the tracee — most actionable diagnostic).
 /// 2. `EPERM` + `ptrace_scope >= 1` → `PtraceScope`.
 /// 3. Anything else → `PtraceAttach`.
+///
 /// Called only from `ptrace_seize`.
 fn classify_seize_err(pid: Pid) -> Error {
     let err = io::Error::last_os_error();
