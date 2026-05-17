@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.5.0
+
+### Seal (Two-Tier Property Locking)
+- `--seal NAME VALUE` / `-sl`: Tier B per-prop hook installed in init via ptrace plus remote `mmap`. Only the named property freezes; neighbour properties keep updating normally.
+- `--seal-arena NAME VALUE` / `-sla`: Tier A arena-level `MAP_PRIVATE|MAP_FIXED` remap in init. Broader blast radius, used as a manual fallback when Tier B refuses (`HookInstallFailed`, `ElfParse`, `SymbolNotFound`).
+- `--unseal NAME` and `--unseal-arena NAME` revert a specific seal. `--seals` lists active seal records (name, tier, arena path).
+- AArch64 only at runtime. Builds for other ABIs return `Error::Unsupported` rather than corrupting init's libc.text.
+- File-backed hook page at `/data/adb/resetprop-rs/hook-<pid>-<nanos>.bin`, unlinked post-`mmap` so `process:execmem` SELinux class is never exercised.
+- In-session only: seals do not persist across reboots, `SystemProperties::Reload`, or init restart. Re-apply on every boot.
+- Library API: `PropSystem::seal`, `PropSystem::unseal`, `PropSystem::seal_arena`, `PropSystem::unseal_arena`, `PropSystem::seals`.
+
+### Conditional Property Primitives
+- `--if-diff` with positional NAME VALUE: write only when the property exists and the current value differs from VALUE.
+- `--if-match NEEDLE` with positional NAME VALUE: write only when the current value equals NEEDLE and differs from VALUE.
+- `--delete-if-exist NAME`: delete only when the property is present, exit 0 on absent.
+- All three skip absent properties and short-circuit equal-value writes so the per-prop serial never bumps spuriously.
+- Library API: `PropSystem::set_if_diff`, `PropSystem::set_if_match`.
+
+### Wait For Value
+- `--wait NAME [VALUE]` with optional `--timeout SECS` blocks until the property either exists (no VALUE) or equals VALUE.
+- Library API: `PropSystem::wait(name, expected, timeout)` returns `Some(value)` on match, `None` on timeout.
+
+### Bionic-Correct Serial Discipline
+- `normalize_serial` API canonicalises the dirty bit and length field on an existing entry without bumping the serial counter. Mirrors the `fix_serials` step real init runs at boot.
+- Seal write routes `ro.*` properties through `set_stealth` (no listeners, so a wake would be the detection signal) and everything else through `set_init` (real listeners present, so a missing wake would be the signal).
+- Hybrid wake policy: `futex_wake` only fires when listeners exist on the prop. Tracer-busy errors now surface the holding pid for diagnosis.
+
+### Build And CI Hardening
+- New `Error::Unsupported(String)` variant for arch-gated features.
+- Release matrix runs with `fail-fast: false`. One failed ABI no longer cancels the other three in flight.
+- Release-artifact build scoped to `cargo build -p resetprop-cli`. Toolchain quirks in `propdetect-bionic` no longer block the shipping binary.
+- Tagged releases auto-publish: `release.yml` extracts the matching `## vX.Y.Z` section from `CHANGELOG.md` via awk and feeds it to `softprops/action-gh-release` as the release body.
+- Workspace lints clean under Rust 1.95.0 (`clippy::sort_by_key`, `clippy::collapsible_match`).
+
+### Testing
+- 133 library unit tests (up from 50 at v0.4.0). Five integration test binaries cover ptrace primitives, Tier A and Tier B child isolation, ELF fixture parsing, plus the existing doc tests.
+- New seal coverage: A64 encoder vectors versus canonical opcodes, hook body splice equivalence, lock-list capacity envelope, PT_DYNAMIC duplicate-tolerant parsing.
+- Device-side stress: Tests 21 and 22 exercise seal under SELinux denials and ksu_props bypass probes.
+
 ## v0.4.0
 
 ### Stealth Set
