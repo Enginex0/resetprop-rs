@@ -22,6 +22,7 @@ pub enum Error {
     ElfParse(String),
     SymbolNotFound(String),
     HookInstallFailed(String),
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -56,6 +57,7 @@ impl fmt::Display for Error {
             Self::ElfParse(msg) => write!(f, "ELF parse error: {msg}"),
             Self::SymbolNotFound(sym) => write!(f, "symbol not found: {sym}"),
             Self::HookInstallFailed(msg) => write!(f, "hook install failed: {msg}"),
+            Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }
 }

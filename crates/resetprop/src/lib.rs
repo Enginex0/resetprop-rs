@@ -48,6 +48,25 @@ use std::time::SystemTime;
 
 const PROP_DIR: &str = "/dev/__properties__";
 
+/// Compile-time arch gate for the seal subsystem. Returns `Ok(())` on
+/// AArch64 builds, where the inline trampoline encoder in `seal::hook`
+/// emits valid A64 opcodes. On any other target, returns
+/// `Error::Unsupported` so library callers and the CLI both fail fast
+/// instead of writing A64 words into a non-A64 init's libc.text.
+#[inline]
+fn require_aarch64() -> Result<()> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        Ok(())
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        Err(Error::Unsupported(
+            "seal is only available on AArch64 builds".to_string(),
+        ))
+    }
+}
+
 impl PropArea {
     /// Returns the value of a property, or `None` if it doesn't exist in this area.
     pub fn get(&self, name: &str) -> Option<String> {
@@ -660,6 +679,7 @@ impl PropSystem {
     ///
     /// Returns the `SealRecord` that was inserted (or refreshed on duplicate).
     pub fn seal_arena(&self, name: &str, value: &str) -> Result<SealRecord> {
+        require_aarch64()?;
         let primary_path = self.resolve_arena_path(name)?;
         let filename = arena_filename(&primary_path)?;
         if filename == SERIAL_FILE {
@@ -688,6 +708,7 @@ impl PropSystem {
     /// removes the matching `SealTier::Arena` record from the registry.
     /// Returns `Ok(true)` if a record was removed, `Ok(false)` otherwise.
     pub fn unseal_arena(&self, name: &str) -> Result<bool> {
+        require_aarch64()?;
         let primary_path = self.resolve_arena_path(name)?;
         let filename = arena_filename(&primary_path)?;
         if filename == SERIAL_FILE {
@@ -737,6 +758,7 @@ impl PropSystem {
     /// prior error surface could brick the API for the lifetime of the
     /// process after a single mid-install panic.
     pub fn seal(&self, name: &str, value: &str) -> Result<SealRecord> {
+        require_aarch64()?;
         let primary_path = self.resolve_arena_path(name)?;
         let filename = arena_filename(&primary_path)?;
         if filename == SERIAL_FILE {
@@ -778,6 +800,7 @@ impl PropSystem {
     /// hook is installed yet or the name was never sealed. Never issues
     /// ptrace work when the hook has not been installed.
     pub fn unseal(&self, name: &str) -> Result<bool> {
+        require_aarch64()?;
         let slot = self.hook_handle.get_or_init(|| Mutex::new(None));
         let mut guard = slot.lock().unwrap_or_else(|poisoned| {
             eprintln!("resetprop: unseal: hook_handle mutex was poisoned; recovering");
@@ -806,6 +829,7 @@ impl PropSystem {
     /// internal mutex, and mutations in the registry after the call are
     /// not reflected in the snapshot.
     pub fn seals(&self) -> Result<Vec<SealRecord>> {
+        require_aarch64()?;
         let registry = seal::seals_registry();
         let entries = registry.lock().unwrap_or_else(|poisoned| {
             eprintln!("resetprop: seals: seals registry mutex was poisoned; recovering");
