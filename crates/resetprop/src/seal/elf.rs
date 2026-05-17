@@ -305,12 +305,10 @@ pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
 
         match phdr.p_type {
             PT_LOAD => pt_loads.push((phdr.p_vaddr, phdr.p_offset, phdr.p_filesz)),
-            PT_DYNAMIC => {
-                if pt_dynamic.is_none() {
-                    // Defensive: ELF spec permits only one PT_DYNAMIC; if more
-                    // than one appears, keep the first and silently accept.
-                    pt_dynamic = Some((phdr.p_vaddr, phdr.p_offset, phdr.p_filesz));
-                }
+            // Defensive: ELF spec permits only one PT_DYNAMIC; if more
+            // than one appears, keep the first and silently accept.
+            PT_DYNAMIC if pt_dynamic.is_none() => {
+                pt_dynamic = Some((phdr.p_vaddr, phdr.p_offset, phdr.p_filesz));
             }
             _ => {}
         }
