@@ -46,7 +46,7 @@ jobs:
           echo "$BIN" >> $GITHUB_PATH
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release -p resetprop-cli --target ${{ matrix.target }}
 
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/resetprop ${{ matrix.artifact }}
