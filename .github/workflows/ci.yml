@@ -26,6 +26,7 @@ jobs:
   cross-compile:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         target: [aarch64-linux-android, armv7-linux-androideabi]
     steps:
