@@ -3,7 +3,7 @@
   <p align="center"><b>Pure Rust Android Property Manipulation</b></p>
   <p align="center">Get. Set. Delete. Stealth. Nuke. No Magisk required.</p>
   <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.4.0-blue?style=for-the-badge" alt="v0.4.0">
+    <img src="https://img.shields.io/badge/version-v0.5.0-blue?style=for-the-badge" alt="v0.5.0">
     <img src="https://img.shields.io/badge/Android-10%2B-green?style=for-the-badge&logo=android" alt="Android 10+">
     <img src="https://img.shields.io/badge/Rust-stable-orange?style=for-the-badge&logo=rust" alt="Rust">
     <img src="https://img.shields.io/badge/Telegram-community-blue?style=for-the-badge&logo=telegram" alt="Telegram">
@@ -13,15 +13,15 @@
 ---
 
 > [!NOTE]
-> **resetprop-rs is a standalone reimplementation** of Magisk's `resetprop` in pure Rust. It does not depend on Magisk, forked bionic, or any custom Android symbols. Works with any root solution — KSU, Magisk, APatch, or bare `su`.
+> **resetprop-rs is a standalone reimplementation** of Magisk's `resetprop` in pure Rust. It does not depend on Magisk, forked bionic, or any custom Android symbols. Works with any root solution: KSU, Magisk, APatch, or bare `su`.
 
 ---
 
 ## 🧬 What is resetprop-rs?
 
-Android system properties live in mmap'd shared memory at `/dev/__properties__/`. Each file is a 128KB arena containing a prefix trie with BST siblings — the same data structure since Android 10.
+Android system properties live in mmap'd shared memory at `/dev/__properties__/`. Each file is a 128KB arena containing a prefix trie with BST siblings, the same data structure since Android 10.
 
-Magisk's `resetprop` can manipulate these, but it's locked into Magisk's build system — it depends on a forked bionic with custom symbols (`__system_property_find2`, `__system_property_delete`, etc.) that don't exist in stock Android. You can't extract it as a standalone binary.
+Magisk's `resetprop` can manipulate these, but it's locked into Magisk's build system. It depends on a forked bionic with custom symbols (`__system_property_find2`, `__system_property_delete`, etc.) that don't exist in stock Android. You can't extract it as a standalone binary.
 
 **resetprop-rs reimplements the entire property area format in pure Rust.** No bionic symbols. No Magisk dependency. Ships as a ~320KB static binary and an embeddable library crate.
 
@@ -31,77 +31,80 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 
 ## 🔥 Why resetprop-rs?
 
-🔓 **Truly Standalone** — Zero runtime dependencies. No Magisk, no forked libc, no JNI. A single static binary that works on any rooted Android device.
+🔓 **Truly Standalone**: Zero runtime dependencies. No Magisk, no forked libc, no JNI. A single static binary that works on any rooted Android device.
 
-🥷 **Stealth Set** — Writes property values with zeroed serial counter, no global serial bump, and no futex wake. To detection apps, the property looks like it was written by `init` at boot. Combine with `-p` for stealth persist to disk.
+🥷 **Stealth Set**: Writes property values with zeroed serial counter, no global serial bump, and no futex wake. To detection apps, the property looks like it was written by `init` at boot. Combine with `-p` for stealth persist to disk.
 
-💀 **Nuke** — Count-preserving stealth delete. Removes the target property, inserts a plausible replacement (drawn from the device's own property vocabulary), and compacts the arena. Property count stays identical. Zero forensic traces.
+💀 **Nuke**: Count-preserving stealth delete. Removes the target property, inserts a plausible replacement (drawn from the device's own property vocabulary), and compacts the arena. Property count stays identical. Zero forensic traces.
 
-🔮 **Hexpatch Delete** — Overwrites property name bytes with realistic dictionary words instead of detaching trie nodes. Trie structure stays intact. Serial counters preserved. Invisible to `__system_property_foreach`.
+🔮 **Hexpatch Delete**: Overwrites property name bytes with realistic dictionary words instead of detaching trie nodes. Trie structure stays intact. Serial counters preserved. Invisible to `__system_property_foreach`.
 
-📦 **Embeddable Library** — `resetprop` crate with typed errors, no `anyhow`. Drop it into your Rust project and manipulate properties programmatically.
+📦 **Embeddable Library**: `resetprop` crate with typed errors, no `anyhow`. Drop it into your Rust project and manipulate properties programmatically.
 
-⚡ **Tiny Footprint** — ~320KB ARM64, ~240KB ARMv7. Hand-rolled CLI parser, `panic=abort`, LTO, single codegen unit. Only dependency: `libc`.
+⚡ **Tiny Footprint**: ~320KB ARM64, ~240KB ARMv7. Hand-rolled CLI parser, `panic=abort`, LTO, single codegen unit. Only dependency: `libc`.
 
-🧪 **Tested Off-Device** — 60 unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, stealth, nuke, compaction, context parsing, trie integrity, serial preservation, name consistency, boundary conditions.
+🧪 **Tested Off-Device**: 133 unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, stealth, nuke, compaction, context parsing, trie integrity, serial preservation, name consistency, conditional primitives, A64 encoder vectors, ELF parsing, ptrace primitives.
 
 ---
 
 ## ✨ Features
 
 **Property Operations**
-- [x] **Get** — single property or list all
-- [x] **Set** — direct mmap write, bypasses `property_service`
-- [x] **Set (init-style)** — `--init` zeros the serial counter, mimicking how `init` writes `ro.*` props at boot
-- [x] **Stealth Set** — `--stealth` / `-st` suppresses serial bump, global serial, and futex wake. Combine with `-p` for stealth persist
-- [x] **Delete** — trie node detach + value/name wipe + orphan pruning
-- [x] **Hexpatch Delete** — dictionary-based name destruction, serial-preserving
-- [x] **Nuke** — `--nuke` / `-nk` count-preserving stealth delete (delete + replacement + compact in one atomic operation)
-- [x] **Compact** — `--compact` defragments arenas after deletes, reclaiming space
-- [x] **Persistent Properties** — `-p` writes to both memory and `/data/property/persistent_properties` on disk; `-P` reads directly from the persist file
-- [x] **Batch Load** — `-f` flag loads `name=value` pairs from file
-- [x] **Wait** — `--wait NAME [VALUE]` blocks until a property exists or matches, with optional `--timeout`
-- [x] **Privatize** — remap areas as `MAP_PRIVATE` for per-process COW isolation
+- [x] **Get**: single property or list all
+- [x] **Set**: direct mmap write, bypasses `property_service`
+- [x] **Set (init-style)**: `--init` zeros the serial counter, mimicking how `init` writes `ro.*` props at boot
+- [x] **Stealth Set**: `--stealth` / `-st` suppresses serial bump, global serial, and futex wake. Combine with `-p` for stealth persist
+- [x] **Conditional Set (if-diff)**: `--if-diff` writes only when the property exists and the current value differs
+- [x] **Conditional Set (if-match)**: `--if-match NEEDLE` writes only when the current value equals NEEDLE and differs from the new value
+- [x] **Conditional Delete**: `--delete-if-exist NAME` deletes only when present, exit 0 on absent
+- [x] **Delete**: trie node detach + value/name wipe + orphan pruning
+- [x] **Hexpatch Delete**: dictionary-based name destruction, serial-preserving
+- [x] **Nuke**: `--nuke` / `-nk` count-preserving stealth delete (delete + replacement + compact in one atomic operation)
+- [x] **Compact**: `--compact` defragments arenas after deletes, reclaiming space
+- [x] **Persistent Properties**: `-p` writes to both memory and `/data/property/persistent_properties` on disk; `-P` reads directly from the persist file
+- [x] **Batch Load**: `-f` flag loads `name=value` pairs from file
+- [x] **Wait**: `--wait NAME [VALUE]` blocks until a property exists or matches, with optional `--timeout`
+- [x] **Privatize**: remap areas as `MAP_PRIVATE` for per-process COW isolation
 
 **Library API**
-- [x] **`PropArea`** — single property file: open, get, set, set_stealth, delete, nuke, hexpatch, compact, foreach
-- [x] **`PropSystem`** — multi-file scan across `/dev/__properties__/`
-- [x] **`PersistStore`** — read/write the on-disk persistent property store (protobuf + legacy format)
-- [x] **Typed errors** — `NotFound`, `AreaCorrupt`, `PermissionDenied`, `AreaFull`, `Io`, `ValueTooLong`, `PersistCorrupt`
-- [x] **RO fallback** — automatically falls back to read-only when write access is denied
-- [x] **Context-aware routing** — parses `property_info` binary trie for O(depth) area lookup instead of O(n) scan
-- [x] **appcompat_override** — dual-writes to Android 14+ override areas, preserving write mode (stealth, init, etc.)
-- [x] **Bionic fallback** — falls back to `__system_property_*` via dlsym when mmap reads are unavailable
-- [x] **Wait** — `PropSystem::wait()` blocks on property changes via bionic or futex
+- [x] **`PropArea`**: single property file: open, get, set, set_stealth, delete, nuke, hexpatch, compact, foreach
+- [x] **`PropSystem`**: multi-file scan across `/dev/__properties__/`
+- [x] **`PersistStore`**: read/write the on-disk persistent property store (protobuf + legacy format)
+- [x] **Typed errors**: `NotFound`, `AreaCorrupt`, `PermissionDenied`, `AreaFull`, `Io`, `ValueTooLong`, `PersistCorrupt`
+- [x] **RO fallback**: automatically falls back to read-only when write access is denied
+- [x] **Context-aware routing**: parses `property_info` binary trie for O(depth) area lookup instead of O(n) scan
+- [x] **appcompat_override**: dual-writes to Android 14+ override areas, preserving write mode (stealth, init, etc.)
+- [x] **Bionic fallback**: falls back to `__system_property_*` via dlsym when mmap reads are unavailable
+- [x] **Wait**: `PropSystem::wait()` blocks on property changes via bionic or futex
 
 **Format Support**
-- [x] **Short values** — ≤91 bytes, inline in prop_info
-- [x] **Long values** — Android 12+, >92 bytes via self-relative arena offset
-- [x] **Serial protocol** — spin-wait on dirty bit, verification loop for concurrent reads
-- [x] **Length-first comparison** — matches AOSP's `cmp_prop_name` exactly
+- [x] **Short values**: ≤91 bytes, inline in prop_info
+- [x] **Long values**: Android 12+, >92 bytes via self-relative arena offset
+- [x] **Serial protocol**: spin-wait on dirty bit, verification loop for concurrent reads
+- [x] **Length-first comparison**: matches AOSP's `cmp_prop_name` exactly
 
 **Stealth**
-- [x] **Three-signal suppression** — stealth writes zero per-prop serial, skip global serial bump, and suppress futex wake
-- [x] **Count-preserving nuke** — delete + plausible replacement + compaction in one operation; enumeration count unchanged
-- [x] **Runtime harvest** — replacement names drawn from the device's own property vocabulary (unfingerprintable)
-- [x] **Randomized selection** — OS-seeded entropy picks different names each run
-- [x] **3-tier fallback** — harvest pool → static dictionary (~95 words) → dot-split compound generation
-- [x] **Plausible value** — replaced/mangled properties show value `0` instead of empty string
-- [x] **Name consistency** — trie segments and prop_info name written from same source (no cross-validation mismatch)
-- [x] **Length-bucketed** — replacement is always exact same byte length as original
-- [x] **Shared segment detection** — skips renaming prefixes used by other properties
-- [x] **Arena compaction** — defragments holes left by deleted properties, eliminating forensic gaps
+- [x] **Three-signal suppression**: stealth writes zero per-prop serial, skip global serial bump, and suppress futex wake
+- [x] **Count-preserving nuke**: delete + plausible replacement + compaction in one operation; enumeration count unchanged
+- [x] **Runtime harvest**: replacement names drawn from the device's own property vocabulary (unfingerprintable)
+- [x] **Randomized selection**: OS-seeded entropy picks different names each run
+- [x] **3-tier fallback**: harvest pool → static dictionary (~95 words) → dot-split compound generation
+- [x] **Plausible value**: replaced/mangled properties show value `0` instead of empty string
+- [x] **Name consistency**: trie segments and prop_info name written from same source (no cross-validation mismatch)
+- [x] **Length-bucketed**: replacement is always exact same byte length as original
+- [x] **Shared segment detection**: skips renaming prefixes used by other properties
+- [x] **Arena compaction**: defragments holes left by deleted properties, eliminating forensic gaps
 
 **Seal**
-- [x] **Two-tier seal** — stealth write + ptrace-driven lock against init-mediated writers; no `setprop`, `property_service`, or bionic `__system_property_set` caller can revert a sealed prop
-- [x] **Tier B default (`-sl` / `--seal`)** — per-prop hook on `__system_property_update` inside init; only the sealed prop freezes, neighbors continue to update normally
-- [x] **Tier A fallback (`-sla` / `--seal-arena`)** — arena-level `MAP_PRIVATE|MAP_FIXED` remap in init; guaranteed to work but freezes every prop in the same arena as a side-effect
-- [x] **`-st` semantics unchanged** — pure stealth write, no ptrace, no hook, no arena remap; 100% back-compat for existing scripts
-- [x] **Bypass surface — direct-mmap writers** — callers that write `/dev/__properties__/<ctx>` directly route around init and defeat both tiers. Confirmed bypass vectors: KernelSU's `/data/adb/ksu/bin/resetprop` for every `ro.*` key and every `-n` / `--skip-svc` write (its dispatch branch at `sys_prop.rs:580` forces direct-mmap for those paths, landing bytes via `core::ptr::copy_nonoverlapping` at `mmap_prop_area.rs:277`), Magisk's resetprop (same pattern), and `resetprop-rs` itself invoked against a sealed prop. Seal protects against init-mediated reverts, not against another root tool writing the arena inode — the threat model is init-routed writers, not every root process on the device.
-- [x] **Detection signature — Tier B installed hook** — a rooted observer inspecting `/proc/1/maps` sees the hook body as a `PROT_R|X` file-backed mapping whose backing inode has been unlinked: `/data/adb/resetprop-rs/hook-<pid>-<nanos>.bin (deleted)`. The on-disk file is written, opened + mmap'd in init, then immediately unlinked from the host so the kernel keeps the inode alive only via init's mapping reference (`hook.rs:428-488`). This path is used instead of an anonymous RWX mapping so init's `process:execmem` SELinux class is not exercised on stock Xiaomi HyperOS policies.
-- [x] **In-session only** — `SealRecord` lives in process memory; seals do not persist across reboots, `SystemProperties::Reload`, or init restart — re-run `--seal` / `--seal-arena` after every boot
-- [x] **Attach-window stall** — the first `-sl` / `-sla` call on a process ptrace-attaches to init and installs the trampoline in a 15–40 ms window on modern ARM64 handsets; any thread that blocks on init for a property write during that window waits out the full stall (zygote, system_server, init-launched daemons included). Subsequent calls skip the ELF parse and remote mmap, so they complete substantially faster.
-- [x] **Futex waiters stall silently on sealed props** — `__system_property_wait(pi, ...)` waits on init's private serial copy; a sealed prop's serial never bumps in the caller's view, so waiters never wake. Aligned with seal intent (a sealed prop should not notify of spurious updates); downstream test authors must not use waiter-based probes on sealed props.
+- [x] **Two-tier seal**: stealth write + ptrace-driven lock against init-mediated writers; no `setprop`, `property_service`, or bionic `__system_property_set` caller can revert a sealed prop
+- [x] **Tier B default (`-sl` / `--seal`)**: per-prop hook on `__system_property_update` inside init; only the sealed prop freezes, neighbors continue to update normally
+- [x] **Tier A fallback (`-sla` / `--seal-arena`)**: arena-level `MAP_PRIVATE|MAP_FIXED` remap in init; guaranteed to work but freezes every prop in the same arena as a side-effect
+- [x] **`-st` semantics unchanged**: pure stealth write, no ptrace, no hook, no arena remap; 100% back-compat for existing scripts
+- [x] **Bypass surface (direct-mmap writers)**: callers that write `/dev/__properties__/<ctx>` directly route around init and defeat both tiers. Confirmed bypass vectors: KernelSU's `/data/adb/ksu/bin/resetprop` for every `ro.*` key and every `-n` / `--skip-svc` write (its dispatch branch at `sys_prop.rs:580` forces direct-mmap for those paths, landing bytes via `core::ptr::copy_nonoverlapping` at `mmap_prop_area.rs:277`), Magisk's resetprop (same pattern), and `resetprop-rs` itself invoked against a sealed prop. Seal protects against init-mediated reverts, not against another root tool writing the arena inode. The threat model is init-routed writers, not every root process on the device.
+- [x] **Detection signature (Tier B installed hook)**: a rooted observer inspecting `/proc/1/maps` sees the hook body as a `PROT_R|X` file-backed mapping whose backing inode has been unlinked: `/data/adb/resetprop-rs/hook-<pid>-<nanos>.bin (deleted)`. The on-disk file is written, opened + mmap'd in init, then immediately unlinked from the host so the kernel keeps the inode alive only via init's mapping reference (`hook.rs:428-488`). This path is used instead of an anonymous RWX mapping so init's `process:execmem` SELinux class is not exercised on stock Xiaomi HyperOS policies.
+- [x] **In-session only**: `SealRecord` lives in process memory; seals do not persist across reboots, `SystemProperties::Reload`, or init restart. Re-run `--seal` / `--seal-arena` after every boot
+- [x] **Attach-window stall**: the first `-sl` / `-sla` call on a process ptrace-attaches to init and installs the trampoline in a 15–40 ms window on modern ARM64 handsets; any thread that blocks on init for a property write during that window waits out the full stall (zygote, system_server, init-launched daemons included). Subsequent calls skip the ELF parse and remote mmap, so they complete substantially faster.
+- [x] **Futex waiters stall silently on sealed props**: `__system_property_wait(pi, ...)` waits on init's private serial copy; a sealed prop's serial never bumps in the caller's view, so waiters never wake. Aligned with seal intent (a sealed prop should not notify of spurious updates); downstream test authors must not use waiter-based probes on sealed props.
 
 ---
 
@@ -237,7 +240,7 @@ adb shell 'getprop ro.telephony.default_network'
 # 0
 ```
 
-Seals do not persist across reboots — they live only in the running init's
+Seals do not persist across reboots. They live only in the running init's
 memory. To keep a prop sealed across boots, re-apply from a KSU/Magisk
 module's `post-fs-data.sh`:
 
@@ -250,7 +253,7 @@ module's `post-fs-data.sh`:
        --seal-arena ro.telephony.default_network 0
 ```
 
-The `||` chain falls back to Tier A if Tier B refuses — useful on builds
+The `||` chain falls back to Tier A if Tier B refuses. Useful on builds
 where init's `libc.so` shape breaks the ELF walker (`HookInstallFailed`,
 `ElfParse`, or `SymbolNotFound` error classes). Tier A freezes every prop
 in the same arena as a side effect; for `ro.telephony.default_network` on
@@ -300,8 +303,11 @@ resetprop-rs --wait ro.crypto.state encrypted --timeout 30
 | `-n` | No-op (compatibility with Magisk's resetprop) |
 | `--init` | Zero the serial counter when writing (mimics init for `ro.*` properties) |
 | `--stealth`, `-st` | Stealth set: zeroed serial, no global serial bump, no futex wake |
+| `--if-diff` | With positional NAME VALUE: write only when the property exists and the current value differs |
+| `--if-match NEEDLE` | With positional NAME VALUE: write only when the current value equals NEEDLE and differs from VALUE |
+| `--delete-if-exist NAME` | Delete NAME only when the property is present; exit 0 on absent |
 | `--seal NAME VALUE`, `-sl NAME VALUE` | Tier B seal (default): stealth write + per-prop init hook. Does not persist across reboots. |
-| `--seal-arena NAME VALUE`, `-sla NAME VALUE` | Tier A seal (fallback): stealth write + arena-level `MAP_PRIVATE` in init. Broader blast radius; no auto-fallback — invoke manually after `--seal` reports a Tier B install failure. |
+| `--seal-arena NAME VALUE`, `-sla NAME VALUE` | Tier A seal (fallback): stealth write + arena-level `MAP_PRIVATE` in init. Broader blast radius; no auto-fallback. Invoke manually after `--seal` reports a Tier B install failure. |
 | `--unseal NAME` | Remove NAME from the Tier B in-init lock list. |
 | `--unseal-arena NAME` | Revert Tier A privatization for the arena holding NAME. |
 | `--seals` | List active seals (name, tier, arena). |
@@ -325,7 +331,7 @@ resetprop-rs --wait ro.crypto.state encrypted --timeout 30
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-resetprop = "0.4"
+resetprop = "0.5"
 ```
 
 Or from git:
@@ -413,7 +419,7 @@ Outputs stripped binaries to `out/`:
 
 The build uses `opt-level=s`, LTO, `panic=abort`, strip, and single codegen unit for minimal binary size.
 
-**No NDK?** Fork the repo and go to **Actions → Build → Run workflow** — GitHub builds all four ABIs for you. Download them from the workflow artifacts.
+**No NDK?** Fork the repo and go to **Actions → Build → Run workflow**: GitHub builds all four ABIs for you. Download them from the workflow artifacts.
 
 ---
 
@@ -539,15 +545,14 @@ The `--wait` command also uses bionic's `__system_property_wait` when available,
 
 ## 🙏 Credits
 
-- **[hiking90/rsproperties](https://github.com/nicetynio/rsproperties)** — Rust property area parser that proved the approach viable (Apache-2.0)
-- **[topjohnwu/Magisk](https://github.com/topjohnwu/Magisk)** — original `resetprop` and the forked bionic approach
-- **[Pixel-Props/sensitive-props](https://github.com/Pixel-Props/sensitive-props?tab=readme-ov-file)** — property spoofing reference that informed the target property list
-- **[AOSP bionic](https://android.googlesource.com/platform/bionic/)** — canonical property area format specification
-- **[frknkrc44](https://github.com/frknkrc44)** — aspiration, proposed building this project
+- **[hiking90/rsproperties](https://github.com/nicetynio/rsproperties)**: Rust property area parser that proved the approach viable (Apache-2.0)
+- **[topjohnwu/Magisk](https://github.com/topjohnwu/Magisk)**: original `resetprop` and the forked bionic approach
+- **[Pixel-Props/sensitive-props](https://github.com/Pixel-Props/sensitive-props?tab=readme-ov-file)**: property spoofing reference that informed the target property list
+- **[AOSP bionic](https://android.googlesource.com/platform/bionic/)**: canonical property area format specification
 
 ### Contributors
 
-- **[fatalcoder524](https://github.com/fatalcoder524)** — stealth strategy design and testing
+- **[fatalcoder524](https://github.com/fatalcoder524)**: stealth strategy design and testing
 
 ---
 
