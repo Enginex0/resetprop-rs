@@ -286,19 +286,18 @@ impl Drop for RemoteAttach {
 ///    (`MAP_PRIVATE|MAP_FIXED` or `MAP_SHARED|MAP_FIXED` per `flags`) over
 ///    the arena VMA — must return exactly `mapping.start`; `remote_syscall`
 ///    close the fd.
-/// 7. `guard.detach()` returns cleanly.
-///
-/// The bootstrap RWX page is intentionally left mapped in the tracee — see
-/// the inline comment at the end of the body for the rationale.
+/// 7. munmap the bootstrap page (runs on every post-mmap exit), then
+///    `guard.detach()` returns cleanly.
 ///
 /// # Safety
 ///
 /// Caller guarantees `pid` refers to a process whose address space may be
 /// modified (typically `1` for init on a rooted Android device). The
-/// function installs a temporary 4 KiB RWX anonymous mapping in the
-/// tracee and does not unmap it before detach (see inline comment). A
-/// tracee death mid-sequence is detected as `Error::PtraceOp` via the
-/// existing `last_ptrace_op_err` path in P01's primitives.
+/// function installs a temporary 4 KiB RW anonymous mapping in the tracee
+/// and frees it on every post-mmap exit (see the closure + munmap at the
+/// end of the body). A tracee death mid-sequence is detected as
+/// `Error::PtraceOp` via the existing `last_ptrace_op_err` path in P01's
+/// primitives.
 pub(crate) unsafe fn remote_remap_private(
     pid: super::Pid,
     mapping: &super::maps::MapEntry,
@@ -410,80 +409,96 @@ pub(crate) unsafe fn remote_remap_private(
         ret as u64
     };
 
-    // --- Stage the arena path at `bootstrap_page` ------------------------
-    let path_bytes = arena_path.as_os_str().as_bytes();
-    let mut path_nul = Vec::with_capacity(path_bytes.len() + 1);
-    path_nul.extend_from_slice(path_bytes);
-    path_nul.push(0);
-    if path_nul.len() as u64 > BOOTSTRAP_PAGE_SIZE {
-        return Err(Error::HookInstallFailed(format!(
-            "arena path exceeds scratch page: {} bytes",
-            path_nul.len()
-        )));
-    }
-    // SAFETY: `bootstrap_page` is the fresh `PROT_RW` page we just mapped;
-    // process_vm_writev respects VMA write bits and the page is writable.
-    // Tracee remains ptrace-stopped for the duration (guarded above).
-    unsafe { super::ptrace::write_remote(pid, bootstrap_page, &path_nul)? };
+    // --- Stage path, openat, remap, close --------------------------------
+    // Every fallible step lives in this closure so the single munmap below
+    // frees `bootstrap_page` on both the success and the error exit — no
+    // post-mmap path can leak the page.
+    let staged = (|| -> Result<()> {
+        // --- Stage the arena path at `bootstrap_page` --------------------
+        let path_bytes = arena_path.as_os_str().as_bytes();
+        let mut path_nul = Vec::with_capacity(path_bytes.len() + 1);
+        path_nul.extend_from_slice(path_bytes);
+        path_nul.push(0);
+        if path_nul.len() as u64 > BOOTSTRAP_PAGE_SIZE {
+            return Err(Error::HookInstallFailed(format!(
+                "arena path exceeds scratch page: {} bytes",
+                path_nul.len()
+            )));
+        }
+        // SAFETY: `bootstrap_page` is the fresh `PROT_RW` page we just mapped;
+        // process_vm_writev respects VMA write bits and the page is writable.
+        // Tracee remains ptrace-stopped for the duration (guarded above).
+        unsafe { super::ptrace::write_remote(pid, bootstrap_page, &path_nul)? };
 
-    // --- openat(AT_FDCWD, bootstrap_page, flags.open_flags(), 0, 0, 0) ---
-    // SAFETY: scratch_pc points into libc.text r-xp; PEEK/POKEDATA bypasses
-    // VMA write bits; tracee stopped by RemoteAttach; bootstrap_page is
-    // PROT_RW and holds the NUL-terminated pathname at its base.
-    let fd_ret = unsafe {
-        super::ptrace::remote_syscall_via_poke(
-            pid,
-            scratch_pc,
-            NR_OPENAT,
-            [AT_FDCWD, bootstrap_page, flags.open_flags(), 0, 0, 0],
-        )?
-    };
-    if fd_ret < 0 {
-        return Err(Error::HookInstallFailed(format!(
-            "openat failed: errno={}",
-            -fd_ret
-        )));
-    }
-    let fd = fd_ret as u64;
+        // --- openat(AT_FDCWD, bootstrap_page, flags.open_flags(), 0, 0, 0) -
+        // SAFETY: scratch_pc points into libc.text r-xp; PEEK/POKEDATA bypasses
+        // VMA write bits; tracee stopped by RemoteAttach; bootstrap_page is
+        // PROT_RW and holds the NUL-terminated pathname at its base.
+        let fd_ret = unsafe {
+            super::ptrace::remote_syscall_via_poke(
+                pid,
+                scratch_pc,
+                NR_OPENAT,
+                [AT_FDCWD, bootstrap_page, flags.open_flags(), 0, 0, 0],
+            )?
+        };
+        if fd_ret < 0 {
+            return Err(Error::HookInstallFailed(format!(
+                "openat failed: errno={}",
+                -fd_ret
+            )));
+        }
+        let fd = fd_ret as u64;
 
-    // --- mmap(mapping.start, len, PROT_RW, flags.mmap_flags(), fd, 0) ----
-    // SAFETY: same rationale as the openat call above.
-    let mmap_ret = unsafe {
-        super::ptrace::remote_syscall_via_poke(
-            pid,
-            scratch_pc,
-            NR_MMAP,
-            [
-                mapping.start,
-                mapping.end - mapping.start,
-                PROT_RW,
-                flags.mmap_flags(),
-                fd,
-                0,
-            ],
-        )?
-    };
-    if mmap_ret as u64 != mapping.start {
-        // Best-effort close; diagnostic wins over tidy here.
+        // --- mmap(mapping.start, len, PROT_RW, flags.mmap_flags(), fd, 0) -
         // SAFETY: same rationale as the openat call above.
+        let mmap_ret = unsafe {
+            super::ptrace::remote_syscall_via_poke(
+                pid,
+                scratch_pc,
+                NR_MMAP,
+                [
+                    mapping.start,
+                    mapping.end - mapping.start,
+                    PROT_RW,
+                    flags.mmap_flags(),
+                    fd,
+                    0,
+                ],
+            )?
+        };
+        if mmap_ret as u64 != mapping.start {
+            // Best-effort close; diagnostic wins over tidy here.
+            // SAFETY: same rationale as the openat call above.
+            let _ = unsafe {
+                super::ptrace::remote_syscall_via_poke(
+                    pid,
+                    scratch_pc,
+                    NR_CLOSE,
+                    [fd, 0, 0, 0, 0, 0],
+                )
+            };
+            return Err(Error::HookInstallFailed(format!(
+                "mmap returned {mmap_ret:#x}, expected {:#x}",
+                mapping.start
+            )));
+        }
+
+        // --- close(fd) ---------------------------------------------------
+        // SAFETY: scratch_pc is in libc.text r-xp; PEEK/POKEDATA bypasses write
+        // bits. Close failure here is benign — the seal is already applied, and
+        // a retry would leak a second bootstrap page. Diagnostic over tidy.
         let _ = unsafe {
             super::ptrace::remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
         };
-        return Err(Error::HookInstallFailed(format!(
-            "mmap returned {mmap_ret:#x}, expected {:#x}",
-            mapping.start
-        )));
-    }
 
-    // --- close(fd) -------------------------------------------------------
-    // SAFETY: scratch_pc is in libc.text r-xp; PEEK/POKEDATA bypasses write bits.
-    // Close failure here is benign — the seal is already applied, and a retry
-    // would leak a second bootstrap page. Diagnostic over tidy.
-    let _ = unsafe {
-        super::ptrace::remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
-    };
+        Ok(())
+    })();
 
     // --- munmap(bootstrap_page, BOOTSTRAP_PAGE_SIZE) ---------------------
+    // Runs on BOTH the success and the error exit of the closure above, so the
+    // bootstrap page is freed on every post-mmap path — no error unwind leaks
+    // the 4 KiB.
     // SAFETY: scratch_pc is in libc.text r-xp; remote_syscall_via_poke bypasses
     // VMA write bits via PEEK/POKEDATA. munmap failure here is benign (leaked
     // 4 KiB in the tracee) — the seal itself is already applied, so do not
@@ -497,8 +512,8 @@ pub(crate) unsafe fn remote_remap_private(
         )
     };
 
-    // Bootstrap page released via remote munmap above; leak is bounded to
-    // the error-unwind path only.
+    // Propagate any staging error only after the page has been released above.
+    staged?;
 
     guard.detach()?;
     Ok(())
