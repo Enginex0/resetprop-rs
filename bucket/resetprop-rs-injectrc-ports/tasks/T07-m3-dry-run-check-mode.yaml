@@ -1,0 +1,26 @@
+id: T07
+title: M3 — dry-run / --check mode
+objective: |
+  Add a no-poke dry-run: resolve symbol + parse maps + locate the scratch
+  slot WITHOUT writing into init, so an operator validates on-device before
+  the real patch. Wire a --check flag in the hand-rolled CLI parser.
+deliverables:
+  - dry-run path in install_init_hook performing the no-side-effect sub-ops only
+  - --check bool flag added to the CLI flag parser (no clap)
+acceptance:
+  - "cargo test -p resetprop passes"
+  - "resetprop-cli --seal <prop> --check resolves and reports with no ptrace write (no AVC, no trampoline installed)"
+  - "cargo clippy -p resetprop -- -D warnings is clean"
+deps: [T04]
+files:
+  - crates/resetprop/src/seal/hook.rs
+  - crates/resetprop-cli/src/main.rs
+refs:
+  - "crates/resetprop/src/seal/hook.rs:335-383 (install_init_hook; gate with dry-run)"
+  - "crates/resetprop/src/seal/hook.rs:207-256 (stage_a_locked; parse_maps+ELF+resolve, the no-poke sub-ops)"
+  - "crates/resetprop/src/seal/hook.rs:274-290 (derive_libc_scratch_pc; scratch slot, no side-effect)"
+  - "crates/resetprop-cli/src/main.rs:16-120 (hand-rolled parser, NOT clap; add --check bool arm)"
+  - "crates/resetprop-cli/src/main.rs:64-67 (--seal arm to mirror)"
+  - "crates/resetprop-cli/src/main.rs:378-382 (arg_val helper)"
+reading_estimate_k: 33
+rev: 311f7bf

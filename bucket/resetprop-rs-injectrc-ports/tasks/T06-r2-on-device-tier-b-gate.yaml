@@ -1,0 +1,21 @@
+id: T06
+title: R2/P05 — on-device Tier B acceptance gate
+objective: |
+  Validation, not code: run Tier B install + multi-prop seal/unseal against
+  real init on aarch64. This is the gate that surfaces Defect A's real effect
+  — a multi-entry lock-list (len>1) where the .advance walker overshoots
+  entry boundaries, so per-property seal must be checked across many entries.
+deliverables:
+  - recorded on-device run result (pass/fail + observed before/after getprop values)
+acceptance:
+  - "Tier B install on a real aarch64 device exits 0"
+  - ">=10 --seal/--unseal cycles across a multi-entry (len>1) lock list, each verified with getprop before and after"
+  - "multi-entry seal lands on the correct entry (no boundary overshoot) for every entry in the list"
+  - "adb shell dmesg | grep avc count is unchanged from the pre-run baseline"
+  - "result recorded as a pass/fail checklist run"
+deps: [T01, T03, T04, T05]
+files: []
+refs:
+  - "tests/device-stress-test.sh:318-383 (existing on-device Tier B seal/unseal procedure; extend to >=10 cycles over a multi-entry list)"
+reading_estimate_k: 3
+rev: 311f7bf

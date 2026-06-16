@@ -1,0 +1,24 @@
+id: T12
+title: Port 3 — XZ decoder module + Cargo dep
+objective: |
+  Provide the pure-Rust XZ decode the .gnu_debugdata mini-symtab needs.
+  New seal/xz_decoder.rs wrapping lzma-rs; add the dep to Cargo.toml with a
+  justifying comment (the second non-libc runtime dep, accepted per plan).
+deliverables:
+  - new seal/xz_decoder.rs with decode(&[u8]) -> Result<Vec<u8>>
+  - "lzma-rs added to Cargo.toml [dependencies] with a justifying comment"
+  - "seal/mod.rs: pub mod xz_decoder; added"
+acceptance:
+  - "cargo build -p resetprop resolves the new lzma-rs dep"
+  - "cargo test -p resetprop passes incl. an XZ round-trip test against a known-good compressed fixture"
+  - "cargo clippy -p resetprop -- -D warnings is clean"
+deps: []
+files:
+  - crates/resetprop/src/seal/xz_decoder.rs
+  - crates/resetprop/Cargo.toml
+  - crates/resetprop/src/seal/mod.rs
+refs:
+  - "crates/resetprop/Cargo.toml:13-14 ([dependencies], currently only libc; add lzma-rs)"
+  - "crates/resetprop/src/seal/mod.rs:12-16 (pub mod block to extend)"
+reading_estimate_k: 1
+rev: 311f7bf

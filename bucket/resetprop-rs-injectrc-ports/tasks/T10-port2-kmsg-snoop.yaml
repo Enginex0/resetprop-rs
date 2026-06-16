@@ -1,0 +1,33 @@
+id: T10
+title: Port 2 — kmsg fd snoop observer
+objective: |
+  Add in-init observability: discover init's kmsg fds, persist them in
+  HookHandle, and add an observe-init syscall-trace snoop that dumps
+  write(kmsg_fd, ...) buffers. Wire --observe-init in the CLI parser.
+deliverables:
+  - new seal/kmsg_observer.rs (discover_kmsg_fds, snoop_kmsg_writes_for_duration)
+  - "seal/mod.rs: pub mod kmsg_observer; added"
+  - "kmsg_fds: Vec<u64> field on HookHandle, populated in install_init_hook before Ok return"
+  - --observe-init [--duration] flag in the hand-rolled CLI parser (no clap)
+acceptance:
+  - "cargo test -p resetprop passes incl. discover_kmsg_fds against a synthetic /proc/<pid>/fd/ fixture"
+  - "on-device positive trigger: setprop persist.pv.kmsg-probe-<rand> while observe-init runs captures >=1 kmsg line in the window (a bare exit-0-no-output run does NOT pass)"
+  - "cargo clippy -p resetprop -- -D warnings is clean"
+deps: [T09]
+files:
+  - crates/resetprop/src/seal/hook.rs
+  - crates/resetprop/src/seal/kmsg_observer.rs
+  - crates/resetprop/src/seal/mod.rs
+  - crates/resetprop-cli/src/main.rs
+refs:
+  - "crates/resetprop/src/seal/hook.rs:145-173 (HookHandle; add kmsg_fds field)"
+  - "crates/resetprop/src/seal/hook.rs:335-383 (install_init_hook; populate before Ok return)"
+  - "crates/resetprop/src/seal/mod.rs:12-16 (pub mod block to extend)"
+  - "crates/resetprop-cli/src/main.rs:16-120 (parser; add --observe-init arm)"
+  - "crates/resetprop-cli/src/main.rs:378-382 (arg_val for --duration)"
+external_refs:
+  - "injectrc@c3fb624 init_injector/injector.cpp:213-232 (kmsg fd discovery via /proc/<pid>/fd readlink)"
+  - "injectrc@c3fb624 init_injector/injector.cpp:289-302 (NR_write kmsg intercept)"
+  - "injectrc@c3fb624 init_injector/injector.cpp:254-310 (syscall-trace loop skeleton)"
+reading_estimate_k: 34
+rev: 311f7bf

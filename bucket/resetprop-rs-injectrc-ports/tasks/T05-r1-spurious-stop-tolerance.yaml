@@ -1,0 +1,25 @@
+id: T05
+title: R1 — spurious-stop tolerance in wait_stop
+objective: |
+  wait_stop accepts exactly one expected stop and errors on anything else,
+  flaking when init is busy. Make it loop, re-CONTing benign group-stops /
+  SIGCHLD, while keeping the strict expected-event check for the final stop.
+deliverables:
+  - wait_stop loops over benign intermediate stops, re-CONTing them
+  - strict expected-event check preserved for the final awaited stop
+acceptance:
+  - "cargo test -p resetprop passes"
+  - "a unit test injecting a benign intermediate stop still reaches the expected event"
+  - "the strict check still rejects a genuinely-unexpected status (PtraceUnexpectedStatus)"
+  - "cargo clippy -p resetprop -- -D warnings is clean"
+deps: []
+files:
+  - crates/resetprop/src/seal/ptrace.rs
+refs:
+  - "crates/resetprop/src/seal/ptrace.rs:249-265 (wait_stop body)"
+  - "crates/resetprop/src/seal/ptrace.rs:262 (PtraceUnexpectedStatus; strict check to preserve for final stop)"
+external_refs:
+  - "ReZygisk@093dfaf loader/src/ptracer/utils.c:1043-1082 (wait_for_trace CONT-on-SIGCHLD)"
+  - "ReZygisk@093dfaf loader/src/ptracer/utils.c:835-889 (wait_for_ptrace_syscall_stop 4x retry)"
+reading_estimate_k: 12
+rev: 311f7bf

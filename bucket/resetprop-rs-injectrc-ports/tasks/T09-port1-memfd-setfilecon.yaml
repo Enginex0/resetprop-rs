@@ -1,0 +1,35 @@
+id: T09
+title: Port 1 — memfd + setfilecon SELinux relabel
+objective: |
+  Replace the host-file hook-page disk dance (HOOK_FILE_DIR write/unlink +
+  openat/mmap) with the injectrc memfd pattern: remote memfd_create, write
+  via /proc/1/fd/<fd>, setfilecon-relabel to libc context, remote mmap/close.
+  Hand-rolled libselinux FFI (zero Cargo change).
+deliverables:
+  - HOOK_FILE_DIR, write_host_hook_file, install_file_backed_hook_page removed
+  - mmap_file_backed_in_tracee replaced with memfd-based variant
+  - new seal/selinux.rs with hand-rolled setfilecon/getfilecon FFI
+  - "seal/mod.rs: pub mod selinux; added"
+  - install_init_hook docstring updated to the relabel-to-libc SELinux contract
+acceptance:
+  - "cargo test -p resetprop passes incl. a new memfd install round-trip test (mocked remote syscalls return a non-zero address)"
+  - "on-device smoke: adb shell ls /data/adb/resetprop-rs/ shows zero hook-*.bin residue at any point during install"
+  - "adb shell dmesg | grep avc shows no denial for adb_data_file:file:execute or the memfd after install"
+  - "cargo clippy -p resetprop -- -D warnings is clean"
+deps: [T08, T12]
+files:
+  - crates/resetprop/src/seal/hook.rs
+  - crates/resetprop/src/seal/selinux.rs
+  - crates/resetprop/src/seal/mod.rs
+refs:
+  - "crates/resetprop/src/seal/hook.rs:53-58 (HOOK_FILE_DIR const + docstring being replaced)"
+  - "crates/resetprop/src/seal/hook.rs:292-316 (install_init_hook docstring / SELinux contract)"
+  - "crates/resetprop/src/seal/hook.rs:428-444 (install_file_backed_hook_page orchestrator replaced)"
+  - "crates/resetprop/src/seal/hook.rs:492-511 (mmap_file_backed_in_tracee openat/mmap/close triad replaced by memfd)"
+  - "crates/resetprop/src/seal/mod.rs:12-16 (pub mod block to extend)"
+external_refs:
+  - "injectrc@c3fb624 init_injector/injector.cpp:60-71 (memfd_create + /proc/<pid>/fd write)"
+  - "injectrc@c3fb624 init_injector/injector.cpp:179-183 (set_system_con call-site / relabel ordering)"
+  - "injectrc@c3fb624 init_injector/ptrace_utils.cpp:744-755 (set_system_con/get_system_con FFI bodies to hand-roll)"
+reading_estimate_k: 26
+rev: 311f7bf

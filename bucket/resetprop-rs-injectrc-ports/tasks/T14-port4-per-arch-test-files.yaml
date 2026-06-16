@@ -1,0 +1,29 @@
+id: T14
+title: Port 4 — per-arch sibling test files
+objective: |
+  tests/ptrace_core_smoke.rs gates the whole file behind aarch64, so the
+  non-aarch64 acceptance is vacuous. Author sibling test files, each
+  #![cfg(target_arch=...)], with per-arch trap/breakpoint encoding fixtures.
+  RISC-V test deferred with its arch.
+deliverables:
+  - tests/ptrace_core_smoke_x86_64.rs (#![cfg(target_arch="x86_64")])
+  - tests/ptrace_core_smoke_arm.rs (#![cfg(target_arch="arm")])
+  - tests/ptrace_core_smoke_x86.rs (#![cfg(target_arch="x86")])
+acceptance:
+  - "cargo test -p resetprop --target x86_64-linux-android runs a non-empty test binary asserting the x86_64 trap/bkpt encodings + reg layout"
+  - "cargo test -p resetprop --target armv7-linux-androideabi runs the non-empty arm fixture"
+  - "cargo test -p resetprop --target i686-linux-android runs the non-empty x86 fixture"
+  - "the existing aarch64 test (ptrace_core_smoke.rs) is unchanged"
+deps: [T13]
+files:
+  - crates/resetprop/tests/ptrace_core_smoke_x86_64.rs
+  - crates/resetprop/tests/ptrace_core_smoke_arm.rs
+  - crates/resetprop/tests/ptrace_core_smoke_x86.rs
+refs:
+  - "crates/resetprop/tests/ptrace_core_smoke.rs:1-30 (#![cfg] gate + empty-binary doc pattern to mirror)"
+  - "crates/resetprop/tests/ptrace_core_smoke.rs:107-186 (test body shape to replicate per-arch)"
+  - "crates/resetprop/src/seal/ptrace.rs:76-89 (ARM64 encoding consts the aarch64 fixture asserts)"
+external_refs:
+  - "injectrc@c3fb624 init_injector/ptrace_utils.hpp:25-65 (per-arch encodings the fixtures assert)"
+reading_estimate_k: 10
+rev: 311f7bf

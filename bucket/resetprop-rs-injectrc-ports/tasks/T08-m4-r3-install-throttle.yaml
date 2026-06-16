@@ -1,0 +1,27 @@
+id: T08
+title: M4/R3 — per-boot install throttle
+objective: |
+  If a seal install has hard-failed N times this boot, refuse further
+  attempts to avoid bootloop-on-retry. Counter is a module-level
+  AtomicU32 in hook.rs; reuse Error::HookInstallFailed (no new variant).
+deliverables:
+  - module-level AtomicU32 hard-fail counter in hook.rs
+  - throttle guard at the top of install_init_hook refusing after N failures
+acceptance:
+  - "cargo test -p resetprop passes"
+  - "after N forced hard-failures the next attempt is refused with Error::HookInstallFailed before any ptrace attach (unit test)"
+  - "cargo clippy -p resetprop -- -D warnings is clean"
+deps: [T07]
+files:
+  - crates/resetprop/src/seal/hook.rs
+refs:
+  - "crates/resetprop/src/seal/hook.rs:335-383 (install_init_hook; throttle guard at top)"
+  - "crates/resetprop/src/seal/hook.rs:1-127 (module const block; where the new static lands)"
+  - "crates/resetprop/src/seal/hook.rs:144-173 (HookHandle; confirms counter must be module-static, not per-handle)"
+  - "crates/resetprop/src/lib.rs:374-381 (PropSystem hook_handle slot; throttle precedes get_or_init; read-only)"
+  - "crates/resetprop/src/lib.rs:760-793 (seal() call site, guard.is_none() at :775; read-only)"
+  - "crates/resetprop/src/error.rs:6-26 (HookInstallFailed at :24 reused; read-only)"
+external_refs:
+  - "ReZygisk@093dfaf loader/src/ptracer/monitor.c:403-423 (MAX_RETRY_COUNT=5 throttle philosophy)"
+reading_estimate_k: 27
+rev: 311f7bf

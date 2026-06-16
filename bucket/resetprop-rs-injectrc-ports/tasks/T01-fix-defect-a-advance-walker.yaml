@@ -1,0 +1,21 @@
+id: T01
+title: Fix Defect A — lock-list .advance walker mis-encoding
+objective: |
+  HOOK_BODY_TEMPLATE word 22 ships 0x3841_054b (ldrb w11,[x10],#16),
+  so .advance overshoots every lock-list entry by 16x. Correct it to
+  0x3840_154b (ldrb w11,[x10],#1) and the test asserting the same wrong const.
+deliverables:
+  - hook.rs word-22 constant changed 0x3841_054b -> 0x3840_154b
+  - round-trip test updated to assert 0x3840_154b
+acceptance:
+  - "cargo test -p resetprop passes"
+  - "the .advance round-trip test asserts 0x3840_154b (not 0x3841_054b)"
+  - "cargo clippy -p resetprop -- -D warnings is clean"
+deps: []
+files:
+  - crates/resetprop/src/seal/hook.rs
+refs:
+  - "crates/resetprop/src/seal/hook.rs:852-875 (HOOK_BODY_TEMPLATE; word 22 wrong const at :875)"
+  - "crates/resetprop/src/seal/hook.rs:1874-1898 (round-trip test asserting same wrong const; #[test] at :1874)"
+reading_estimate_k: 26
+rev: 311f7bf

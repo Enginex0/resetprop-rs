@@ -1,0 +1,24 @@
+id: T02
+title: Fix bootstrap-page leak on arena cold-error paths
+objective: |
+  remote_remap_private leaks the 4 KiB bootstrap page on early error
+  returns (path-too-long, openat failure) between the bootstrap mmap and
+  the final munmap. Free it on each cold-error path before return.
+deliverables:
+  - remote munmap of the bootstrap page on the path-too-long early return
+  - remote munmap of the bootstrap page on the openat-failure early return
+acceptance:
+  - "cargo test -p resetprop passes"
+  - "each early return after the bootstrap mmap frees the page before returning (inspection + unit check)"
+  - "cargo clippy -p resetprop -- -D warnings is clean"
+deps: []
+files:
+  - crates/resetprop/src/seal/arena.rs
+refs:
+  - "crates/resetprop/src/seal/arena.rs:302-307 (remote_remap_private signature)"
+  - "crates/resetprop/src/seal/arena.rs:346-411 (bootstrap_page mmap block)"
+  - "crates/resetprop/src/seal/arena.rs:418-423 (path-too-long early return; leak site 1)"
+  - "crates/resetprop/src/seal/arena.rs:441-446 (openat-fail early return; leak site 2)"
+  - "crates/resetprop/src/seal/arena.rs:486-498 (success-path remote munmap to replicate)"
+reading_estimate_k: 9
+rev: 311f7bf
