@@ -1,0 +1,11 @@
+# Status ledger. Flags only. Detail lives in code, docs/, and git log.
+# Shape is law: docs/schema/registry.schema.yaml in the Mold repo.
+# This is a snapshot of "what matters now", not a redundant index.
+
+current_focus: "resetprop-rs-injectrc-ports — implement Wave-1 (T01, T02, T05, T12)"
+
+priorities: []
+
+blocked: {}
+
+recent_done: []

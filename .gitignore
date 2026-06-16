@@ -4,3 +4,17 @@
 .env
 *.pem
 *.key
+
+# seal: regenerable output + agent scratch (keep execution sessions lean)
+*.bak
+graphify-out/
+target/
+.gradle/
+build/
+.omc/
+.analysis/
+.mcp-vector-search/
+vectors.db
+vectors.db-shm
+vectors.db-wal
+logs_llm/

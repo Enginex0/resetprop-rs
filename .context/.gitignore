@@ -1,0 +1,13 @@
+# .context/.gitignore - managed by the Mold stamp
+#
+# experimental/ is a persistent scratch workspace for decompiled artifacts,
+# pulled device files, and in-flight analysis. Contents are intentionally not
+# versioned; commit specific subpaths only when they become stable deliverables
+# (then move them out of experimental/ into src/, docs/, etc.).
+
+experimental/*
+!experimental/.gitkeep
+!experimental/README.md
+
+# change-aware marker for the scheduled passes; local state, never committed
+run-marker.yaml
