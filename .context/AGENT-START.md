@@ -2,9 +2,9 @@
 
 ```
 branch:  main
-last:    9170052  (W2 merged + pushed to origin/main)
-active:  T03 init-identity guard landed in working tree (Error::NotInit + verify_init_identity before both poke entry points + 4 unit tests; cargo test 146✓, clippy -D warnings clean) — NOT yet committed
-next:    commit T03, then T16 (ready) or T04 (now unblocked, critical path). first 2-wide window opens (T13 ∥ T04|T16); hook.rs serializes the rest.
+last:    ed7a618  (T03 init-identity guard — feat(seal))
+active:  T03 committed — Error::NotInit + verify_init_identity gating both fresh-pid poke entry points (remote_remap_private, install_init_hook); cargo test 146✓, clippy -D warnings clean. Not pushed.
+next:    T16 (ready) or T04 (now unblocked, critical path). first 2-wide window opens (T13 ∥ T04|T16); hook.rs serializes the rest.
 ```
 
 ## Pointers (open only when the task needs them)
@@ -20,7 +20,7 @@ next:    commit T03, then T16 (ready) or T04 (now unblocked, critical path). fir
 17 active tasks; W2 merged 2026-06-16 (T15, T19). Status + parallelism:
 
 ```
-done T01 T02 T03 T05 T15 T19    (T12 done → reverted by T19; T03 in working tree, pending commit)
+done T01 T02 T03 T05 T15 T19    (T12 done → reverted by T19)
 now  T16 🟢                     ← ready; writes seal/hook.rs
 W4   T04  T18  T13          T13 is the only non-hook.rs task → first parallel partner
 W5   T07  T17               T17 dep[T15] met but wave-parked (4-file refactor, collides broadly)
