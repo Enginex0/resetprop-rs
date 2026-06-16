@@ -236,32 +236,108 @@ pub fn ptrace_interrupt(pid: Pid) -> Result<()> {
     Ok(())
 }
 
-/// `waitpid(pid, &status, __WALL)` — block until a ptrace-stop arrives and
-/// verify it matches the caller's expected stop kind.
+/// Verdict for one decoded `waitpid` status, produced by [`classify_stop`].
 ///
-/// Verifies `WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP` AND that the
-/// upper event byte equals `expected_event`. Callers pass
-/// [`PTRACE_EVENT_STOP`] (128) to consume the initial SEIZE+INTERRUPT
-/// group-stop, or `0` to consume a brk-trap (post-`svc`). Any mismatch
-/// surfaces as [`Error::PtraceUnexpectedStatus`] carrying the raw status
-/// bits for diagnosis. `waitpid` syscall failure maps to
-/// [`Error::PtraceOp`] via [`last_ptrace_op_err`].
-pub fn wait_stop(pid: Pid, expected_event: u32) -> Result<i32> {
-    let mut status: i32 = 0;
-    // SAFETY: `status` lives on the stack for the duration of the call;
-    // `waitpid` writes through the pointer only while blocked, returns
-    // pid on success or -1 on error (captured via errno).
-    let rc = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
-    if rc == -1 {
-        return Err(last_ptrace_op_err());
-    }
+/// Ported from ReZygisk's `wait_for_trace` branch ladder
+/// (`loader/src/ptracer/utils.c:1043-1082`): a benign intermediate stop is
+/// re-`CONT`ed and the loop continues; the awaited stop is accepted; anything
+/// else is the strict `PtraceUnexpectedStatus` fault.
+enum StopVerdict {
+    /// A benign intermediate stop (init busy → `SIGCHLD` group-stop). Mirrors
+    /// the `WIFSTOPPED && WSTOPSIG == SIGCHLD` arm at utils.c:1058 — re-`CONT`
+    /// the tracee and wait again. NOT the awaited event, so it is never
+    /// returned to the caller as success.
+    ContAndRetry,
+    /// The awaited ptrace-stop: `WIFSTOPPED && WSTOPSIG == SIGTRAP &&
+    /// event == expected_event`. The original strict acceptance, preserved
+    /// verbatim for the final stop.
+    Awaited,
+    /// A genuinely-unexpected status. Surfaced as
+    /// [`Error::PtraceUnexpectedStatus`] — kept strict so the seal spine still
+    /// detects real faults; deliberately NOT a catch-all.
+    Unexpected,
+}
+
+/// Pure status classifier — no syscalls — so the [`wait_stop`] loop is unit
+/// testable on any host by injecting raw `waitpid` statuses.
+///
+/// Port fidelity (ReZygisk `wait_for_trace`, utils.c:1043-1082):
+/// - `SIGCHLD` ptrace-stop → [`StopVerdict::ContAndRetry`] (utils.c:1058-1063).
+/// - the awaited `SIGTRAP` + `event == expected_event` → [`StopVerdict::Awaited`].
+/// - everything else → [`StopVerdict::Unexpected`] (strict, no catch-all).
+///
+/// The reference's `PTRACE_EVENT_SECCOMP` skip-syscall arm (utils.c:1064-1069)
+/// is deliberately not ported: this engine never sets `PTRACE_O_TRACESECCOMP`,
+/// so a seccomp-event stop cannot arise on our tracee.
+fn classify_stop(status: i32, expected_event: u32) -> StopVerdict {
     let is_stopped = libc::WIFSTOPPED(status);
     let sig = libc::WSTOPSIG(status);
     let event = ((status >> 16) & 0xffff) as u32;
-    if !is_stopped || sig != libc::SIGTRAP || event != expected_event {
-        return Err(Error::PtraceUnexpectedStatus(status));
+    if is_stopped && sig == libc::SIGCHLD {
+        return StopVerdict::ContAndRetry;
     }
-    Ok(status)
+    if is_stopped && sig == libc::SIGTRAP && event == expected_event {
+        return StopVerdict::Awaited;
+    }
+    StopVerdict::Unexpected
+}
+
+/// `waitpid(pid, &status, __WALL)` — block until the awaited ptrace-stop
+/// arrives, tolerating benign intermediate stops, and verify it matches the
+/// caller's expected stop kind.
+///
+/// Ported from ReZygisk's `wait_for_trace` (`loader/src/ptracer/utils.c:1043`):
+/// loops over `waitpid`, retrying on `EINTR` and re-`CONT`ing benign `SIGCHLD`
+/// group-stops (raised when init forks while traced) before waiting again.
+/// The loop terminates by genuine progress: every benign stop consumed via
+/// `PTRACE_CONT` advances the tracee, so the kernel does not redeliver it, and
+/// any non-benign status returns immediately (awaited stop or fault).
+///
+/// The FINAL awaited stop keeps the original strict check: `WIFSTOPPED(status)
+/// && WSTOPSIG(status) == SIGTRAP` AND the upper event byte equals
+/// `expected_event`. Callers pass [`PTRACE_EVENT_STOP`] (128) to consume the
+/// initial SEIZE+INTERRUPT group-stop, or `0` to consume a brk-trap
+/// (post-`svc`). Any mismatch surfaces as [`Error::PtraceUnexpectedStatus`]
+/// carrying the raw status bits for diagnosis. `waitpid` syscall failure maps
+/// to [`Error::PtraceOp`] via [`last_ptrace_op_err`].
+pub fn wait_stop(pid: Pid, expected_event: u32) -> Result<i32> {
+    loop {
+        let mut status: i32 = 0;
+        // SAFETY: `status` lives on the stack for the duration of the call;
+        // `waitpid` writes through the pointer only while blocked, returns
+        // pid on success or -1 on error (captured via errno).
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
+        if rc == -1 {
+            // Port of utils.c:1047 — a signal interrupted the wait; retry.
+            // SAFETY: reading the thread-local errno slot.
+            if unsafe { *errno_ptr() } == libc::EINTR {
+                continue;
+            }
+            return Err(last_ptrace_op_err());
+        }
+        match classify_stop(status, expected_event) {
+            StopVerdict::ContAndRetry => {
+                // Port of utils.c:1061 — resume the tracee past the benign
+                // stop, then loop back into `waitpid`.
+                // SAFETY: `libc::ptrace` FFI; `addr`/`data` are NULL per the
+                // PTRACE_CONT contract. The tracee is ptrace-stopped (we just
+                // observed a stop status for it), so a CONT is legal.
+                let cont = unsafe {
+                    libc::ptrace(
+                        PTRACE_CONT as _,
+                        pid,
+                        std::ptr::null_mut::<c_void>(),
+                        std::ptr::null_mut::<c_void>(),
+                    )
+                };
+                if cont == -1 {
+                    return Err(last_ptrace_op_err());
+                }
+            }
+            StopVerdict::Awaited => return Ok(status),
+            StopVerdict::Unexpected => return Err(Error::PtraceUnexpectedStatus(status)),
+        }
+    }
 }
 
 /// `PTRACE_GETREGSET` with `NT_PRSTATUS` — snapshot AArch64 GP registers.
@@ -758,6 +834,92 @@ mod tests {
         assert_eq!(NT_PRSTATUS, 1);
         assert_eq!(ARM64_SVC_0, 0xd400_0001);
         assert_eq!(ARM64_BRK_0, 0xd420_0000);
+    }
+
+    /// Build a `waitpid` ptrace-stop status: low byte `0x7f` makes
+    /// `WIFSTOPPED` true, `WSTOPSIG` is bits 8..16, the ptrace event is
+    /// bits 16..32. Matches the encoding `wait_stop` decodes.
+    fn stopped_status(sig: i32, event: u32) -> i32 {
+        let s = 0x7f | (sig << 8) | ((event as i32) << 16);
+        assert!(libc::WIFSTOPPED(s));
+        assert_eq!(libc::WSTOPSIG(s), sig);
+        s
+    }
+
+    /// A benign `SIGCHLD` group-stop is classified as `ContAndRetry`; the
+    /// awaited `SIGTRAP` + matching event that follows reaches `Awaited`.
+    /// This is the spurious-stop tolerance: an intermediate stop is
+    /// re-`CONT`ed, then the expected event still lands.
+    #[test]
+    fn benign_intermediate_stop_then_reaches_expected_event() {
+        let benign = stopped_status(libc::SIGCHLD, 0);
+        assert!(
+            matches!(classify_stop(benign, PTRACE_EVENT_STOP), StopVerdict::ContAndRetry),
+            "benign SIGCHLD stop must be re-CONTed, not accepted or faulted"
+        );
+
+        let awaited = stopped_status(libc::SIGTRAP, PTRACE_EVENT_STOP);
+        assert!(
+            matches!(classify_stop(awaited, PTRACE_EVENT_STOP), StopVerdict::Awaited),
+            "the awaited SIGTRAP + matching event must be accepted as the final stop"
+        );
+    }
+
+    /// Drive the same decision sequence the `wait_stop` loop would: a queue of
+    /// statuses with two benign SIGCHLD stops ahead of the awaited brk-trap
+    /// (event 0). The loop consumes the benign ones and stops on the awaited
+    /// one, proving the intermediate stops do not abort the wait.
+    #[test]
+    fn loop_consumes_benign_stops_until_expected() {
+        let queue = [
+            stopped_status(libc::SIGCHLD, 0),
+            stopped_status(libc::SIGCHLD, 0),
+            stopped_status(libc::SIGTRAP, 0),
+        ];
+        let mut retried = 0;
+        let mut reached = None;
+        for status in queue {
+            match classify_stop(status, 0) {
+                StopVerdict::ContAndRetry => retried += 1,
+                StopVerdict::Awaited => {
+                    reached = Some(status);
+                    break;
+                }
+                StopVerdict::Unexpected => panic!("unexpected status 0x{status:x} in benign run"),
+            }
+        }
+        assert_eq!(retried, 2, "both benign stops must be re-CONTed");
+        assert_eq!(reached, Some(queue[2]), "loop must land on the awaited brk-trap");
+    }
+
+    /// The strict final check is intact: a `SIGTRAP` with the WRONG event, and
+    /// a non-SIGTRAP/non-SIGCHLD stop, both classify as `Unexpected` so
+    /// `wait_stop` returns `PtraceUnexpectedStatus`. The benign tolerance must
+    /// not have widened into a catch-all.
+    #[test]
+    fn genuinely_unexpected_status_stays_strict() {
+        // SIGTRAP but event=0 when the caller awaited the group-stop (128).
+        let wrong_event = stopped_status(libc::SIGTRAP, 0);
+        assert!(
+            matches!(classify_stop(wrong_event, PTRACE_EVENT_STOP), StopVerdict::Unexpected),
+            "a SIGTRAP with the wrong event must stay PtraceUnexpectedStatus"
+        );
+
+        // A stop signal that is neither the awaited SIGTRAP nor benign SIGCHLD.
+        let foreign = stopped_status(libc::SIGSEGV, 0);
+        assert!(
+            matches!(classify_stop(foreign, 0), StopVerdict::Unexpected),
+            "a foreign stop signal must stay PtraceUnexpectedStatus"
+        );
+
+        // Confirm the error path actually maps to PtraceUnexpectedStatus.
+        match classify_stop(wrong_event, PTRACE_EVENT_STOP) {
+            StopVerdict::Unexpected => {
+                let err = Error::PtraceUnexpectedStatus(wrong_event);
+                assert!(matches!(err, Error::PtraceUnexpectedStatus(s) if s == wrong_event));
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// Fork a child, SEIZE + INTERRUPT it, then PEEK a parent-allocated word
