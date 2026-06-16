@@ -411,6 +411,203 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Thread-group stop — T15 / Defect B (freeze every init thread before any poke)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Upper bound on re-scan passes before a thread group is declared
+/// non-convergent. Init carries a small, near-static thread count, so a real
+/// group settles in one or two passes; eight passes is generous head-room that
+/// still bounds liveness against a pathologically thread-churning target.
+const MAX_GROUP_SCAN_PASSES: u32 = 8;
+
+/// True when `err` means the targeted thread is already gone (it exited inside
+/// the attach/stop/detach window) rather than a genuine ptrace fault. Covers
+/// `ESRCH` from seize/interrupt/detach and a thread-exit wait status surfaced by
+/// [`wait_stop`] as [`Error::PtraceUnexpectedStatus`]. Per-tid `ESRCH` tolerance
+/// (T15): such a tid is skipped, never a hard error.
+fn is_thread_gone(err: &Error) -> bool {
+    match err {
+        Error::PtraceAttach(e) | Error::PtraceOp(e) => e.raw_os_error() == Some(libc::ESRCH),
+        Error::PtraceUnexpectedStatus(status) => {
+            libc::WIFEXITED(*status) || libc::WIFSIGNALED(*status)
+        }
+        _ => false,
+    }
+}
+
+/// `PTRACE_SEIZE` with bounded retry to ride out transient tracer contention
+/// from other modules (Magisk / KSU-style hooks that inject and detach in a
+/// tight window). After the final attempt the original error is propagated so
+/// [`Error::PtraceTracerBusy`] still reaches the caller with the holder's PID
+/// intact. A thread that has already exited (`ESRCH`) is not contention, so it
+/// short-circuits without burning the backoff budget.
+///
+/// Moved here from `arena::RemoteAttach::seize_with_retry` (T15) so every attach
+/// primitive lives beside [`ptrace_seize`]; the group-stop loop calls it per
+/// tid.
+fn seize_with_retry(pid: Pid) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut last_err: Option<Error> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match ptrace_seize(pid) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let is_contention = !is_thread_gone(&err)
+                    && matches!(err, Error::PtraceTracerBusy { .. } | Error::PtraceAttach(_));
+                last_err = Some(err);
+                if !is_contention || attempt + 1 == MAX_ATTEMPTS {
+                    break;
+                }
+                std::thread::sleep(BACKOFF);
+            }
+        }
+    }
+    Err(last_err.expect("seize_with_retry without an error after the loop"))
+}
+
+/// Enumerate every kernel task (thread) id in `pid`'s thread group by reading
+/// `/proc/<pid>/task/`. Returned tids are sorted ascending (the leader, `pid`,
+/// sorts in naturally). A read failure — the process is gone, or `/proc` is
+/// unreadable — propagates as `Error`.
+///
+/// This is the raw, ptrace-free enumeration step; it runs identically on any
+/// Linux host, which is why the host unit test exercises it directly while the
+/// live SEIZE path stays `#[cfg(target_arch = "aarch64")]` + `#[ignore]`.
+pub(crate) fn enumerate_thread_group(pid: Pid) -> Result<Vec<Pid>> {
+    let mut tids = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+        let name = entry?.file_name();
+        if let Some(tid) = name.to_str().and_then(|s| s.parse::<Pid>().ok()) {
+            tids.push(tid);
+        }
+    }
+    tids.sort_unstable();
+    Ok(tids)
+}
+
+/// Seize+interrupt+wait_stop a single tid. Returns `Ok(true)` once the tid is
+/// group-stopped, `Ok(false)` when it exited mid-attach (ESRCH-tolerated: skip),
+/// and `Err` on a genuine ptrace fault.
+fn seize_one_tid(tid: Pid) -> Result<bool> {
+    match seize_with_retry(tid) {
+        Ok(()) => {}
+        Err(e) if is_thread_gone(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    // SEIZE took; the kernel auto-detaches on thread death, so a later `ESRCH`
+    // needs no explicit detach — just skip the tid.
+    if let Err(e) = ptrace_interrupt(tid) {
+        return if is_thread_gone(&e) { Ok(false) } else { Err(e) };
+    }
+    match wait_stop(tid, PTRACE_EVENT_STOP) {
+        Ok(_) => Ok(true),
+        Err(e) if is_thread_gone(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-scan-until-stable driver (T15). Repeatedly `enumerate`s the thread group
+/// and `seize`s every tid not yet stopped, until a full pass adds no new tid —
+/// the fixpoint — or `max_passes` is exceeded.
+///
+/// # Why this converges, and why it is race-free in the poke window
+///
+/// Each pass that stops a tid strictly grows the stopped set, which is bounded
+/// by the process's (finite) thread count, so the loop cannot grow forever. A
+/// thread that is *group-stopped cannot execute `clone`* — so once a pass adds
+/// nothing, every listed thread is stopped and no running thread remains to
+/// spawn another. The fixpoint is therefore a *fully* frozen group, and the
+/// pokes that run afterwards (and before detach) face no live sibling: the
+/// "thread spawned during enumeration" race that defines Defect B is closed.
+///
+/// # Clone-after-enumeration policy (the residual)
+///
+/// We deliberately do **not** set `PTRACE_O_TRACECLONE`. ReZygisk sidesteps the
+/// multi-thread hazard by injecting only when its target is single-threaded
+/// (`monitor.c:694`); init is multi-threaded at patch time, so that prior-art
+/// trick does not apply. TRACECLONE would auto-trace new threads but at the cost
+/// of threading `PTRACE_EVENT_CLONE` stops and child-SIGSTOP reaping through the
+/// carefully-ported [`wait_stop`] ladder — added moving parts on the PID 1 path.
+/// Instead we use a *bounded* re-scan: because a frozen group can birth no new
+/// thread, the only way to keep seeing fresh tids is a target that out-spawns
+/// our scan for `max_passes` consecutive passes. That cannot be poked safely, so
+/// we ABORT (return [`Error::PtraceAttach`]) rather than proceed against a
+/// partially-frozen init. The residual is thus a refusal, never a half-written
+/// poke.
+fn rescan_until_stable<E, S>(
+    leader: Pid,
+    max_passes: u32,
+    mut enumerate: E,
+    mut seize: S,
+) -> Result<Vec<Pid>>
+where
+    E: FnMut() -> Result<Vec<Pid>>,
+    S: FnMut(Pid) -> Result<bool>,
+{
+    let mut stopped: Vec<Pid> = Vec::new();
+    for _ in 0..max_passes {
+        let mut added = 0u32;
+        for tid in enumerate()? {
+            if stopped.contains(&tid) {
+                continue;
+            }
+            if seize(tid)? {
+                stopped.push(tid);
+                added += 1;
+            }
+        }
+        if added == 0 {
+            return Ok(stopped);
+        }
+    }
+    Err(Error::PtraceAttach(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "thread group of {leader} did not stabilize after {max_passes} scan passes; \
+             refusing to poke a partially-frozen process"
+        ),
+    )))
+}
+
+/// Freeze `pid`'s **entire** thread group — every `/proc/<pid>/task/` tid, not
+/// just the leader — with SEIZE+INTERRUPT+wait_stop, re-scanning until the group
+/// is stable so siblings spawned mid-enumeration are caught too. Returns every
+/// stopped tid; [`detach_thread_group`] resumes them all. This is the T15 fix
+/// for Defect B: the leader-only stop left init's siblings running on other
+/// cores through the Tier A remap and the Tier B trampoline pokes.
+pub(crate) fn seize_thread_group(pid: Pid) -> Result<Vec<Pid>> {
+    rescan_until_stable(
+        pid,
+        MAX_GROUP_SCAN_PASSES,
+        || enumerate_thread_group(pid),
+        seize_one_tid,
+    )
+}
+
+/// `PTRACE_DETACH` (resume) every tid in `tids`, tolerating per-tid `ESRCH` (a
+/// thread that exited inside the window is already reaped by the kernel). Every
+/// tid is attempted even if one fails, so a single stuck detach never strands
+/// the rest still-stopped; the first genuine fault is returned afterwards.
+/// Preserves PLAN G2:424-425 ("re-detach all task threads").
+pub(crate) fn detach_thread_group(tids: &[Pid]) -> Result<()> {
+    let mut first_err: Option<Error> = None;
+    for &tid in tids {
+        match ptrace_detach(tid) {
+            Ok(()) => {}
+            Err(e) if is_thread_gone(&e) => {}
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Word-granularity tracee memory IO — PTRACE_PEEKDATA / PTRACE_POKEDATA
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -983,6 +1180,150 @@ mod tests {
         // SAFETY: `slot_addr` came from `Box::into_raw` above; no other owner exists.
         unsafe {
             drop(Box::from_raw(slot_addr as *mut u64));
+        }
+    }
+
+    // ── T15: thread-group stop (Defect B) ───────────────────────────────────
+
+    #[test]
+    fn thread_gone_detects_exit_and_esrch_only() {
+        assert!(is_thread_gone(&Error::PtraceAttach(io::Error::from_raw_os_error(
+            libc::ESRCH
+        ))));
+        assert!(is_thread_gone(&Error::PtraceOp(io::Error::from_raw_os_error(
+            libc::ESRCH
+        ))));
+        // WIFEXITED(0) is true (low 7 bits == 0): a clean thread exit status.
+        assert!(libc::WIFEXITED(0));
+        assert!(is_thread_gone(&Error::PtraceUnexpectedStatus(0)));
+        // A real ptrace stop with the wrong event is NOT a thread exit.
+        let bad_stop = stopped_status(libc::SIGSEGV, 0);
+        assert!(!is_thread_gone(&Error::PtraceUnexpectedStatus(bad_stop)));
+        // A non-ESRCH op failure is a genuine fault, not a vanished thread.
+        assert!(!is_thread_gone(&Error::PtraceOp(io::Error::from_raw_os_error(
+            libc::EIO
+        ))));
+    }
+
+    #[test]
+    fn rescan_until_stable_catches_thread_spawned_mid_scan() {
+        // Pass 1 lists {10,11}; tid 12 is born during pass 1 and shows up in
+        // pass 2; pass 3 adds nothing → fixpoint. Each live tid is seized once.
+        let passes: [&[Pid]; 3] = [&[10, 11], &[10, 11, 12], &[10, 11, 12]];
+        let mut call = 0usize;
+        let mut seized: Vec<Pid> = Vec::new();
+        let stopped = rescan_until_stable(
+            1,
+            MAX_GROUP_SCAN_PASSES,
+            || {
+                let snap = passes[call.min(passes.len() - 1)].to_vec();
+                call += 1;
+                Ok(snap)
+            },
+            |tid| {
+                seized.push(tid);
+                Ok(true)
+            },
+        )
+        .expect("a settling group converges to a fixpoint");
+        assert_eq!(stopped, vec![10, 11, 12]);
+        assert_eq!(seized, vec![10, 11, 12], "each live tid seized exactly once");
+    }
+
+    #[test]
+    fn rescan_until_stable_tolerates_threads_that_exit_mid_attach() {
+        // tid 11 exits the instant we try to seize it (seize → Ok(false)); it
+        // must be skipped, never recorded, and the group still converges.
+        let passes: [&[Pid]; 2] = [&[10, 11, 12], &[10, 12]];
+        let mut call = 0usize;
+        let stopped = rescan_until_stable(
+            1,
+            MAX_GROUP_SCAN_PASSES,
+            || {
+                let snap = passes[call.min(passes.len() - 1)].to_vec();
+                call += 1;
+                Ok(snap)
+            },
+            |tid| Ok(tid != 11),
+        )
+        .expect("converges despite a thread exiting mid-attach");
+        assert_eq!(
+            stopped,
+            vec![10, 12],
+            "the exited tid is never recorded as stopped"
+        );
+    }
+
+    #[test]
+    fn rescan_until_stable_aborts_when_group_never_settles() {
+        // Every pass introduces one brand-new tid, so the group never settles →
+        // the bounded re-scan refuses (abort); it does not poke an unfrozen
+        // process. This is the documented residual of the bounded policy.
+        let mut call = 0i32;
+        let err = rescan_until_stable(
+            1,
+            4,
+            || {
+                call += 1;
+                Ok((100..100 + call).collect())
+            },
+            |_tid| Ok(true),
+        )
+        .expect_err("a never-settling group must abort, not silently proceed");
+        assert!(
+            matches!(err, Error::PtraceAttach(_)),
+            "non-convergence is surfaced as an attach-phase failure"
+        );
+    }
+
+    /// Spawn several real worker threads, have each report its kernel tid, then
+    /// confirm `enumerate_thread_group` on this process lists the leader and
+    /// every worker. Exercises the live `/proc/<pid>/task/` enumerator on any
+    /// host (no ptrace), per the T15 acceptance criterion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enumerate_thread_group_lists_leader_and_all_workers() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Barrier};
+
+        const WORKERS: usize = 4;
+        let gate = Arc::new(Barrier::new(WORKERS + 1));
+        let (tx, rx) = mpsc::channel::<Pid>();
+
+        let mut handles = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            let gate = Arc::clone(&gate);
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                // SAFETY: SYS_gettid takes no args and only reads the caller's
+                // kernel tid — always safe.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as Pid;
+                tx.send(tid).expect("report tid");
+                gate.wait(); // park until the assertions have run
+            }));
+        }
+        drop(tx);
+
+        let worker_tids: Vec<Pid> = (0..WORKERS).map(|_| rx.recv().expect("worker tid")).collect();
+
+        let listed =
+            enumerate_thread_group(std::process::id() as Pid).expect("enumerate own task dir");
+        // SAFETY: see above — SYS_gettid is argument-free and side-effect-free.
+        let leader_tid = unsafe { libc::syscall(libc::SYS_gettid) } as Pid;
+        assert!(
+            listed.contains(&leader_tid),
+            "the calling (leader) thread must be listed"
+        );
+        for wt in &worker_tids {
+            assert!(
+                listed.contains(wt),
+                "spawned worker tid {wt} must be enumerated"
+            );
+        }
+
+        gate.wait(); // release the workers
+        for h in handles {
+            h.join().expect("join worker");
         }
     }
 }

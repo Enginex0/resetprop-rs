@@ -180,68 +180,52 @@ impl RemapFlags {
 // RemoteAttach — RAII guard that detaches on drop
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// RAII guard that unconditionally `PTRACE_DETACH`es on Drop.
+/// RAII guard that group-stops init's **entire** thread group on construction
+/// and resumes every frozen thread on Drop.
 ///
-/// Acquired immediately after `ptrace_seize + ptrace_interrupt + wait_stop`.
-/// If any subsequent operation returns `Err`, the `?` unwinds through this
-/// guard and the tracee is released. Detach failures during unwind are
-/// logged via `eprintln!` and swallowed — there is no recoverable action,
-/// and panicking in Drop would abort on unwind (double panic).
+/// [`RemoteAttach::new`] freezes every `/proc/<pid>/task/` tid (not just the
+/// leader) via SEIZE+INTERRUPT+wait_stop and re-scans until the group is stable
+/// — the T15 fix for Defect B, where init's siblings kept running on other
+/// cores through the Tier A remap and the Tier B trampoline pokes. If any
+/// subsequent operation returns `Err`, the `?` unwinds through this guard and
+/// every seized thread is released. Detach failures during unwind are logged
+/// via `eprintln!` and swallowed — there is no recoverable action, and
+/// panicking in Drop would abort on unwind (double panic).
+///
+/// The group-stop machinery itself lives in [`super::ptrace`]
+/// (`seize_thread_group` / `detach_thread_group`); this guard is the single
+/// entry point both tiers and T03's pending init-identity guard build on, so
+/// its public surface (`new` / `detach` / `pid`) is held stable — T03 rebases
+/// its guard *in front of* `new`.
 pub(crate) struct RemoteAttach {
+    /// Thread-group leader pid (init's `1`). `pid()` returns this; all remote
+    /// PEEK/POKE/syscall work still targets the leader's (shared) address space.
     pid: super::Pid,
+    /// Every tid SEIZE+INTERRUPT+wait_stop froze for this window — the whole
+    /// thread group, leader included. Resumed in `detach` / Drop.
+    stopped_tids: Vec<super::Pid>,
     detached: bool,
 }
 
 impl RemoteAttach {
-    // P03 T5: `new` / `detach` / `pid` promoted from `fn` to `pub(crate) fn`
-    // so the Tier B hook installer in `seal::hook` can consume this RAII
-    // guard without reimplementing SEIZE + INTERRUPT + wait_stop. The P03
-    // phase brief explicitly declares `RemoteAttach` as stage-B's canonical
-    // attach helper and forbids reimplementation; this is the minimal
-    // visibility widening required for that consumption and the only edit
-    // to arena.rs in P03 T5.
+    // P03 T5 promoted `new` / `detach` / `pid` to `pub(crate)` so the Tier B
+    // hook installer in `seal::hook` consumes this RAII guard without
+    // reimplementing the attach. T15 widens the body from a leader-only stop to
+    // a whole-thread-group stop while keeping that public surface intact.
     pub(crate) fn new(pid: super::Pid) -> Result<Self> {
-        Self::seize_with_retry(pid)?;
-        super::ptrace::ptrace_interrupt(pid)?;
-        super::ptrace::wait_stop(pid, super::ptrace::PTRACE_EVENT_STOP)?;
+        // T15 group-stop entry point — freeze the ENTIRE thread group of `pid`
+        // before any caller pokes. See `super::ptrace::seize_thread_group`.
+        let stopped_tids = super::ptrace::seize_thread_group(pid)?;
         Ok(Self {
             pid,
+            stopped_tids,
             detached: false,
         })
     }
 
-    /// SEIZE with bounded retry to ride out transient tracer contention from
-    /// other modules (Magisk/KSU style hooks that inject and detach in a tight
-    /// window). After the final attempt the original error is propagated so
-    /// `Error::PtraceTracerBusy` still reaches the caller with the holder's
-    /// PID intact.
-    fn seize_with_retry(pid: super::Pid) -> Result<()> {
-        const MAX_ATTEMPTS: u32 = 3;
-        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
-
-        let mut last_err: Option<Error> = None;
-        for attempt in 0..MAX_ATTEMPTS {
-            match super::ptrace::ptrace_seize(pid) {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    let is_contention = matches!(
-                        err,
-                        Error::PtraceTracerBusy { .. } | Error::PtraceAttach(_)
-                    );
-                    last_err = Some(err);
-                    if !is_contention || attempt + 1 == MAX_ATTEMPTS {
-                        break;
-                    }
-                    std::thread::sleep(BACKOFF);
-                }
-            }
-        }
-        Err(last_err.expect("seize_with_retry without an error after the loop"))
-    }
-
     pub(crate) fn detach(mut self) -> Result<()> {
         self.detached = true;
-        super::ptrace::ptrace_detach(self.pid)
+        super::ptrace::detach_thread_group(&self.stopped_tids)
     }
 
     pub(crate) fn pid(&self) -> super::Pid {
@@ -252,8 +236,10 @@ impl RemoteAttach {
 impl Drop for RemoteAttach {
     fn drop(&mut self) {
         if !self.detached {
-            if let Err(e) = super::ptrace::ptrace_detach(self.pid) {
-                eprintln!("resetprop: ptrace_detach during unwind failed: {e}");
+            // Best-effort: resume every frozen tid (ESRCH-tolerant). Errors are
+            // logged and swallowed; panicking in Drop would abort on unwind.
+            if let Err(e) = super::ptrace::detach_thread_group(&self.stopped_tids) {
+                eprintln!("resetprop: thread-group detach during unwind failed: {e}");
             }
         }
     }

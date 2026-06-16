@@ -1124,6 +1124,13 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
         // `ptrace_access_vm`. The trampoline is two LP64 words: word_lo
         // packs `ldr x16, [pc, #8]` (low 4 bytes) with `br x16` (high 4
         // bytes); word_hi is the absolute 64-bit literal target.
+        //
+        // DEFECT B (T15): these two POKEs are non-atomic — a sibling init
+        // thread calling `__system_property_*` *between* them would run
+        // `ldr x16,[pc,#8]; br x16` over a half-written 16 bytes and branch
+        // into garbage, killing PID 1. The race is closed at the source:
+        // `RemoteAttach::new` froze init's ENTIRE thread group (every
+        // /proc/1/task tid), so no sibling executes while these words land.
         let word_lo = (encoder::LDR_X16_PC8 as u64) | ((encoder::BR_X16 as u64) << 32);
         let word_hi = hook_body_vaddr;
         ptrace_poketext(handle.pid, handle.target_fn, word_lo).map_err(|e| {
@@ -1326,6 +1333,10 @@ pub fn seal_prop(handle: &mut HookHandle, name: &str) -> Result<()> {
     let attach = seal::arena::RemoteAttach::new(handle.pid)
         .map_err(|e| Error::HookInstallFailed(format!("seal_prop: attach: {e}")))?;
 
+    // L2 (lock-list write-ordering race) is closed here by T15: `RemoteAttach`
+    // now freezes init's whole thread group, so no init thread reads this lock
+    // list during the read-modify-write below. seal_prop's byte ordering
+    // therefore needs no lock-free rewrite.
     let mut buffer = vec![0u8; LOCK_LIST_CAPACITY as usize];
 
     // SAFETY: `handle.lock_list_page` was allocated PROT_RW anonymous by
