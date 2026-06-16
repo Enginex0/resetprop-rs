@@ -2,10 +2,10 @@
 # Shape is law: docs/schema/registry.schema.yaml in the Mold repo.
 # This is a snapshot of "what matters now", not a redundant index.
 
-current_focus: "resetprop-rs-injectrc-ports — implement Wave-1 (T01, T02, T05, T12)"
+current_focus: "resetprop-rs-injectrc-ports — W2 merged (T15 group-stop, T19 single-dep); next T03 init-identity guard"
 
 priorities: []
 
 blocked: {}
 
-recent_done: []
+recent_done: [T15, T19]

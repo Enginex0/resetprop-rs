@@ -2,9 +2,9 @@
 
 ```
 branch:  main
-last:    d25be85
-active:  W1 done + adversarial audit complete; bucket amended with audit follow-ups (T15-T19; Port 3 / T11-T12 dropped)
-next:    impl account on aarch64 — land T19 (lzma revert), then T15 (thread-group stop, foundational), then the T03 chain
+last:    9170052  (W2 merged + pushed to origin/main)
+active:  W2 landed — T19 lzma revert + T15 thread-group stop (incl. adversarial-audit leak fix) merged & verified; single-dep law restored
+next:    T03 init-identity guard (critical path); then first 2-wide window T13 ∥ T04|T16. hook.rs serializes the rest.
 ```
 
 ## Pointers (open only when the task needs them)
@@ -17,17 +17,17 @@ next:    impl account on aarch64 — land T19 (lzma revert), then T15 (thread-gr
 
 ## The bucket at a glance
 
-17 active tasks (T15-T19 added 2026-06-16; Port 3 / T11-T12 dropped). Waves:
+17 active tasks; W2 merged 2026-06-16 (T15, T19). Status + parallelism:
 
 ```
-done T01 T02 T05            (T12 done → reverted by T19)
-W2   T15  T19  T16          ← claimable now: T15 foundational, T19 indep, T16 host-only
-W3   T03                    (rebases on T15's group-stop RemoteAttach)
-W4   T04  T18  T13
-W5   T07  T17
+done T01 T02 T05 T15 T19    (T12 done → reverted by T19)
+now  T03 🟢  T16 🟢         ← both write seal/hook.rs → must serialize; no parallel pair yet
+W4   T04  T18  T13          T13 is the only non-hook.rs task → first parallel partner
+W5   T07  T17               T17 dep[T15] met but wave-parked (4-file refactor, collides broadly)
 W6   T08  T09  T14
 W7   T06(device)  T10
-critical path = T01 → T15 → T03 → T04 → T07 → T17 → T06(device)
+critical path = T03 → T04 → T07 → T17 → T06(device)
+hook.rs = serialization chokepoint (writers: T03 T04 T07 T08 T09 T10 T16 T17 T18)
 ```
 
 ## Slash commands
