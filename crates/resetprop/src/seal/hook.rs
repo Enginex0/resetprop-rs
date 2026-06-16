@@ -872,7 +872,7 @@ const HOOK_BODY_TEMPLATE: [u32; 35] = [
     0xd503_201f, // 19: nop (unused — was canonical `ret`)
     0x5280_0000, // 20: .on_match: movz w0, #0
     0xd65f_03c0, // 21: ret
-    0x3841_054b, // 22: .advance: ldrb w11, [x10], #1  -- post-indexed scan
+    0x3840_154b, // 22: .advance: ldrb w11, [x10], #1  -- post-indexed scan
     0x35ff_ffeb, // 23: cbnz w11, .-4                  (-4   → word 22)
     0x17ff_ffeb, // 24: b    .next_entry               (-84  → word 3)
     0xd503_201f, // 25: STOLEN_0 (patched)
@@ -1876,7 +1876,7 @@ mod tests {
         let bytes = build_hook_body_bytes([0u8; 16], 0, 0);
 
         let expected: [u32; 3] = [
-            0x3841_054b, // 22: ldrb w11, [x10], #1  (post-indexed load+advance)
+            0x3840_154b, // 22: ldrb w11, [x10], #1  (post-indexed load+advance)
             0x35ff_ffeb, // 23: cbnz w11, .-4        (-4 → word 22, loop on non-NUL)
             0x17ff_ffeb, // 24: b    .next_entry    (-84 → word 3)
         ];
