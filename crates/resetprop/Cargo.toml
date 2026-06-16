@@ -12,8 +12,6 @@ categories = ["os::unix-apis"]
 
 [dependencies]
 libc = "0.2"
-# Second runtime dep, accepted per plan: pure-Rust XZ decode for `.gnu_debugdata`.
-lzma-rs = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

@@ -14,7 +14,6 @@ pub mod elf;
 pub mod hook;
 pub mod maps;
 pub mod ptrace;
-pub mod xz_decoder;
 
 /// Process identifier alias matching the libc type used by ptrace/waitpid.
 pub type Pid = libc::pid_t;
