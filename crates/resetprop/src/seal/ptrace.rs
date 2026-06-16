@@ -536,17 +536,24 @@ fn seize_one_tid(tid: Pid) -> Result<bool> {
 /// we ABORT (return [`Error::PtraceAttach`]) rather than proceed against a
 /// partially-frozen init. The residual is thus a refusal, never a half-written
 /// poke.
+///
+/// # Partial-set contract
+///
+/// `stopped` is a caller-owned out-accumulator: every tid frozen by this loop is
+/// recorded in it *even when the call returns `Err`*. [`seize_thread_group`]
+/// relies on that to resume the partial group on any failure, so a mid-group
+/// fault never strands init partially stopped.
 fn rescan_until_stable<E, S>(
     leader: Pid,
     max_passes: u32,
     mut enumerate: E,
     mut seize: S,
-) -> Result<Vec<Pid>>
+    stopped: &mut Vec<Pid>,
+) -> Result<()>
 where
     E: FnMut() -> Result<Vec<Pid>>,
     S: FnMut(Pid) -> Result<bool>,
 {
-    let mut stopped: Vec<Pid> = Vec::new();
     for _ in 0..max_passes {
         let mut added = 0u32;
         for tid in enumerate()? {
@@ -559,7 +566,7 @@ where
             }
         }
         if added == 0 {
-            return Ok(stopped);
+            return Ok(());
         }
     }
     Err(Error::PtraceAttach(io::Error::new(
@@ -578,12 +585,24 @@ where
 /// for Defect B: the leader-only stop left init's siblings running on other
 /// cores through the Tier A remap and the Tier B trampoline pokes.
 pub(crate) fn seize_thread_group(pid: Pid) -> Result<Vec<Pid>> {
-    rescan_until_stable(
+    let mut stopped = Vec::new();
+    match rescan_until_stable(
         pid,
         MAX_GROUP_SCAN_PASSES,
         || enumerate_thread_group(pid),
         seize_one_tid,
-    )
+        &mut stopped,
+    ) {
+        Ok(()) => Ok(stopped),
+        // A mid-group failure (seize/interrupt/wait fault, /proc read error, or
+        // non-convergence) must never strand init partially frozen. Resume every
+        // thread already stopped before propagating; the original fault is the
+        // meaningful error, so a best-effort detach failure is discarded.
+        Err(e) => {
+            let _ = detach_thread_group(&stopped);
+            Err(e)
+        }
+    }
 }
 
 /// `PTRACE_DETACH` (resume) every tid in `tids`, tolerating per-tid `ESRCH` (a
@@ -1212,7 +1231,8 @@ mod tests {
         let passes: [&[Pid]; 3] = [&[10, 11], &[10, 11, 12], &[10, 11, 12]];
         let mut call = 0usize;
         let mut seized: Vec<Pid> = Vec::new();
-        let stopped = rescan_until_stable(
+        let mut stopped: Vec<Pid> = Vec::new();
+        rescan_until_stable(
             1,
             MAX_GROUP_SCAN_PASSES,
             || {
@@ -1224,6 +1244,7 @@ mod tests {
                 seized.push(tid);
                 Ok(true)
             },
+            &mut stopped,
         )
         .expect("a settling group converges to a fixpoint");
         assert_eq!(stopped, vec![10, 11, 12]);
@@ -1236,7 +1257,8 @@ mod tests {
         // must be skipped, never recorded, and the group still converges.
         let passes: [&[Pid]; 2] = [&[10, 11, 12], &[10, 12]];
         let mut call = 0usize;
-        let stopped = rescan_until_stable(
+        let mut stopped: Vec<Pid> = Vec::new();
+        rescan_until_stable(
             1,
             MAX_GROUP_SCAN_PASSES,
             || {
@@ -1245,6 +1267,7 @@ mod tests {
                 Ok(snap)
             },
             |tid| Ok(tid != 11),
+            &mut stopped,
         )
         .expect("converges despite a thread exiting mid-attach");
         assert_eq!(
@@ -1260,6 +1283,7 @@ mod tests {
         // the bounded re-scan refuses (abort); it does not poke an unfrozen
         // process. This is the documented residual of the bounded policy.
         let mut call = 0i32;
+        let mut stopped: Vec<Pid> = Vec::new();
         let err = rescan_until_stable(
             1,
             4,
@@ -1268,11 +1292,47 @@ mod tests {
                 Ok((100..100 + call).collect())
             },
             |_tid| Ok(true),
+            &mut stopped,
         )
         .expect_err("a never-settling group must abort, not silently proceed");
         assert!(
             matches!(err, Error::PtraceAttach(_)),
             "non-convergence is surfaced as an attach-phase failure"
+        );
+        // The partial set is exposed so seize_thread_group can resume it on
+        // abort instead of stranding init partially frozen.
+        assert!(
+            !stopped.is_empty(),
+            "an aborted re-scan must surface the threads it already froze"
+        );
+    }
+
+    #[test]
+    fn rescan_until_stable_exposes_partial_set_on_seize_fault() {
+        // tid 12 hits a genuine (non-ESRCH) ptrace fault after 10 and 11 are
+        // frozen. The call errors, but the threads already stopped must be left
+        // in `stopped` so seize_thread_group can resume them — the fix for the
+        // partial-freeze leak that would otherwise strand init.
+        let mut stopped: Vec<Pid> = Vec::new();
+        let err = rescan_until_stable(
+            1,
+            MAX_GROUP_SCAN_PASSES,
+            || Ok(vec![10, 11, 12]),
+            |tid| {
+                if tid == 12 {
+                    Err(Error::PtraceOp(io::Error::from_raw_os_error(libc::EIO)))
+                } else {
+                    Ok(true)
+                }
+            },
+            &mut stopped,
+        )
+        .expect_err("a genuine seize fault propagates");
+        assert!(matches!(err, Error::PtraceOp(_)));
+        assert_eq!(
+            stopped,
+            vec![10, 11],
+            "threads frozen before the fault are exposed for cleanup, not lost"
         );
     }
 
