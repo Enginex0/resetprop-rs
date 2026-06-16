@@ -1,8 +1,8 @@
 # Session Start
 
 ```
-branch:  feat/bucket-injectrc-ports
-last:    d07d49f
+branch:  main
+last:    dedb5f1
 active:  none
 next:    claim a Wave-1 task — T01, T02, T05, or T12 (write-disjoint, parallel-safe)
 ```
