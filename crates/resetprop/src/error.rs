@@ -23,6 +23,10 @@ pub enum Error {
     SymbolNotFound(String),
     HookInstallFailed(String),
     Unsupported(String),
+    /// The pid targeted for a Tier A / Tier B seal is not Android init.
+    /// Raised by the M1 init-identity guard before any RemoteAttach / poke,
+    /// so a non-init PID-1 stand-in is rejected before a single byte is written.
+    NotInit(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -58,6 +62,7 @@ impl fmt::Display for Error {
             Self::SymbolNotFound(sym) => write!(f, "symbol not found: {sym}"),
             Self::HookInstallFailed(msg) => write!(f, "hook install failed: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            Self::NotInit(msg) => write!(f, "target pid is not init: {msg}"),
         }
     }
 }

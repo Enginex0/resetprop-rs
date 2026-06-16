@@ -333,6 +333,9 @@ unsafe fn derive_libc_scratch_pc(pid: libc::pid_t, libc_base: u64, libc_end: u64
 /// openat / mmap / close + unlink. Any thread that blocks on init
 /// for a property write during this window waits out the full stall.
 pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
+    // M1: reject a non-init PID-1 stand-in before attaching or poking.
+    seal::arena::verify_init_identity(pid)?;
+
     let guard = seal::arena::RemoteAttach::new(pid)
         .map_err(|e| Error::HookInstallFailed(format!("stage-B: attach: {e}")))?;
 

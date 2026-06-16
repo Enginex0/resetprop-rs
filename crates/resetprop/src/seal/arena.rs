@@ -177,6 +177,51 @@ impl RemapFlags {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// verify_init_identity — M1 init-identity guard (runs BEFORE any RemoteAttach)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read `/proc/<pid>/comm` — the kernel's per-process command name, written
+/// with a trailing newline. Authored fresh for the M1 guard; no other
+/// `/proc/<pid>/comm` reader exists in the tree.
+fn read_proc_comm(pid: super::Pid) -> Result<String> {
+    Ok(std::fs::read_to_string(format!("/proc/{pid}/comm"))?)
+}
+
+/// M1 init-identity guard. Verify `pid` really is Android init *before* the
+/// caller opens a [`RemoteAttach`] window or pokes a single byte, so a non-init
+/// PID-1 stand-in is rejected with [`Error::NotInit`] rather than silently
+/// patched. Both Tier A (`remote_remap_private`) and Tier B
+/// (`super::hook::install_init_hook`) call this in front of `RemoteAttach::new`.
+pub(crate) fn verify_init_identity(pid: super::Pid) -> Result<()> {
+    let comm = read_proc_comm(pid)?;
+    let maps = parse_maps(pid)?;
+    check_init_identity(&comm, &maps)
+}
+
+/// Pure decision core for [`verify_init_identity`], split out so both gates are
+/// unit-testable against a fabricated fake-PID-1 fixture (a `comm` string and a
+/// `MapEntry` slice) with no real `/proc` access.
+///
+/// Two independent gates:
+///   1. `/proc/<pid>/comm` is exactly `init`.
+///   2. an r-xp `libc.so` row is mapped, mirroring [`super::hook::is_libc_row`]
+///      — the expected APEX/system bionic libc the seal pipeline patches.
+fn check_init_identity(comm: &str, maps: &[MapEntry]) -> Result<()> {
+    let name = comm.trim_end();
+    if name != "init" {
+        return Err(Error::NotInit(format!(
+            "/proc/<pid>/comm is {name:?}, expected \"init\""
+        )));
+    }
+    if !maps.iter().any(super::hook::is_libc_row) {
+        return Err(Error::NotInit(
+            "no r-xp libc.so mapping in target; not the expected bionic init".into(),
+        ));
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RemoteAttach — RAII guard that detaches on drop
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -291,6 +336,9 @@ pub(crate) unsafe fn remote_remap_private(
     flags: RemapFlags,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
+
+    // M1: reject a non-init PID-1 stand-in before attaching or poking.
+    verify_init_identity(pid)?;
 
     let guard = RemoteAttach::new(pid)?;
 
@@ -705,5 +753,43 @@ mod tests {
         // Bootstrap / scan sizing
         assert_eq!(BOOTSTRAP_PAGE_SIZE, 4096);
         assert_eq!(LIBC_SCAN_LIMIT, 64 * 1024);
+    }
+
+    fn libc_row() -> MapEntry {
+        mk("/apex/com.android.runtime/lib64/bionic/libc.so", b"r-xp", 0x2000)
+    }
+
+    #[test]
+    fn init_identity_accepts_init_with_libc_row() {
+        let maps = vec![mk("/system/bin/init", b"r-xp", 0x1000), libc_row()];
+        assert!(check_init_identity("init\n", &maps).is_ok());
+    }
+
+    #[test]
+    fn init_identity_rejects_non_init_comm() {
+        let maps = vec![libc_row()];
+        match check_init_identity("system_server\n", &maps) {
+            Err(Error::NotInit(_)) => {}
+            other => panic!("expected NotInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_identity_rejects_init_without_libc_row() {
+        let maps = vec![mk("/system/bin/init", b"r-xp", 0x1000)];
+        match check_init_identity("init\n", &maps) {
+            Err(Error::NotInit(_)) => {}
+            other => panic!("expected NotInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_identity_rejects_live_non_init_pid() {
+        // The test process stands in as a real, live non-init PID-1: its comm is
+        // the test binary, not "init", so the full /proc path must reject it.
+        match verify_init_identity(std::process::id() as libc::pid_t) {
+            Err(Error::NotInit(_)) => {}
+            other => panic!("expected NotInit for self pid, got {other:?}"),
+        }
     }
 }
