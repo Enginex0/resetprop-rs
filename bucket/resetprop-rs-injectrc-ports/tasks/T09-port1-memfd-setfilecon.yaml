@@ -16,7 +16,7 @@ acceptance:
   - "on-device smoke: adb shell ls /data/adb/resetprop-rs/ shows zero hook-*.bin residue at any point during install"
   - "adb shell dmesg | grep avc shows no denial for adb_data_file:file:execute or the memfd after install"
   - "cargo clippy -p resetprop -- -D warnings is clean"
-deps: [T08, T12]
+deps: [T08, T19]
 files:
   - crates/resetprop/src/seal/hook.rs
   - crates/resetprop/src/seal/selinux.rs

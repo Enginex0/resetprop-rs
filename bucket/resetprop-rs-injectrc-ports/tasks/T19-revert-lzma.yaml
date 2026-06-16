@@ -1,0 +1,41 @@
+id: T19
+title: M1 — revert lzma-rs + xz_decoder; restore single-dep law
+objective: |
+  Drop Port 3's speculative dependency. lzma-rs (Cargo.toml:16) + xz_decoder
+  landed on main (d25be85) and shipped in v0.5.0 with NO consumer. Evidence
+  it is unnecessary: the live resolver scans .dynsym only (elf.rs:554,622),
+  and the sole resolved symbol __system_property_update is exported under
+  LIBC_PLATFORM in bionic (libc.map.txt:1819-1825), so it is present in the
+  shipped libc.so .dynsym, which is never stripped. PLAN.md:180 already
+  states .dynsym resolves the target; PLAN.md:182-184 justify the port purely
+  as a speculative "capability door" for a hypothetical future feature
+  (hooking init's internal C++ symbols) that is not scoped. Restoring the
+  single-dep law now has net-zero functional impact. If that future feature
+  is scoped, reintroduce the decoder + .gnu_debugdata fallback in the SAME
+  change as the consumer, per the single-dep law.
+deliverables:
+  - "remove lzma-rs from crates/resetprop/Cargo.toml [dependencies] and the inline justification comment; regenerate Cargo.lock"
+  - "delete crates/resetprop/src/seal/xz_decoder.rs and the `pub mod xz_decoder;` line in mod.rs:17"
+  - "T11 (.gnu_debugdata fallback) is cut; this task supersedes it"
+acceptance:
+  - "crates/resetprop/Cargo.toml [dependencies] contains libc only (tempfile stays dev-only)"
+  - "cargo build -p resetprop and cargo test -p resetprop pass (xz_decoder tests removed with the file)"
+  - "grep: no lzma_rs / xz_decoder references remain outside this revert"
+  - "commit lands clean (commit hook rejects AI-attribution trailers)"
+deps: []
+files:
+  - crates/resetprop/Cargo.toml
+  - Cargo.lock
+  - crates/resetprop/src/seal/xz_decoder.rs
+  - crates/resetprop/src/seal/mod.rs
+refs:
+  - "crates/resetprop/Cargo.toml:13-16 (libc + lzma-rs)"
+  - "crates/resetprop/src/seal/xz_decoder.rs:1-66 (the wrapper to delete)"
+  - "crates/resetprop/src/seal/mod.rs:17 (pub mod xz_decoder)"
+  - "crates/resetprop/src/seal/elf.rs:554,622 (.dynsym linear scan + resolve_symbol — the path that makes XZ unnecessary)"
+external_refs:
+  - "bionic libc.map.txt:1819-1825 (__system_property_update is global under LIBC_PLATFORM -> in the shipped .dynsym)"
+  - "PLAN.md:176-223 (Port 3 — dropped; :180 admits .dynsym already resolves the target, :182-184 the no-consumer capability-door rationale)"
+  - "adds-the-dep commit: d25be85"
+reading_estimate_k: 10
+rev: d25be85

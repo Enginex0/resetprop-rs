@@ -1,0 +1,37 @@
+id: T17
+title: M2/M5/L1 — collapse the four syscall-injector copies
+objective: |
+  Four near-identical copies of the stop->poke->setregs->CONT->wait_stop->
+  restore skeleton exist: remote_syscall (process_vm transport, DEAD in
+  production — only its own tests call it, yet it is pub + re-exported),
+  remote_syscall_via_poke (the workhorse), execute_remote_isb (instruction
+  payload), and the inline bootstrap in remote_remap_private. About 250 lines
+  duplicated with a few lines of real difference; this is the drift surface
+  that bred the Defect-A constant bug. Collapse to one primitive, delete the
+  dead one, cut the per-seal attach churn, and close the i-cache revert
+  asymmetry (L1).
+deliverables:
+  - "one injection primitive parameterized by (payload, transport: peek/poke | process_vm) replacing the shared skeleton across all four sites"
+  - "delete pub remote_syscall (process_vm variant) if no production consumer remains after consolidation; drop its mod.rs re-export"
+  - "single attach window for the first seal(): fold install_init_hook + install_trampoline + first seal_prop under one RemoteAttach (today: three separate SEIZE/INTERRUPT/DETACH cycles on PID 1)"
+  - "revert_trampoline reuses the consolidated ISB primitive for i-cache re-sync (L1: install syncs i-cache via membarrier/ISB, revert currently does not)"
+acceptance:
+  - "cargo test -p resetprop passes; clippy clean"
+  - "ptrace_core_smoke and tier_a_child_smoke still pass on aarch64 against the consolidated primitive"
+  - "grep confirms one injection skeleton, not four; no dead pub remote_syscall remains"
+deps: [T15]
+files:
+  - crates/resetprop/src/seal/ptrace.rs
+  - crates/resetprop/src/seal/hook.rs
+  - crates/resetprop/src/seal/arena.rs
+  - crates/resetprop/src/seal/mod.rs
+refs:
+  - "crates/resetprop/src/seal/ptrace.rs:611-699 (remote_syscall — dead in prod, tests-only callers)"
+  - "crates/resetprop/src/seal/ptrace.rs:726-804 (remote_syscall_via_poke — the workhorse to keep as the base)"
+  - "crates/resetprop/src/seal/hook.rs:991-1036 (execute_remote_isb — third copy)"
+  - "crates/resetprop/src/seal/arena.rs:345-410 (bootstrap mmap inline — fourth copy)"
+  - "crates/resetprop/src/seal/hook.rs:1046-1073 (revert_trampoline — add i-cache re-sync here)"
+  - "crates/resetprop/src/seal/hook.rs:336,1112,1326 (the three attach sites to fold into one window)"
+  - "crates/resetprop/src/seal/mod.rs:49-52 (re-export list incl remote_syscall)"
+reading_estimate_k: 40
+rev: d25be85
