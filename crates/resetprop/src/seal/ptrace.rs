@@ -34,9 +34,7 @@ pub use arch::active::{
     TRAP_INSN,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // PTRACE request numbers — from bionic/libc/kernel/uapi/linux/ptrace.h
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// `PTRACE_CONT` — resume a stopped tracee. source: linux/ptrace.h:17
 pub const PTRACE_CONT: c_int = 7;
@@ -87,9 +85,7 @@ pub const PTRACE_EVENT_STOP: u32 = 128;
 /// source: linux/elf.h:301
 pub const NT_PRSTATUS: c_int = 1;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Wrap the current `errno` as [`Error::PtraceOp`].
 ///
@@ -146,9 +142,7 @@ fn classify_seize_err(pid: Pid) -> Error {
     Error::PtraceAttach(err)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // ptrace primitives
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// `PTRACE_SEIZE` — attach without stopping the tracee. Sets
 /// `PTRACE_O_TRACESYSGOOD` atomically via the `data` argument so subsequent
@@ -372,9 +366,7 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Thread-group stop — T15 / Defect B (freeze every init thread before any poke)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Upper bound on re-scan passes before a thread group is declared
 /// non-convergent. Init carries a small, near-static thread count, so a real
@@ -588,9 +580,7 @@ pub(crate) fn detach_thread_group(tids: &[Pid]) -> Result<()> {
     first_err.map_or(Ok(()), Err)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Word-granularity tracee memory IO — PTRACE_PEEKDATA / PTRACE_POKEDATA
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// `PTRACE_PEEKDATA` — read one 64-bit word from `addr` in the tracee.
 ///
@@ -668,9 +658,7 @@ pub fn ptrace_poketext(pid: Pid, addr: u64, value: u64) -> Result<()> {
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Cross-process memory IO — process_vm_{readv,writev} partial-transfer loops
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Loop `process_vm_readv` until the entire `buf` has been filled from
 /// `remote_addr` in the tracee, or the kernel returns an error.
@@ -763,9 +751,7 @@ pub(crate) unsafe fn write_remote(pid: Pid, remote_addr: u64, buf: &[u8]) -> Res
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // remote_syscall — stage `svc #0 ; brk #0` and run one syscall in the tracee
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Execute `syscall_no(args...)` inside `pid` by staging an 8-byte
 /// `svc #0 ; brk #0` blob at `scratch_pc`, resuming until the `brk` traps,
@@ -876,9 +862,7 @@ pub unsafe fn remote_syscall(
     Ok(ret)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // remote_syscall_via_poke — same as remote_syscall, but PEEK/POKEDATA scratch
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Execute `syscall_no(args...)` inside `pid` by staging an 8-byte
 /// `svc #0 ; brk #0` blob at `scratch_pc` via [`ptrace_peektext`] /
@@ -980,9 +964,7 @@ pub(crate) unsafe fn remote_syscall_via_poke(
     Ok(ret)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

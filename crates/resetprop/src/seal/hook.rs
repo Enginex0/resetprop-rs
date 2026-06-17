@@ -40,9 +40,7 @@ use crate::seal::ptrace::{
     setregset, wait_stop, write_remote, PTRACE_CONT,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Stage-B constants (REGISTRY §1 canonical flag values)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// 4 KiB — one base page on AArch64. Mirrors `BOOTSTRAP_PAGE_SIZE` in
 /// `seal::arena` but kept local to keep the stage-B constant block self-
@@ -69,9 +67,7 @@ const PATH_STAGE_OFFSET: u64 = 2048;
 /// pipelines share identical scan behaviour.
 const LIBC_SCAN_LIMIT: usize = 64 * 1024;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // P04 T3 — hook-page layout and i-cache sync constants
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Hook page byte offset where [`build_hook_body_bytes`]'s 140-byte body
 /// lands in the file-backed mapping. Held at 1024 rather than 0 to keep
@@ -821,9 +817,7 @@ pub(crate) mod encoder {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // P04 T2 — pure hook-body encoder
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Canonical 35-word (140-byte) hook-body layout.
 ///
@@ -965,9 +959,7 @@ pub fn build_hook_body_bytes(
     body.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // P04 T3 — trampoline installer + i-cache sync
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Execute a single `isb` in the tracee by staging `isb ; brk #0` at
 /// `scratch_pc`, flipping `pc`, resuming, waiting for the brk trap, and
@@ -1286,9 +1278,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // P04 T4 — lock-list mechanics (pure helpers + public seal / unseal)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Append `name` + entry-NUL + empty-sentinel-NUL to a lock-list buffer in
 /// the atomic-append write order. Returns the new `cur_len`, i.e. the byte
@@ -1601,9 +1591,7 @@ mod tests {
         _drop_compiles::<HookHandle>();
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // P04 T1 — A64 encoder submodule tests
-    // ─────────────────────────────────────────────────────────────────────
 
     /// Round-trips a 16-byte absolute-target trampoline built from the
     /// encoder helpers against the canonical byte pattern from
@@ -1739,9 +1727,7 @@ mod tests {
         let _ = super::encoder::ldrb_imm(0, 0, 4096);
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // P04 T2 — build_hook_body_bytes tests
-    // ─────────────────────────────────────────────────────────────────────
 
     /// Verifies [`build_hook_body_bytes`] serialises the 35-word template
     /// with the three patch regions filled in the correct byte positions.
@@ -1960,9 +1946,7 @@ mod tests {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // T16 / H1 — independent encoding oracle
-    // ─────────────────────────────────────────────────────────────────────
 
     /// The golden trampoline image, assembled out-of-band from
     /// `oracle/hook_body.s` by a real ARM64 assembler (`aarch64-linux-gnu-as`
@@ -2057,9 +2041,7 @@ mod tests {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // P04 T4 — lock-list mechanics tests
-    // ─────────────────────────────────────────────────────────────────────
 
     /// Builds a dummy `HookHandle` for NUL-rejection paths that never reach
     /// ptrace. Both `hook_page == 0` and `lock_list_page == 0` short-circuit
@@ -2168,9 +2150,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidKey));
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // T04 / M2 — verify-after-write read-back gate
-    // ─────────────────────────────────────────────────────────────────────
 
     /// The two words `install_trampoline` POKEs, packed exactly as they land
     /// in tracee memory: `word_lo` (`ldr x16,[pc,#8]` | `br x16`) then the

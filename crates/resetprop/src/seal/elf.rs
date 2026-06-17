@@ -23,9 +23,7 @@ use std::ptr;
 
 use crate::error::{Error, Result};
 
-// -----------------------------------------------------------------------------
 // Constants
-// -----------------------------------------------------------------------------
 
 /// ELF magic — first four bytes of `e_ident`. `/usr/include/elf.h:103-107`.
 pub const ELFMAG: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -86,9 +84,7 @@ pub const STB_WEAK: u8 = 2;
 /// Reserved section index meaning "undefined". `/usr/include/elf.h:413`.
 pub const SHN_UNDEF: u16 = 0;
 
-// -----------------------------------------------------------------------------
 // ELF64 structs (exact layouts per /usr/include/elf.h)
-// -----------------------------------------------------------------------------
 
 /// ELF64 file header. Layout: `/usr/include/elf.h:81-97`. Total: 64 bytes.
 #[repr(C)]
@@ -155,9 +151,7 @@ pub struct Elf64_Sym {
 }
 const _: () = assert!(mem::size_of::<Elf64_Sym>() == 24);
 
-// -----------------------------------------------------------------------------
 // LibcElfView — owned file bytes + resolved dynamic table offsets
-// -----------------------------------------------------------------------------
 
 /// Parsed view of an Android arm64 `libc.so`.
 ///
@@ -184,9 +178,7 @@ pub struct LibcElfView {
     pub(crate) syment: usize,
 }
 
-// -----------------------------------------------------------------------------
 // vaddr → file offset translation
-// -----------------------------------------------------------------------------
 
 /// Translate a linking-view virtual address to a file offset using the PT_LOAD
 /// map. Returns `None` if `vaddr` falls outside every PT_LOAD range.
@@ -201,9 +193,7 @@ fn vaddr_to_foff(pt_loads: &[(u64, u64, u64)], vaddr: u64) -> Option<usize> {
     None
 }
 
-// -----------------------------------------------------------------------------
 // Unaligned struct read helper
-// -----------------------------------------------------------------------------
 
 /// Read a `#[repr(C)]` POD struct of size `N` from `bytes[off..off+N]` without
 /// alignment requirements. Returns `Error::ElfParse` on bounds overflow.
@@ -231,9 +221,7 @@ fn read_struct<T: Copy>(bytes: &[u8], off: usize, what: &str) -> Result<T> {
     Ok(unsafe { ptr::read_unaligned(ptr) })
 }
 
-// -----------------------------------------------------------------------------
 // parse_libc_elf — public entry point for P03
-// -----------------------------------------------------------------------------
 
 /// Parse an Android arm64 `libc.so` from a `File` handle into a [`LibcElfView`].
 ///
@@ -380,9 +368,7 @@ pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
     })
 }
 
-// -----------------------------------------------------------------------------
 // GNU_HASH lookup (T2)
-// -----------------------------------------------------------------------------
 
 /// Width of a single bloom-filter word, in bits. Matches bionic's
 /// `kBloomMaskBits = sizeof(ElfW(Addr)) * 8` for arm64.
@@ -547,9 +533,7 @@ pub fn gnu_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
     }
 }
 
-// -----------------------------------------------------------------------------
 // Linear symbol-table fallback (T3)
-// -----------------------------------------------------------------------------
 
 /// Linear scan of `.dynsym` for `name`, returning the matched symbol's
 /// `st_value` or `None` on miss / malformed bounds.
@@ -628,9 +612,7 @@ pub fn resolve_symbol(view: &LibcElfView, name: &str) -> Result<u64> {
     result.ok_or_else(|| Error::SymbolNotFound(name.into()))
 }
 
-// -----------------------------------------------------------------------------
 // Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 impl LibcElfView {

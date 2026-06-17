@@ -39,9 +39,7 @@ use resetprop::seal::{
 /// source: asm-generic/unistd.h:461 (`__NR_getpid = 172`).
 const NR_GETPID: u64 = 172;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Helpers (verbatim from phases/seal/references/test-harness-patterns.md §3)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Fork a child running `child_body`; return the child pid to the parent.
 /// Safety: `child_body` must not return (it should `_exit`, `loop`, or `panic!`).
@@ -89,9 +87,7 @@ impl Drop for ChildGuard {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Child body — inherits the pre-fork RWX scratch page via COW and blocks
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn child_body() -> ! {
     loop {
@@ -104,9 +100,7 @@ fn child_body() -> ! {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Test — round-trip getpid() through remote_syscall
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 #[ignore = "requires ptrace_scope<=1 or CAP_SYS_PTRACE; run with: cargo test -p resetprop --test ptrace_core_smoke -- --ignored --test-threads=1"]

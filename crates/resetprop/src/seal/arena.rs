@@ -10,9 +10,7 @@ use std::path::Path;
 use super::maps::{parse_maps, MapEntry};
 use crate::error::{Error, Result};
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Syscall numbers and flag constants (REGISTRY §1 canonical values)
-// ─────────────────────────────────────────────────────────────────────────────
 
 // Syscall numbers (asm-generic/unistd.h via linux-arm64-abi.md §1)
 pub(crate) const NR_OPENAT: u64 = 56;
@@ -149,9 +147,7 @@ pub(crate) fn find_scratch_slot(bytes: &[u8]) -> Option<usize> {
     Some(min.next_multiple_of(8))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // RemapFlags — direction selector for remote_remap_private
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Direction of the arena remap — `Private` seals (blocks writes from
 /// propagating), `Shared` restores init's original view (unseal).
@@ -176,9 +172,7 @@ impl RemapFlags {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // verify_init_identity — M1 init-identity guard (runs BEFORE any RemoteAttach)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Read `/proc/<pid>/comm` — the kernel's per-process command name, written
 /// with a trailing newline. Authored fresh for the M1 guard; no other
@@ -221,9 +215,7 @@ fn check_init_identity(comm: &str, maps: &[MapEntry]) -> Result<()> {
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // RemoteAttach — RAII guard that detaches on drop
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// RAII guard that group-stops init's **entire** thread group on construction
 /// and resumes every frozen thread on Drop.
@@ -290,9 +282,7 @@ impl Drop for RemoteAttach {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // remote_remap_private — the core Tier A seal primitive
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Remap init's mapping of `arena_path` as `MAP_PRIVATE|MAP_FIXED`
 /// (Tier A seal) or `MAP_SHARED|MAP_FIXED` (unseal) via remote syscalls
@@ -561,11 +551,9 @@ pub(crate) unsafe fn remote_remap_private(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Tier A orchestrators — thin compositions over find_arena_mapping +
 // remote_remap_private. These are the public seam consumed by
 // `PropSystem::seal_arena` / `::unseal_arena` and by the T5 smoke test.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Tier A seal: remap init's writable view of `arena_path` as
 /// `MAP_PRIVATE|MAP_FIXED`. Thin composition of `find_arena_mapping` +

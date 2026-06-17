@@ -51,9 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Constants
-// ─────────────────────────────────────────────────────────────────────────────
 
 const PAGE_SIZE: usize = 4096;
 const ARENA_PAGES: usize = 4;
@@ -62,9 +60,7 @@ const SENTINEL_OFFSET: usize = 128;
 const SENTINEL_PRE: u8 = 0xAA;
 const SENTINEL_POST: u8 = 0xBB;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Helpers (verbatim from phases/seal/references/test-harness-patterns.md §3)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Fork a child running `child_body`; return the child pid to the parent.
 /// Safety: `child_body` must not return (it should `_exit`, `loop`, or `panic!`).
@@ -117,7 +113,6 @@ fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Child path propagation
 //
 // The `fn() -> !` fork bound precludes closure captures, so the child body
@@ -125,13 +120,10 @@ fn sleep_ms(ms: u64) {
 // by the parent immediately before `fork()`. After `fork()`, the child
 // inherits the same virtual-memory image via COW page tables, so the value
 // stored in `CHILD_PATH` is visible to the child without any IPC.
-// ─────────────────────────────────────────────────────────────────────────────
 
 static CHILD_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Child body — mmaps the tempfile MAP_SHARED and write-loops a sentinel
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn child_body_mmap_loop() -> ! {
     // SAFETY: All libc calls below are the standard open/mmap/usleep FFI
@@ -181,10 +173,8 @@ fn child_body_mmap_loop() -> ! {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Third-observer read path — independent file handle, never aliases the
 // child's mapping. Demonstrates the inode's ground-truth state.
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn read_file_byte(path: &Path, offset: usize) -> u8 {
     let mut f = OpenOptions::new()
@@ -198,9 +188,7 @@ fn read_file_byte(path: &Path, offset: usize) -> u8 {
     buf[0]
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Test
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 #[ignore = "requires ptrace_scope<=1; run with --ignored --test-threads=1"]
