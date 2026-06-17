@@ -48,11 +48,14 @@ use std::time::SystemTime;
 
 const PROP_DIR: &str = "/dev/__properties__";
 
-/// Compile-time arch gate for the seal subsystem. Returns `Ok(())` on
-/// AArch64 builds, where the inline trampoline encoder in `seal::hook`
-/// emits valid A64 opcodes. On any other target, returns
-/// `Error::Unsupported` so library callers and the CLI both fail fast
-/// instead of writing A64 words into a non-A64 init's libc.text.
+/// Compile-time arch gate for the **Tier B** (per-prop hook) seal path.
+/// Returns `Ok(())` only on AArch64 builds, where the inline trampoline
+/// encoder in `seal::hook` emits valid A64 opcodes. On any other target,
+/// returns `Error::Unsupported` so library callers and the CLI both fail
+/// fast instead of writing A64 words into a non-A64 init's libc.text.
+///
+/// Tier A (arena remap) does not run the hook encoder, so it uses the wider
+/// [`require_seal_arch`] gate instead.
 #[inline]
 fn require_aarch64() -> Result<()> {
     #[cfg(target_arch = "aarch64")]
@@ -62,7 +65,43 @@ fn require_aarch64() -> Result<()> {
     #[cfg(not(target_arch = "aarch64"))]
     {
         Err(Error::Unsupported(
-            "seal is only available on AArch64 builds".to_string(),
+            "Tier B (per-prop hook) seal is only available on AArch64 builds".to_string(),
+        ))
+    }
+}
+
+/// Compile-time arch gate for the **Tier A** (arena remap) seal path and the
+/// seal registry. Returns `Ok(())` on every architecture for which
+/// `seal::ptrace::arch` ships a register layout — the four
+/// injectrc-supported arches with a working multi-arch ptrace facade
+/// (`aarch64`, `arm`, `x86_64`, `x86`). Tier A needs only that register glue
+/// plus the `mmap`/`mremap` remote-syscall remap; it never emits A64 hook
+/// opcodes, so it is correct anywhere the facade compiles.
+///
+/// RISC-V is deliberately excluded: its `arch::riscv64` module is a deferred
+/// stub (no live runtime port), so the gate refuses it rather than driving an
+/// unexercised path against a real tracee. Enabling a new arch is then a
+/// one-line edit here once its facade module is proven on-device.
+#[inline]
+fn require_seal_arch() -> Result<()> {
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86_64",
+        target_arch = "x86"
+    ))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86_64",
+        target_arch = "x86"
+    )))]
+    {
+        Err(Error::Unsupported(
+            "Tier A seal has no register layout for this architecture".to_string(),
         ))
     }
 }
@@ -679,7 +718,7 @@ impl PropSystem {
     ///
     /// Returns the `SealRecord` that was inserted (or refreshed on duplicate).
     pub fn seal_arena(&self, name: &str, value: &str) -> Result<SealRecord> {
-        require_aarch64()?;
+        require_seal_arch()?;
         let primary_path = self.resolve_arena_path(name)?;
         let filename = arena_filename(&primary_path)?;
         if filename == SERIAL_FILE {
@@ -708,7 +747,7 @@ impl PropSystem {
     /// removes the matching `SealTier::Arena` record from the registry.
     /// Returns `Ok(true)` if a record was removed, `Ok(false)` otherwise.
     pub fn unseal_arena(&self, name: &str) -> Result<bool> {
-        require_aarch64()?;
+        require_seal_arch()?;
         let primary_path = self.resolve_arena_path(name)?;
         let filename = arena_filename(&primary_path)?;
         if filename == SERIAL_FILE {
@@ -829,7 +868,7 @@ impl PropSystem {
     /// internal mutex, and mutations in the registry after the call are
     /// not reflected in the snapshot.
     pub fn seals(&self) -> Result<Vec<SealRecord>> {
-        require_aarch64()?;
+        require_seal_arch()?;
         let registry = seal::seals_registry();
         let entries = registry.lock().unwrap_or_else(|poisoned| {
             eprintln!("resetprop: seals: seals registry mutex was poisoned; recovering");

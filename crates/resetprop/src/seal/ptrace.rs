@@ -1,23 +1,38 @@
-//! ARM64 ptrace core — attach/detach primitives and register IO.
+//! ptrace core — attach/detach primitives and register IO.
+//!
+//! The PTRACE request numbers and the wait/attach primitives here are
+//! arch-neutral; the register layout (`UserPtRegs`), the syscall-trap and
+//! breakpoint instruction encodings (`TRAP_INSN` / `BRK_INSN`), and the
+//! syscall-arg / return-value convention live in the `cfg`-selected
+//! `arch::active` module, re-exported below so this file carries no raw
+//! register-index literals.
 //!
 //! Sources (verified verbatim against AOSP `bionic/libc/kernel/uapi/`):
 //! - `linux/ptrace.h` lines 17, 21, 27-31 — `PTRACE_*` request numbers
 //! - `linux/elf.h` line 301 — `NT_PRSTATUS`
-//! - `asm-arm64/asm/ptrace.h` lines 49-54 — `struct user_pt_regs`
+//! - per-arch `asm/ptrace.h` `user_pt_regs`/`user_regs_struct` — see `arch::*`
 //!
-//! See `phases/seal/references/linux-arm64-abi.md` §3-§6 for the full reference.
+//! See `phases/seal/references/linux-arm64-abi.md` §3-§6 for the full
+//! AArch64 reference; the per-arch modules cite their own UAPI headers.
 //!
 //! P01 Task 3 scope: the six ptrace primitives (`ptrace_seize`,
 //! `ptrace_interrupt`, `wait_stop`, `getregset`, `setregset`, `ptrace_detach`),
-//! the `UserPtRegs` layout with a 272-byte compile-time size assertion,
-//! and the raw ARM64 instruction encodings used by P01 Task 4's
+//! the `UserPtRegs` layout with a compile-time NT_PRSTATUS size assertion,
+//! and the raw instruction encodings used by P01 Task 4's
 //! `remote_syscall` injector.
+
+mod arch;
 
 use super::Pid;
 use crate::error::{Error, Result};
 use std::io;
 
 use libc::{c_int, c_void, iovec, process_vm_readv, process_vm_writev};
+
+pub use arch::active::{
+    get_syscall_return, set_pc, set_syscall_args, UserPtRegs, BRK_INSN, NT_PRSTATUS_SIZE,
+    TRAP_INSN,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PTRACE request numbers — from bionic/libc/kernel/uapi/linux/ptrace.h
@@ -71,59 +86,6 @@ pub const PTRACE_EVENT_STOP: u32 = 128;
 /// `NT_PRSTATUS` — note type selecting general-purpose regs for REGSET ops.
 /// source: linux/elf.h:301
 pub const NT_PRSTATUS: c_int = 1;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ARM64 instruction encodings — used by P01 T4 remote_syscall stager
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `svc #0` — AArch64 supervisor call, little-endian bytes `01 00 00 d4`.
-/// `pub(crate)` scope because only [`remote_syscall`] consumes this; the
-/// ARM64 encoder in P04 (`seal/hook.rs`) re-derives its own encodings.
-/// source: ARM ARM C6.2.304; linux-arm64-abi.md §2
-pub(crate) const ARM64_SVC_0: u32 = 0xd400_0001;
-
-/// `brk #0` — AArch64 software breakpoint (delivers SIGTRAP),
-/// little-endian bytes `00 00 20 d4`. `pub(crate)` for the same reason as
-/// [`ARM64_SVC_0`].
-/// source: ARM ARM C6.2.41; linux-arm64-abi.md §2
-pub(crate) const ARM64_BRK_0: u32 = 0xd420_0000;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UserPtRegs — AArch64 general-purpose register set exchanged via NT_PRSTATUS
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// AArch64 general-purpose register set.
-///
-/// Layout mirrors `struct user_pt_regs` at
-/// `bionic/libc/kernel/uapi/asm-arm64/asm/ptrace.h:49-54`:
-///
-/// ```c
-/// struct user_pt_regs {
-///   __u64 regs[31];   // x0..x30
-///   __u64 sp;
-///   __u64 pc;
-///   __u64 pstate;
-/// };
-/// ```
-///
-/// `regs[8]` is `x8` (AArch64 syscall number register); `regs[0..=5]` carry
-/// syscall args 1..6; `regs[30]` is the link register.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct UserPtRegs {
-    pub regs: [u64; 31],
-    pub sp: u64,
-    pub pc: u64,
-    pub pstate: u64,
-}
-
-// Compile-time tripwire: the NT_PRSTATUS iovec contract demands exactly 272
-// bytes (31*8 regs + sp + pc + pstate). On non-arm64 hosts the assertion is
-// still sound (size is layout-invariant under `#[repr(C)]`), but we gate it
-// to aarch64 per spec §Approach.4 so host `cargo check` on x86_64 dev boxes
-// stays green even if future porting changes the primitive sizes.
-#[cfg(target_arch = "aarch64")]
-const _: () = assert!(core::mem::size_of::<UserPtRegs>() == 272);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
@@ -340,10 +302,10 @@ pub fn wait_stop(pid: Pid, expected_event: u32) -> Result<i32> {
     }
 }
 
-/// `PTRACE_GETREGSET` with `NT_PRSTATUS` — snapshot AArch64 GP registers.
+/// `PTRACE_GETREGSET` with `NT_PRSTATUS` — snapshot the GP registers.
 ///
-/// Uses a 272-byte iovec buffer per the NT_PRSTATUS contract
-/// (linux-arm64-abi.md §5).
+/// Sizes the iovec from `size_of::<UserPtRegs>()`, which equals the active
+/// arch's `NT_PRSTATUS_SIZE` (272 bytes on AArch64; linux-arm64-abi.md §5).
 pub fn getregset(pid: Pid) -> Result<UserPtRegs> {
     let mut regs = UserPtRegs::default();
     let mut iov = iovec {
@@ -351,8 +313,8 @@ pub fn getregset(pid: Pid) -> Result<UserPtRegs> {
         iov_len: core::mem::size_of::<UserPtRegs>(),
     };
     // SAFETY: `iov.iov_base` points at a stack-allocated `UserPtRegs`
-    // (272 bytes, matches `iov_len`); the kernel writes ≤272 bytes into
-    // it. `&mut iov` outlives the syscall. No aliasing: `regs` is not
+    // (`iov_len` == its size); the kernel writes at most that many bytes
+    // into it. `&mut iov` outlives the syscall. No aliasing: `regs` is not
     // otherwise borrowed.
     let rc = unsafe {
         libc::ptrace(
@@ -368,7 +330,7 @@ pub fn getregset(pid: Pid) -> Result<UserPtRegs> {
     Ok(regs)
 }
 
-/// `PTRACE_SETREGSET` with `NT_PRSTATUS` — write AArch64 GP registers.
+/// `PTRACE_SETREGSET` with `NT_PRSTATUS` — write the GP registers.
 pub fn setregset(pid: Pid, regs: &UserPtRegs) -> Result<()> {
     let mut iov = iovec {
         // Kernel only reads through this pointer; casting `*const` to
@@ -376,8 +338,8 @@ pub fn setregset(pid: Pid, regs: &UserPtRegs) -> Result<()> {
         iov_base: regs as *const UserPtRegs as *mut c_void,
         iov_len: core::mem::size_of::<UserPtRegs>(),
     };
-    // SAFETY: `iov.iov_base` points at caller-owned `UserPtRegs` (272 bytes
-    // matching `iov_len`); the kernel only reads through it on SETREGSET.
+    // SAFETY: `iov.iov_base` points at caller-owned `UserPtRegs` (`iov_len`
+    // == its size); the kernel only reads through it on SETREGSET.
     // `&mut iov` lives for the duration of the syscall.
     let rc = unsafe {
         libc::ptrace(
@@ -830,12 +792,13 @@ pub unsafe fn remote_syscall(
     syscall_no: u64,
     args: [u64; 6],
 ) -> Result<i64> {
-    // Payload: `svc #0 ; brk #0` little-endian. Derived from the two public
-    // constants so the encoding cannot drift from the ARM ARM citations.
-    let svc_bytes = ARM64_SVC_0.to_le_bytes();
-    let brk_bytes = ARM64_BRK_0.to_le_bytes();
+    // Payload: trap-then-breakpoint little-endian. Derived from the two
+    // arch-neutral instruction constants so the encoding cannot drift from
+    // the per-arch ISA citations.
+    let trap_bytes = TRAP_INSN.to_le_bytes();
+    let brk_bytes = BRK_INSN.to_le_bytes();
     let mut payload = [0u8; 8];
-    payload[..4].copy_from_slice(&svc_bytes);
+    payload[..4].copy_from_slice(&trap_bytes);
     payload[4..].copy_from_slice(&brk_bytes);
 
     // (§7 step 2) Save the 8 bytes we are about to clobber.
@@ -843,19 +806,18 @@ pub unsafe fn remote_syscall(
     // SAFETY: forwards caller's `scratch_pc` readability guarantee.
     unsafe { read_remote(pid, scratch_pc, &mut saved_bytes)? };
 
-    // (§7 step 3) Stage the svc+brk blob.
+    // (§7 step 3) Stage the trap+brk blob.
     // SAFETY: forwards caller's `scratch_pc` writability guarantee.
     unsafe { write_remote(pid, scratch_pc, &payload)? };
 
     // (§7 step 4) Snapshot registers so we can restore on exit.
     let saved_regs = getregset(pid)?;
 
-    // (§7 step 5) Build the work register set: pc=scratch, x8=syscall,
-    // x0..x5=args. Leave sp/pstate/lr untouched — kernel uses its own stack.
+    // (§7 step 5) Build the work register set via the arch-neutral interface:
+    // pc=scratch, syscall-number register, arg registers. Stack/flags/link
+    // are left untouched — the kernel uses its own stack across the trap.
     let mut work = saved_regs;
-    work.pc = scratch_pc;
-    work.regs[8] = syscall_no;
-    work.regs[0..6].copy_from_slice(&args);
+    set_syscall_args(&mut work, scratch_pc, syscall_no, args);
 
     // (§7 step 6) Install the work regs, then resume.
     setregset(pid, &work)?;
@@ -894,7 +856,7 @@ pub unsafe fn remote_syscall(
     }
     wait_result?;
 
-    // (§7 step 8) Read x0 from the post-trap register state.
+    // (§7 step 8) Read the syscall return register from the post-trap state.
     let out_result = getregset(pid);
     if out_result.is_err() {
         // SAFETY: forwards caller's `scratch_pc` writability guarantee.
@@ -902,7 +864,7 @@ pub unsafe fn remote_syscall(
         let _ = setregset(pid, &saved_regs);
     }
     let out = out_result?;
-    let ret = out.regs[0] as i64;
+    let ret = get_syscall_return(&out);
 
     // (§7 step 9) Restore in order: regs first (so pc points back at the
     // caller's resume address), then the scratch bytes (so a subsequent
@@ -945,27 +907,26 @@ pub(crate) unsafe fn remote_syscall_via_poke(
     syscall_no: u64,
     args: [u64; 6],
 ) -> Result<i64> {
-    // Payload: `svc #0 ; brk #0` little-endian packed into one 64-bit word.
-    // Same byte pattern `[0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4]`
-    // as [`remote_syscall`]; construction differs only in transport.
-    let svc_brk: u64 = (ARM64_SVC_0 as u64) | ((ARM64_BRK_0 as u64) << 32);
+    // Payload: trap-then-breakpoint little-endian packed into one 64-bit word
+    // (low half = `TRAP_INSN`, high half = `BRK_INSN`). Same byte pattern as
+    // [`remote_syscall`]; construction differs only in transport.
+    let trap_brk: u64 = (TRAP_INSN as u64) | ((BRK_INSN as u64) << 32);
 
     // Save the 8 bytes we are about to clobber (one PEEKDATA word on LP64).
     let saved_word = ptrace_peektext(pid, scratch_pc)?;
 
-    // Stage the svc+brk blob via POKEDATA — bypasses VMA write bits so the
+    // Stage the trap+brk blob via POKEDATA — bypasses VMA write bits so the
     // scratch may be an `r-xp` libc.text NOP slide.
-    ptrace_poketext(pid, scratch_pc, svc_brk)?;
+    ptrace_poketext(pid, scratch_pc, trap_brk)?;
 
     // Snapshot registers so we can restore on exit.
     let saved_regs = getregset(pid)?;
 
-    // Build the work register set: pc=scratch, x8=syscall, x0..x5=args.
-    // Leave sp/pstate/lr untouched — kernel uses its own stack.
+    // Build the work register set via the arch-neutral interface: pc=scratch,
+    // syscall-number register, arg registers. Stack/flags/link are left
+    // untouched — the kernel uses its own stack across the trap.
     let mut work = saved_regs;
-    work.pc = scratch_pc;
-    work.regs[8] = syscall_no;
-    work.regs[0..6].copy_from_slice(&args);
+    set_syscall_args(&mut work, scratch_pc, syscall_no, args);
 
     // Install the work regs, then resume.
     setregset(pid, &work)?;
@@ -983,10 +944,10 @@ pub(crate) unsafe fn remote_syscall_via_poke(
     };
     if rc == -1 {
         // Best-effort restore before propagating: libc.text must not retain
-        // live svc+brk at scratch_pc, and the tracee's saved regs must not
-        // remain in work-state (pc=scratch_pc, x8=syscall_no). Otherwise
-        // RemoteAttach::drop detaches init into a poisoned state and the
-        // next thread scheduled at scratch_pc traps on brk #0.
+        // live trap+brk at scratch_pc, and the tracee's saved regs must not
+        // remain in work-state (pc=scratch_pc, syscall register set).
+        // Otherwise RemoteAttach::drop detaches init into a poisoned state and
+        // the next thread scheduled at scratch_pc traps on the breakpoint.
         let _ = ptrace_poketext(pid, scratch_pc, saved_word);
         let _ = setregset(pid, &saved_regs);
         return Err(last_ptrace_op_err());
@@ -1001,14 +962,14 @@ pub(crate) unsafe fn remote_syscall_via_poke(
     }
     wait_result?;
 
-    // Read x0 from the post-trap register state.
+    // Read the syscall return register from the post-trap state.
     let out_result = getregset(pid);
     if out_result.is_err() {
         let _ = ptrace_poketext(pid, scratch_pc, saved_word);
         let _ = setregset(pid, &saved_regs);
     }
     let out = out_result?;
-    let ret = out.regs[0] as i64;
+    let ret = get_syscall_return(&out);
 
     // Restore in order: regs first (so pc points back at the caller's resume
     // address), then the scratch word (so a subsequent
@@ -1028,11 +989,12 @@ mod tests {
     use super::*;
 
     /// Test name referenced by P01 checklist as `seal::ptrace::size_assert`.
-    /// On aarch64 this reaches the compile-time assertion; on other arches
-    /// it verifies the layout is at least internally consistent.
+    /// `UserPtRegs`'s in-memory size must equal the active arch's declared
+    /// NT_PRSTATUS contract (the same value the per-arch compile-time
+    /// assertion enforces) — 272 on AArch64, 216 on x86_64, etc.
     #[test]
     fn size_assert() {
-        assert_eq!(core::mem::size_of::<UserPtRegs>(), 272);
+        assert_eq!(core::mem::size_of::<UserPtRegs>(), NT_PRSTATUS_SIZE);
     }
 
     #[test]
@@ -1048,8 +1010,15 @@ mod tests {
         assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
         assert_eq!(PTRACE_EVENT_STOP, 128);
         assert_eq!(NT_PRSTATUS, 1);
-        assert_eq!(ARM64_SVC_0, 0xd400_0001);
-        assert_eq!(ARM64_BRK_0, 0xd420_0000);
+    }
+
+    /// The AArch64 trap/breakpoint encodings the gadget stages, asserted only
+    /// where they are the active arch's instructions (`svc #0` / `brk #0`).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_trap_brk_encodings() {
+        assert_eq!(TRAP_INSN, 0xd400_0001);
+        assert_eq!(BRK_INSN, 0xd420_0000);
     }
 
     /// Build a `waitpid` ptrace-stop status: low byte `0x7f` makes

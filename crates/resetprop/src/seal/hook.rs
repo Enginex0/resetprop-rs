@@ -36,8 +36,8 @@ use crate::seal::arena::{
 };
 use crate::seal::maps::MapEntry;
 use crate::seal::ptrace::{
-    getregset, ptrace_peektext, ptrace_poketext, read_remote, remote_syscall_via_poke, setregset,
-    wait_stop, write_remote, PTRACE_CONT,
+    getregset, ptrace_peektext, ptrace_poketext, read_remote, remote_syscall_via_poke, set_pc,
+    setregset, wait_stop, write_remote, PTRACE_CONT,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -999,7 +999,7 @@ unsafe fn execute_remote_isb(pid: libc::pid_t, scratch_pc: u64) -> Result<()> {
 
     let saved_regs = getregset(pid)?;
     let mut work = saved_regs;
-    work.pc = scratch_pc;
+    set_pc(&mut work, scratch_pc);
     setregset(pid, &work)?;
 
     // SAFETY: `libc::ptrace` FFI; `addr` / `data` are NULL per PTRACE_CONT

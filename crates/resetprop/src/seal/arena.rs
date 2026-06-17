@@ -371,22 +371,30 @@ pub(crate) unsafe fn remote_remap_private(
     // --- Bootstrap: POKEDATA an svc+brk blob at scratch_pc ---------------
     let saved_bytes = super::ptrace::ptrace_peektext(guard.pid(), scratch_pc)?;
 
-    // svc #0 (low 4 bytes) ; brk #0 (high 4 bytes), little-endian pack
-    let svc_brk: u64 =
-        (super::ptrace::ARM64_SVC_0 as u64) | ((super::ptrace::ARM64_BRK_0 as u64) << 32);
-    super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, svc_brk)?;
+    // trap (low 4 bytes) ; brk (high 4 bytes), little-endian pack
+    let trap_brk: u64 = (super::ptrace::TRAP_INSN as u64)
+        | ((super::ptrace::BRK_INSN as u64) << 32);
+    super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, trap_brk)?;
 
     let bootstrap_page = {
         let saved_regs = super::ptrace::getregset(guard.pid())?;
         let mut work = saved_regs;
-        work.pc = scratch_pc;
-        work.regs[8] = NR_MMAP;
-        work.regs[0] = 0; // addr = NULL
-        work.regs[1] = BOOTSTRAP_PAGE_SIZE; // len  = 4096
-        work.regs[2] = PROT_RW; // prot — page is data-only; no execmem required
-        work.regs[3] = MAP_PRIVATE_ANON; // flags
-        work.regs[4] = (-1_i64) as u64; // fd = -1
-        work.regs[5] = 0; // offset
+        // mmap(NULL, 4096, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0) — page is
+        // data-only, so no execmem is requested. Staged through the arch-
+        // neutral interface so no raw register index appears here.
+        super::ptrace::set_syscall_args(
+            &mut work,
+            scratch_pc,
+            NR_MMAP,
+            [
+                0,                  // addr = NULL
+                BOOTSTRAP_PAGE_SIZE, // len  = 4096
+                PROT_RW,            // prot
+                MAP_PRIVATE_ANON,   // flags
+                (-1_i64) as u64,    // fd = -1
+                0,                  // offset
+            ],
+        );
 
         super::ptrace::setregset(guard.pid(), &work)?;
 
@@ -429,7 +437,7 @@ pub(crate) unsafe fn remote_remap_private(
             let _ = super::ptrace::setregset(guard.pid(), &saved_regs);
         }
         let out = out_result?;
-        let ret = out.regs[0] as i64;
+        let ret = super::ptrace::get_syscall_return(&out);
 
         super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes)?;
         super::ptrace::setregset(guard.pid(), &saved_regs)?;
