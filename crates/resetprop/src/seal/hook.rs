@@ -1075,6 +1075,33 @@ fn revert_trampoline(pid: libc::pid_t, target_fn: u64, saved_prologue: &[u8; 16]
     }
 }
 
+/// Compare the trampoline bytes read back from the tracee against the two
+/// words [`install_trampoline`] intended to write.
+///
+/// The two POKEs deliver `word_lo` then `word_hi` as consecutive little-
+/// endian `u64`s at `target_fn`, so the 16 bytes that should be live are
+/// exactly `word_lo.to_le_bytes()` followed by `word_hi.to_le_bytes()`. A
+/// torn or partial write (one POKE landing, the other silently dropping its
+/// high half, a racing writer clobbering a word) leaves `readback` differing
+/// from that expectation; this is the read-back gate that catches it before
+/// the i-cache sync makes the bad bytes executable.
+///
+/// Pure (no I/O) so the mismatch decision is unit-testable off-device:
+/// `install_trampoline` performs the `read_remote` and hands the buffer here.
+fn verify_trampoline_readback(word_lo: u64, word_hi: u64, readback: &[u8; 16]) -> Result<()> {
+    let mut expected = [0u8; 16];
+    expected[..8].copy_from_slice(&word_lo.to_le_bytes());
+    expected[8..].copy_from_slice(&word_hi.to_le_bytes());
+    if readback == &expected {
+        Ok(())
+    } else {
+        Err(Error::HookInstallFailed(format!(
+            "install_trampoline: trampoline read-back mismatch: \
+             wrote {expected:02x?} read {readback:02x?}"
+        )))
+    }
+}
+
 /// Install the 16-byte absolute-target trampoline at `handle.target_fn`
 /// and the 140-byte hook body at `handle.hook_page + HOOK_BODY_OFFSET`.
 ///
@@ -1093,6 +1120,11 @@ fn revert_trampoline(pid: libc::pid_t, target_fn: u64, saved_prologue: &[u8; 16]
 /// symbol resolution); on `EINVAL` / `EPERM` (kernel lacks the cmd or
 /// the tracee never registered) it falls back to
 /// [`execute_remote_isb`].
+///
+/// Between the trampoline write and the i-cache sync the 16 bytes are read
+/// back via [`read_remote`] and checked against the intended words by
+/// [`verify_trampoline_readback`]; a torn write is caught here, reverted,
+/// and aborted before it can be made executable.
 ///
 /// On success, `handle.trampoline_installed` is flipped to `true` so
 /// [`HookHandle::drop`] skips the `munmap` — init is now executing
@@ -1142,6 +1174,23 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
         ptrace_poketext(handle.pid, handle.target_fn + 8, word_hi).map_err(|e| {
             Error::HookInstallFailed(format!("install_trampoline: poke tramp hi: {e}"))
         })?;
+
+        // Step 3b: verify-after-write. Read the 16 bytes back via
+        // `process_vm_readv` and confirm they match the two words we POKEd
+        // BEFORE the i-cache sync makes them executable. A torn or partial
+        // write that slipped past the POKE return codes would otherwise be
+        // cache-synced into a live `ldr x16; br x16` over garbage and branch
+        // init into the weeds. On mismatch the `?` aborts the closure; the
+        // trailing `match` runs `revert_trampoline` to restore the prologue.
+        //
+        // SAFETY: `target_fn` is inside libc.text `r-xp`; `read_remote`
+        // needs read permission only, and the tracee is ptrace-stopped via
+        // `attach` so the read cannot race a concurrent write.
+        let mut readback = [0u8; 16];
+        unsafe { read_remote(handle.pid, handle.target_fn, &mut readback) }.map_err(|e| {
+            Error::HookInstallFailed(format!("install_trampoline: trampoline read-back: {e}"))
+        })?;
+        verify_trampoline_readback(word_lo, word_hi, &readback)?;
 
         // Step 4: i-cache sync via remote membarrier — REGISTER then SYNC_CORE.
         //
@@ -2117,5 +2166,95 @@ mod tests {
         let mut handle = dummy_handle_for_pre_attach_reject();
         let err = seal_prop(&mut handle, "a\0b").unwrap_err();
         assert!(matches!(err, Error::InvalidKey));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // T04 / M2 — verify-after-write read-back gate
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The two words `install_trampoline` POKEs, packed exactly as they land
+    /// in tracee memory: `word_lo` (`ldr x16,[pc,#8]` | `br x16`) then the
+    /// absolute body target. Shared by the read-back tests so the "intended"
+    /// bytes match the production encoder path.
+    fn intended_trampoline_words(target: u64) -> (u64, u64) {
+        let word_lo = (encoder::LDR_X16_PC8 as u64) | ((encoder::BR_X16 as u64) << 32);
+        (word_lo, target)
+    }
+
+    /// A faithful read-back — the 16 bytes that came back equal the two words
+    /// we wrote — passes the gate, so the i-cache sync proceeds untouched on a
+    /// good install.
+    #[test]
+    fn verify_trampoline_readback_accepts_faithful_write() {
+        let (word_lo, word_hi) = intended_trampoline_words(0x0000_7fff_abcd_1234);
+        let mut readback = [0u8; 16];
+        readback[..8].copy_from_slice(&word_lo.to_le_bytes());
+        readback[8..].copy_from_slice(&word_hi.to_le_bytes());
+
+        assert!(verify_trampoline_readback(word_lo, word_hi, &readback).is_ok());
+    }
+
+    /// Forces the torn write Defect-B can still produce past the POKE return
+    /// codes: the high half of `word_hi` is dropped, so the read-back holds a
+    /// half-written `br x16` target. The gate must flag the mismatch and
+    /// return the typed [`Error::HookInstallFailed`] — spec assertions (a)
+    /// detection and (d) typed error.
+    #[test]
+    fn verify_trampoline_readback_detects_torn_write() {
+        let (word_lo, word_hi) = intended_trampoline_words(0x0000_7fff_abcd_1234);
+
+        // Simulate a torn POKE: lo word landed, hi word lost its top 4 bytes.
+        let torn_hi = word_hi & 0x0000_0000_ffff_ffff;
+        let mut readback = [0u8; 16];
+        readback[..8].copy_from_slice(&word_lo.to_le_bytes());
+        readback[8..].copy_from_slice(&torn_hi.to_le_bytes());
+
+        let err = verify_trampoline_readback(word_lo, word_hi, &readback).unwrap_err();
+        assert!(
+            matches!(err, Error::HookInstallFailed(ref m) if m.contains("read-back mismatch")),
+            "torn write must surface as HookInstallFailed, got {err:?}"
+        );
+    }
+
+    /// End-to-end of the rollback contract against a 16-byte model of
+    /// `target_fn` in tracee memory: the install POKEs land a torn trampoline,
+    /// the gate detects it, and the same decode `revert_trampoline` uses (two
+    /// little-endian `u64` words of `saved_prologue`) restores init's original
+    /// 16-byte prologue byte-for-byte — spec assertions (b) revert runs and
+    /// (c) prologue intact.
+    #[test]
+    fn torn_trampoline_write_reverts_to_prologue() {
+        let target = 0x0000_7fff_abcd_1234u64;
+        let saved_prologue: [u8; 16] = [
+            0xfd, 0x7b, 0xbf, 0xa9, 0xfd, 0x03, 0x00, 0x91, // stp x29,x30 / mov x29,sp
+            0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6, // mov x0,#0 / ret
+        ];
+
+        // Model of the 16 bytes at `target_fn`, seeded with init's prologue.
+        let mut cell = saved_prologue;
+
+        // The install writes the trampoline words, but the hi POKE tears
+        // (drops its top half). Mirror that into the cell.
+        let (word_lo, word_hi) = intended_trampoline_words(target);
+        let torn_hi = word_hi & 0x0000_0000_ffff_ffff;
+        cell[..8].copy_from_slice(&word_lo.to_le_bytes());
+        cell[8..].copy_from_slice(&torn_hi.to_le_bytes());
+        assert_ne!(cell, saved_prologue, "torn write must perturb the cell");
+
+        // The gate reads `cell` back and rejects it.
+        assert!(verify_trampoline_readback(word_lo, word_hi, &cell).is_err());
+
+        // `revert_trampoline` decodes `saved_prologue` as two LE u64 words and
+        // POKEs them back over `target_fn` / `target_fn + 8`. Replay that
+        // decode against the cell; the result must be the original prologue.
+        let lo = u64::from_le_bytes(saved_prologue[0..8].try_into().unwrap());
+        let hi = u64::from_le_bytes(saved_prologue[8..16].try_into().unwrap());
+        cell[..8].copy_from_slice(&lo.to_le_bytes());
+        cell[8..].copy_from_slice(&hi.to_le_bytes());
+
+        assert_eq!(
+            cell, saved_prologue,
+            "revert must leave init's prologue byte-for-byte intact"
+        );
     }
 }
