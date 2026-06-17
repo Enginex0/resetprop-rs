@@ -90,7 +90,7 @@ fn run_detect(sys: &PropSystem) -> Result<(), String> {
         return Ok(());
     }
 
-    findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+    findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
     println!("=== propdetect report ({} properties scanned) ===\n", all_props.len());
 
