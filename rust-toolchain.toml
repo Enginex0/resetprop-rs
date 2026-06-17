@@ -1,14 +1,10 @@
-# Single source of truth for the toolchain: the enforcement wall (rustfmt + clippy),
-# the host checks, and the NDK cross-builds all resolve to this exact version, so a
-# newer rustfmt can never silently reformat the tree out from under CI. Pinned to the
-# Casting law's rust toolchain (casting/gradle/libs.versions.toml: rust = 1.96.0).
+# Single source of truth for the toolchain version: the enforcement wall (rustfmt +
+# clippy) and the host checks resolve to this exact version, so a newer rustfmt can
+# never silently reformat the tree out from under CI. Pinned to the Casting law's rust
+# (casting/gradle/libs.versions.toml: rust = 1.96.0). Cross targets are added at the
+# cross-compile sites (build.sh, the CI cross jobs), NOT here: listing them forces
+# every host cargo command to fetch the Android std libs before it can run.
 [toolchain]
 channel = "1.96.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
-targets = [
-    "aarch64-linux-android",
-    "armv7-linux-androideabi",
-    "x86_64-linux-android",
-    "i686-linux-android",
-]

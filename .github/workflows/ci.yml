@@ -58,10 +58,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Pinned toolchain + Android target
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Install NDK
         uses: nttld/setup-ndk@v1
