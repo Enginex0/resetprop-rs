@@ -1912,6 +1912,103 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // T16 / H1 — independent encoding oracle
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The golden trampoline image, assembled out-of-band from
+    /// `oracle/hook_body.s` by a real ARM64 assembler (`aarch64-linux-gnu-as`
+    /// + `objcopy -O binary`; `llvm-mc` was verified to emit identical bytes).
+    ///
+    /// Because the assembler derives every opcode *and every branch
+    /// displacement* from labelled mnemonics — not from the hand-written hex in
+    /// [`HOOK_BODY_TEMPLATE`] — this blob is an *independent* derivation. A
+    /// transcription slip in the template can therefore no longer ratify
+    /// itself: the exact failure mode that let Defect-A's `ldrb w11,[x10],#16`
+    /// (0x3841_054b) ship green against an equally-wrong hand-typed golden.
+    ///
+    /// Regeneration command lives in the header of `oracle/hook_body.s`.
+    const HOOK_BODY_ORACLE: &[u8] = include_bytes!("oracle/hook_body.golden.bin");
+
+    /// Diffs every word of [`HOOK_BODY_TEMPLATE`] against the independent
+    /// assembler oracle.
+    ///
+    /// Covers all 35 words, so mutating any single template word — opcode,
+    /// immediate, or branch displacement — turns this test red. This closes the
+    /// gap Defect-A slipped through: the old advance-block test asserted the
+    /// same wrong constant the template carried, so both agreed and the bug was
+    /// green. The oracle's bytes come from a different tool, so they cannot
+    /// agree with a hand-encoding mistake.
+    #[test]
+    fn hook_body_template_matches_independent_oracle() {
+        assert_eq!(
+            HOOK_BODY_ORACLE.len(),
+            HOOK_BODY_TEMPLATE.len() * 4,
+            "oracle blob must be 35 words × 4 = 140 bytes; regenerate via oracle/hook_body.s"
+        );
+
+        let template_bytes: Vec<u8> =
+            HOOK_BODY_TEMPLATE.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        for (i, (tpl, gold)) in template_bytes
+            .chunks_exact(4)
+            .zip(HOOK_BODY_ORACLE.chunks_exact(4))
+            .enumerate()
+        {
+            let tpl_w = u32::from_le_bytes([tpl[0], tpl[1], tpl[2], tpl[3]]);
+            let gold_w = u32::from_le_bytes([gold[0], gold[1], gold[2], gold[3]]);
+            assert_eq!(
+                tpl_w, gold_w,
+                "word {i}: HOOK_BODY_TEMPLATE 0x{tpl_w:08x} diverges from the \
+                 independent oracle 0x{gold_w:08x} — a hand-encoding error, or \
+                 the template changed and oracle/hook_body.s needs regenerating"
+            );
+        }
+    }
+
+    /// Confirms [`build_hook_body_bytes`] carries the assembler-verified
+    /// instruction words through unmodified — only the three patch regions may
+    /// differ from the oracle.
+    ///
+    /// The patcher overwrites the stolen-prologue, RESTORE_TARGET, and
+    /// LOCK_LIST data slots; every *instruction* word it emits must still match
+    /// the independent oracle. Anchoring the patcher's output to the oracle
+    /// (not to a second hand-derived copy) extends the Defect-A guard from the
+    /// static template to the bytes actually written into the tracee. The patch
+    /// set is derived from the module's patch-point constants so this test
+    /// tracks any future layout shift.
+    #[test]
+    fn build_hook_body_bytes_instruction_surface_matches_oracle() {
+        let saved_prologue = [0xABu8; 16];
+        let lock_list_vaddr: u64 = 0x1111_2222_3333_4444;
+        let return_addr: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
+        let body = build_hook_body_bytes(saved_prologue, lock_list_vaddr, return_addr);
+
+        let is_patched = |w: usize| {
+            (STOLEN_START..STOLEN_START + 4).contains(&w)
+                || (RESTORE_LIT..RESTORE_LIT + 2).contains(&w)
+                || (LOCK_LIST_LIT..LOCK_LIST_LIT + 2).contains(&w)
+        };
+
+        for (i, (body_w, gold)) in body
+            .chunks_exact(4)
+            .zip(HOOK_BODY_ORACLE.chunks_exact(4))
+            .enumerate()
+        {
+            if is_patched(i) {
+                continue;
+            }
+            let got = u32::from_le_bytes([body_w[0], body_w[1], body_w[2], body_w[3]]);
+            let want = u32::from_le_bytes([gold[0], gold[1], gold[2], gold[3]]);
+            assert_eq!(
+                got, want,
+                "instruction word {i} emitted by build_hook_body_bytes \
+                 (0x{got:08x}) diverges from the independent oracle (0x{want:08x})"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // P04 T4 — lock-list mechanics tests
     // ─────────────────────────────────────────────────────────────────────
 
