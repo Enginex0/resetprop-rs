@@ -2,9 +2,9 @@
 
 ```
 branch:  main
-last:    ed7a618  (T03 init-identity guard — feat(seal))
-active:  T03 committed — Error::NotInit + verify_init_identity gating both fresh-pid poke entry points (remote_remap_private, install_init_hook); cargo test 146✓, clippy -D warnings clean. Not pushed.
-next:    T16 (ready) or T04 (now unblocked, critical path). first 2-wide window opens (T13 ∥ T04|T16); hook.rs serializes the rest.
+last:    e86b23b  (T16 independent encoding oracle — test(seal))
+active:  T16 done — oracle/hook_body.s + golden blob (aarch64-as; llvm-mc agrees byte-for-byte); 2 tests diff HOOK_BODY_TEMPLATE + build_hook_body_bytes vs golden. Single-word mutation→red proven; cargo test 148✓, clippy -D warnings clean. Not pushed.
+next:    T04 (m2 verify-after-write — critical path, unblocked) ∥ T13 (only non-hook.rs task); hook.rs serializes the rest.
 ```
 
 ## Pointers (open only when the task needs them)
@@ -20,9 +20,9 @@ next:    T16 (ready) or T04 (now unblocked, critical path). first 2-wide window 
 17 active tasks; W2 merged 2026-06-16 (T15, T19). Status + parallelism:
 
 ```
-done T01 T02 T03 T05 T15 T19    (T12 done → reverted by T19)
-now  T16 🟢                     ← ready; writes seal/hook.rs
-W4   T04  T18  T13          T13 is the only non-hook.rs task → first parallel partner
+done T01 T02 T03 T05 T15 T16 T19    (T12 done → reverted by T19)
+now  T04 🟢                     ← critical path; writes seal/hook.rs
+W4   T18  T13               T13 is the only non-hook.rs task → first parallel partner
 W5   T07  T17               T17 dep[T15] met but wave-parked (4-file refactor, collides broadly)
 W6   T08  T09  T14
 W7   T06(device)  T10
