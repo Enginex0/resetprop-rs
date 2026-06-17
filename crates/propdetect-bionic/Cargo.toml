@@ -1,4 +1,5 @@
 [package]
+publish = false  # internal workspace crate, not a crates.io artifact
 name = "propdetect-bionic"
 version = "0.1.0"
 edition = "2021"
