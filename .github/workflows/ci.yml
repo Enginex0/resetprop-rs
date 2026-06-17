@@ -23,6 +23,32 @@ jobs:
       - name: Tests
         run: cargo test -p resetprop
 
+  gates:
+    name: Casting wall (fmt, clippy, supply, comment-hygiene)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (workspace, all targets and features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Supply line (offline, deterministic)
+        run: cargo deny check licenses bans sources
+
+      - name: Comment hygiene
+        run: python3 scripts/comment-hygiene.py
+
   cross-compile:
     runs-on: ubuntu-latest
     strategy:
@@ -51,16 +77,3 @@ jobs:
 
       - name: Build ${{ matrix.target }}
         run: cargo build --release --target ${{ matrix.target }}
-
-  clippy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Clippy (library)
-        run: cargo clippy -p resetprop -- -D warnings
