@@ -140,7 +140,12 @@ fn child_name(data: &[u8], child_node_off: usize) -> Option<&str> {
     entry_name(data, &entry)
 }
 
-fn resolve_binary<'a>(data: &'a [u8], contexts_off: usize, root_off: usize, name: &str) -> Option<&'a str> {
+fn resolve_binary<'a>(
+    data: &'a [u8],
+    contexts_off: usize,
+    root_off: usize,
+    name: &str,
+) -> Option<&'a str> {
     let mut best: Option<u32> = None;
     let mut node_off = root_off;
     let mut remaining = name;
@@ -499,22 +504,22 @@ mod tests {
         // "build" node (leaf with exact_match)
         let build_node_off = b.pos();
         b.write_u32(entry_build_off); // property_entry
-        b.write_u32(0);               // num_child_nodes
-        b.write_u32(0);               // child_nodes
-        b.write_u32(0);               // num_prefixes
-        b.write_u32(0);               // prefix_entries
-        b.write_u32(1);               // num_exact_matches
+        b.write_u32(0); // num_child_nodes
+        b.write_u32(0); // child_nodes
+        b.write_u32(0); // num_prefixes
+        b.write_u32(0); // prefix_entries
+        b.write_u32(1); // num_exact_matches
         b.write_u32(exact_array_off); // exact_match_entries
 
         // "ro" node
         let ro_node_off = b.pos();
-        b.write_u32(entry_ro_off);            // property_entry
-        b.write_u32(1);                        // num_child_nodes
-        b.write_u32(ro_children_array_off);    // child_nodes
-        b.write_u32(0);                        // num_prefixes
-        b.write_u32(0);                        // prefix_entries
-        b.write_u32(0);                        // num_exact_matches
-        b.write_u32(0);                        // exact_match_entries
+        b.write_u32(entry_ro_off); // property_entry
+        b.write_u32(1); // num_child_nodes
+        b.write_u32(ro_children_array_off); // child_nodes
+        b.write_u32(0); // num_prefixes
+        b.write_u32(0); // prefix_entries
+        b.write_u32(0); // num_exact_matches
+        b.write_u32(0); // exact_match_entries
 
         // "persist" node
         let persist_node_off = b.pos();
@@ -528,13 +533,13 @@ mod tests {
 
         // root node
         let root_off = b.pos();
-        b.write_u32(0);                         // property_entry (none)
-        b.write_u32(2);                          // num_child_nodes
-        b.write_u32(root_children_array_off);    // child_nodes
-        b.write_u32(0);                          // num_prefixes
-        b.write_u32(0);                          // prefix_entries
-        b.write_u32(0);                          // num_exact_matches
-        b.write_u32(0);                          // exact_match_entries
+        b.write_u32(0); // property_entry (none)
+        b.write_u32(2); // num_child_nodes
+        b.write_u32(root_children_array_off); // child_nodes
+        b.write_u32(0); // num_prefixes
+        b.write_u32(0); // prefix_entries
+        b.write_u32(0); // num_exact_matches
+        b.write_u32(0); // exact_match_entries
 
         // --- Patch child_nodes arrays with actual offsets ---
         // Root children: sorted by name. "persist" < "ro" alphabetically
@@ -597,7 +602,12 @@ mod tests {
     fn binary_resolve_persist() {
         let data = build_test_blob();
         let header = parse_header(&data).unwrap();
-        let result = resolve_binary(&data, header.contexts_off, header.root_off, "persist.sys.timezone");
+        let result = resolve_binary(
+            &data,
+            header.contexts_off,
+            header.root_off,
+            "persist.sys.timezone",
+        );
         assert_eq!(result, Some("u:object_r:persist_prop:s0"));
     }
 
@@ -631,7 +641,10 @@ mod tests {
         // Already sorted longest first
         assert_eq!(resolve_text(&entries, "ro.build.type"), Some("build_ctx"));
         assert_eq!(resolve_text(&entries, "ro.debuggable"), Some("ro_ctx"));
-        assert_eq!(resolve_text(&entries, "persist.sys.tz"), Some("persist_ctx"));
+        assert_eq!(
+            resolve_text(&entries, "persist.sys.tz"),
+            Some("persist_ctx")
+        );
         assert_eq!(resolve_text(&entries, "dalvik.vm.heapsize"), None);
     }
 

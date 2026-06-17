@@ -354,16 +354,17 @@ pub(crate) unsafe fn remote_remap_private(
     // is ptrace-stopped for the duration (guarded by `RemoteAttach` above).
     unsafe { super::ptrace::read_remote(pid, libc_text.start, &mut scan_buf)? };
 
-    let slide_offset = find_scratch_slot(&scan_buf)
-        .ok_or_else(|| Error::HookInstallFailed("libc.text scan too small for scratch slot".into()))?;
+    let slide_offset = find_scratch_slot(&scan_buf).ok_or_else(|| {
+        Error::HookInstallFailed("libc.text scan too small for scratch slot".into())
+    })?;
     let scratch_pc = libc_text.start + slide_offset as u64;
 
     // --- Bootstrap: POKEDATA an svc+brk blob at scratch_pc ---------------
     let saved_bytes = super::ptrace::ptrace_peektext(guard.pid(), scratch_pc)?;
 
     // trap (low 4 bytes) ; brk (high 4 bytes), little-endian pack
-    let trap_brk: u64 = (super::ptrace::TRAP_INSN as u64)
-        | ((super::ptrace::BRK_INSN as u64) << 32);
+    let trap_brk: u64 =
+        (super::ptrace::TRAP_INSN as u64) | ((super::ptrace::BRK_INSN as u64) << 32);
     super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, trap_brk)?;
 
     let bootstrap_page = {
@@ -377,12 +378,12 @@ pub(crate) unsafe fn remote_remap_private(
             scratch_pc,
             NR_MMAP,
             [
-                0,                  // addr = NULL
+                0,                   // addr = NULL
                 BOOTSTRAP_PAGE_SIZE, // len  = 4096
-                PROT_RW,            // prot
-                MAP_PRIVATE_ANON,   // flags
-                (-1_i64) as u64,    // fd = -1
-                0,                  // offset
+                PROT_RW,             // prot
+                MAP_PRIVATE_ANON,    // flags
+                (-1_i64) as u64,     // fd = -1
+                0,                   // offset
             ],
         );
 
@@ -752,7 +753,11 @@ mod tests {
     }
 
     fn libc_row() -> MapEntry {
-        mk("/apex/com.android.runtime/lib64/bionic/libc.so", b"r-xp", 0x2000)
+        mk(
+            "/apex/com.android.runtime/lib64/bionic/libc.so",
+            b"r-xp",
+            0x2000,
+        )
     }
 
     #[test]

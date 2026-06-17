@@ -51,7 +51,11 @@ impl<'a> TrieNode<'a> {
     }
 
     pub(crate) fn name_bytes(&self) -> &[u8] {
-        let len = (self.namelen() as usize).min(self.area.len().saturating_sub(self.offset + TRIE_NODE_FIXED));
+        let len = (self.namelen() as usize).min(
+            self.area
+                .len()
+                .saturating_sub(self.offset + TRIE_NODE_FIXED),
+        );
         let start = self.offset + TRIE_NODE_FIXED;
         unsafe { std::slice::from_raw_parts(self.area.base().add(start), len) }
     }
@@ -92,7 +96,11 @@ pub(crate) fn find(area: &PropArea, name: &str) -> Result<(usize, usize)> {
             return Err(Error::NotFound);
         }
 
-        current = bst_find(area, area.data_offset() + children_off as usize, segment.as_bytes())?;
+        current = bst_find(
+            area,
+            area.data_offset() + children_off as usize,
+            segment.as_bytes(),
+        )?;
 
         match rest {
             Some(r) => remaining = r,
@@ -179,7 +187,11 @@ where
 }
 
 /// BST insert: returns offset of existing or newly inserted node.
-pub(crate) fn bst_insert(area: &PropArea, parent_children: &AtomicU32, name: &[u8]) -> Result<usize> {
+pub(crate) fn bst_insert(
+    area: &PropArea,
+    parent_children: &AtomicU32,
+    name: &[u8],
+) -> Result<usize> {
     let root_off = parent_children.load(AO::Acquire);
     if root_off == 0 {
         let off = alloc_trie_node(area, name)?;
@@ -256,7 +268,11 @@ pub(crate) fn find_path(area: &PropArea, name: &str) -> Result<Vec<usize>> {
             return Err(Error::NotFound);
         }
 
-        let found = bst_find(area, area.data_offset() + children_off as usize, segment.as_bytes())?;
+        let found = bst_find(
+            area,
+            area.data_offset() + children_off as usize,
+            segment.as_bytes(),
+        )?;
         path.push(found.offset());
         current = found;
 

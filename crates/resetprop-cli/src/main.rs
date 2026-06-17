@@ -107,7 +107,10 @@ fn run() -> Result<(), String> {
             "--timeout" => {
                 i += 1;
                 let s = arg_val(&args, i, "--timeout")?;
-                timeout_secs = Some(s.parse::<u64>().map_err(|_| "--timeout requires a number".to_string())?);
+                timeout_secs = Some(
+                    s.parse::<u64>()
+                        .map_err(|_| "--timeout requires a number".to_string())?,
+                );
             }
             "-h" | "--help" => {
                 print_usage();
@@ -139,9 +142,7 @@ fn run() -> Result<(), String> {
         return Err("--if-diff and --if-match are mutually exclusive".to_string());
     }
     if conditional_set && conditional_delete {
-        return Err(
-            "--if-diff/--if-match cannot be combined with --delete-if-exist".to_string(),
-        );
+        return Err("--if-diff/--if-match cannot be combined with --delete-if-exist".to_string());
     }
     if any_conditional && any_top_level_op {
         return Err(
@@ -274,11 +275,11 @@ fn run() -> Result<(), String> {
                 }
                 Ok(())
             }
-            Err(e @ (Error::HookInstallFailed(_) | Error::ElfParse(_) | Error::SymbolNotFound(_))) => {
-                Err(format!(
-                    "Tier B hook install failed: {e}. Try --seal-arena for Tier A fallback."
-                ))
-            }
+            Err(
+                e @ (Error::HookInstallFailed(_) | Error::ElfParse(_) | Error::SymbolNotFound(_)),
+            ) => Err(format!(
+                "Tier B hook install failed: {e}. Try --seal-arena for Tier A fallback."
+            )),
             Err(e) => Err(format!("seal failed: {e}")),
         };
     }
@@ -417,8 +418,7 @@ fn persist_read_op(positional: &[String]) -> Result<(), String> {
 }
 
 fn load_file(sys: &PropSystem, path: &str, init: bool, verbose: bool) -> Result<(), String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let content = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
 
     let mut count = 0u32;
     for line in content.lines() {
@@ -439,7 +439,10 @@ fn load_file(sys: &PropSystem, path: &str, init: bool, verbose: bool) -> Result<
         .map_err(|e| format!("failed to set {name}: {e}"))?;
         count += 1;
         if verbose {
-            eprintln!("set{}: [{name}]=[{value}]", if init { "(init)" } else { "" });
+            eprintln!(
+                "set{}: [{name}]=[{value}]",
+                if init { "(init)" } else { "" }
+            );
         }
     }
 

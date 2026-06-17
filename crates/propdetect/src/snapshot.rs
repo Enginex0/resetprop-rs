@@ -48,14 +48,13 @@ pub fn capture(sys: &PropSystem) -> Snapshot {
 }
 
 pub fn save(snapshot: &Snapshot, path: &Path) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(snapshot)
-        .map_err(|e| format!("serialize: {e}"))?;
+    let json = serde_json::to_string_pretty(snapshot).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 pub fn load(path: &Path) -> Result<Snapshot, String> {
-    let data = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     serde_json::from_str(&data).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 

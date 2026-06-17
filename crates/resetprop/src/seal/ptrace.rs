@@ -30,8 +30,7 @@ use std::io;
 use libc::{c_int, c_void, iovec, process_vm_readv, process_vm_writev};
 
 pub use arch::active::{
-    get_syscall_return, set_pc, set_syscall_args, UserPtRegs, BRK_INSN, NT_PRSTATUS_SIZE,
-    TRAP_INSN,
+    get_syscall_return, set_pc, set_syscall_args, UserPtRegs, BRK_INSN, NT_PRSTATUS_SIZE, TRAP_INSN,
 };
 
 // PTRACE request numbers — from bionic/libc/kernel/uapi/linux/ptrace.h
@@ -453,7 +452,11 @@ fn seize_one_tid(tid: Pid) -> Result<bool> {
     // SEIZE took; the kernel auto-detaches on thread death, so a later `ESRCH`
     // needs no explicit detach — just skip the tid.
     if let Err(e) = ptrace_interrupt(tid) {
-        return if is_thread_gone(&e) { Ok(false) } else { Err(e) };
+        return if is_thread_gone(&e) {
+            Ok(false)
+        } else {
+            Err(e)
+        };
     }
     match wait_stop(tid, PTRACE_EVENT_STOP) {
         Ok(_) => Ok(true),
@@ -1021,13 +1024,19 @@ mod tests {
     fn benign_intermediate_stop_then_reaches_expected_event() {
         let benign = stopped_status(libc::SIGCHLD, 0);
         assert!(
-            matches!(classify_stop(benign, PTRACE_EVENT_STOP), StopVerdict::ContAndRetry),
+            matches!(
+                classify_stop(benign, PTRACE_EVENT_STOP),
+                StopVerdict::ContAndRetry
+            ),
             "benign SIGCHLD stop must be re-CONTed, not accepted or faulted"
         );
 
         let awaited = stopped_status(libc::SIGTRAP, PTRACE_EVENT_STOP);
         assert!(
-            matches!(classify_stop(awaited, PTRACE_EVENT_STOP), StopVerdict::Awaited),
+            matches!(
+                classify_stop(awaited, PTRACE_EVENT_STOP),
+                StopVerdict::Awaited
+            ),
             "the awaited SIGTRAP + matching event must be accepted as the final stop"
         );
     }
@@ -1056,7 +1065,11 @@ mod tests {
             }
         }
         assert_eq!(retried, 2, "both benign stops must be re-CONTed");
-        assert_eq!(reached, Some(queue[2]), "loop must land on the awaited brk-trap");
+        assert_eq!(
+            reached,
+            Some(queue[2]),
+            "loop must land on the awaited brk-trap"
+        );
     }
 
     /// The strict final check is intact: a `SIGTRAP` with the WRONG event, and
@@ -1068,7 +1081,10 @@ mod tests {
         // SIGTRAP but event=0 when the caller awaited the group-stop (128).
         let wrong_event = stopped_status(libc::SIGTRAP, 0);
         assert!(
-            matches!(classify_stop(wrong_event, PTRACE_EVENT_STOP), StopVerdict::Unexpected),
+            matches!(
+                classify_stop(wrong_event, PTRACE_EVENT_STOP),
+                StopVerdict::Unexpected
+            ),
             "a SIGTRAP with the wrong event must stay PtraceUnexpectedStatus"
         );
 
@@ -1157,12 +1173,12 @@ mod tests {
 
     #[test]
     fn thread_gone_detects_exit_and_esrch_only() {
-        assert!(is_thread_gone(&Error::PtraceAttach(io::Error::from_raw_os_error(
-            libc::ESRCH
-        ))));
-        assert!(is_thread_gone(&Error::PtraceOp(io::Error::from_raw_os_error(
-            libc::ESRCH
-        ))));
+        assert!(is_thread_gone(&Error::PtraceAttach(
+            io::Error::from_raw_os_error(libc::ESRCH)
+        )));
+        assert!(is_thread_gone(&Error::PtraceOp(
+            io::Error::from_raw_os_error(libc::ESRCH)
+        )));
         // WIFEXITED(0) is true (low 7 bits == 0): a clean thread exit status.
         assert!(libc::WIFEXITED(0));
         assert!(is_thread_gone(&Error::PtraceUnexpectedStatus(0)));
@@ -1170,9 +1186,9 @@ mod tests {
         let bad_stop = stopped_status(libc::SIGSEGV, 0);
         assert!(!is_thread_gone(&Error::PtraceUnexpectedStatus(bad_stop)));
         // A non-ESRCH op failure is a genuine fault, not a vanished thread.
-        assert!(!is_thread_gone(&Error::PtraceOp(io::Error::from_raw_os_error(
-            libc::EIO
-        ))));
+        assert!(!is_thread_gone(&Error::PtraceOp(
+            io::Error::from_raw_os_error(libc::EIO)
+        )));
     }
 
     #[test]
@@ -1199,7 +1215,11 @@ mod tests {
         )
         .expect("a settling group converges to a fixpoint");
         assert_eq!(stopped, vec![10, 11, 12]);
-        assert_eq!(seized, vec![10, 11, 12], "each live tid seized exactly once");
+        assert_eq!(
+            seized,
+            vec![10, 11, 12],
+            "each live tid seized exactly once"
+        );
     }
 
     #[test]
@@ -1315,7 +1335,9 @@ mod tests {
         }
         drop(tx);
 
-        let worker_tids: Vec<Pid> = (0..WORKERS).map(|_| rx.recv().expect("worker tid")).collect();
+        let worker_tids: Vec<Pid> = (0..WORKERS)
+            .map(|_| rx.recv().expect("worker tid"))
+            .collect();
 
         let listed =
             enumerate_thread_group(std::process::id() as Pid).expect("enumerate own task dir");

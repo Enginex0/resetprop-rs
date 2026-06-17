@@ -28,7 +28,13 @@ pub(crate) fn compact(area: &PropArea) -> Result<bool> {
         });
     }
 
-    collect(area, area.data_offset(), &mut allocs, &mut trie_offsets, &mut long_props)?;
+    collect(
+        area,
+        area.data_offset(),
+        &mut allocs,
+        &mut trie_offsets,
+        &mut long_props,
+    )?;
 
     allocs.sort_by_key(|a| a.offset);
     allocs.dedup_by_key(|a| a.offset);
@@ -64,7 +70,9 @@ pub(crate) fn compact(area: &PropArea) -> Result<bool> {
 
     let old_end = area.data_offset() + area.bytes_used().load(AO::Acquire) as usize;
     if cursor < old_end {
-        unsafe { std::ptr::write_bytes(area.base().add(cursor), 0, old_end - cursor); }
+        unsafe {
+            std::ptr::write_bytes(area.base().add(cursor), 0, old_end - cursor);
+        }
     }
 
     let new_used = (cursor - area.data_offset()) as u32;
@@ -88,7 +96,10 @@ fn collect(
         (TRIE_HEADER_SIZE + namelen + 1 + 3) & !3
     };
 
-    allocs.push(LiveAlloc { offset: node_abs, size: node_size });
+    allocs.push(LiveAlloc {
+        offset: node_abs,
+        size: node_size,
+    });
     trie_offsets.push(node_abs);
 
     let prop_rel = node.prop_offset().load(AO::Acquire);
@@ -96,7 +107,10 @@ fn collect(
         let pi_abs = area.data_offset() + prop_rel as usize;
         let name_len = strlen_at(area, pi_abs + PROP_INFO_FIXED);
         let pi_total = (PROP_INFO_FIXED + name_len + 1 + 3) & !3;
-        allocs.push(LiveAlloc { offset: pi_abs, size: pi_total });
+        allocs.push(LiveAlloc {
+            offset: pi_abs,
+            size: pi_total,
+        });
 
         let serial = area.read_u32(pi_abs);
         if serial & LONG_FLAG != 0 {
@@ -104,24 +118,45 @@ fn collect(
             let long_abs = pi_abs + rel;
             let val_len = strlen_at(area, long_abs);
             let aligned = (val_len + 1 + 3) & !3;
-            allocs.push(LiveAlloc { offset: long_abs, size: aligned });
+            allocs.push(LiveAlloc {
+                offset: long_abs,
+                size: aligned,
+            });
             long_props.push((pi_abs, long_abs));
         }
     }
 
     let left_rel = node.left().load(AO::Acquire);
     if left_rel != 0 {
-        collect(area, area.data_offset() + left_rel as usize, allocs, trie_offsets, long_props)?;
+        collect(
+            area,
+            area.data_offset() + left_rel as usize,
+            allocs,
+            trie_offsets,
+            long_props,
+        )?;
     }
 
     let children_rel = node.children().load(AO::Acquire);
     if children_rel != 0 {
-        collect(area, area.data_offset() + children_rel as usize, allocs, trie_offsets, long_props)?;
+        collect(
+            area,
+            area.data_offset() + children_rel as usize,
+            allocs,
+            trie_offsets,
+            long_props,
+        )?;
     }
 
     let right_rel = node.right().load(AO::Acquire);
     if right_rel != 0 {
-        collect(area, area.data_offset() + right_rel as usize, allocs, trie_offsets, long_props)?;
+        collect(
+            area,
+            area.data_offset() + right_rel as usize,
+            allocs,
+            trie_offsets,
+            long_props,
+        )?;
     }
 
     Ok(())
@@ -163,7 +198,12 @@ fn patch_trie_pointers(area: &PropArea, trie_offsets: &[usize], remap: &HashMap<
             Err(_) => continue,
         };
 
-        for field in [node.prop_offset(), node.left(), node.right(), node.children()] {
+        for field in [
+            node.prop_offset(),
+            node.left(),
+            node.right(),
+            node.children(),
+        ] {
             let old_rel = field.load(AO::Acquire);
             if old_rel == 0 {
                 continue;
@@ -176,7 +216,11 @@ fn patch_trie_pointers(area: &PropArea, trie_offsets: &[usize], remap: &HashMap<
     }
 }
 
-fn patch_long_values(area: &PropArea, long_props: &[(usize, usize)], remap: &HashMap<usize, usize>) {
+fn patch_long_values(
+    area: &PropArea,
+    long_props: &[(usize, usize)],
+    remap: &HashMap<usize, usize>,
+) {
     for &(old_pi, old_lv) in long_props {
         let new_pi = match remap.get(&old_pi) {
             Some(&v) => v,
@@ -187,7 +231,8 @@ fn patch_long_values(area: &PropArea, long_props: &[(usize, usize)], remap: &Has
             None => continue,
         };
         let new_rel = (new_lv - new_pi) as u32;
-        area.atomic_u32(new_pi + 4 + LONG_PROP_ERROR_SIZE).store(new_rel, AO::Release);
+        area.atomic_u32(new_pi + 4 + LONG_PROP_ERROR_SIZE)
+            .store(new_rel, AO::Release);
     }
 }
 
@@ -201,7 +246,8 @@ fn has_dirty_backup(area: &PropArea) -> bool {
         return false;
     }
     if children == 0 {
-        return area.bytes_used().load(AO::Acquire) as usize == TRIE_HEADER_SIZE + DIRTY_BACKUP_SIZE;
+        return area.bytes_used().load(AO::Acquire) as usize
+            == TRIE_HEADER_SIZE + DIRTY_BACKUP_SIZE;
     }
     true
 }

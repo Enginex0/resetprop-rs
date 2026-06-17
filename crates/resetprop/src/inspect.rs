@@ -35,7 +35,11 @@ impl PropArea {
                 }
                 let value = pi.read_value();
                 let serial = pi.serial_raw();
-                entries.push(PropEntry { name, value, serial });
+                entries.push(PropEntry {
+                    name,
+                    value,
+                    serial,
+                });
             }
         });
         entries
@@ -46,7 +50,12 @@ impl PropArea {
         let root = TrieNode::root(self);
         let children = root.children().load(Ordering::Acquire);
         if children != 0 {
-            walk_bst(self, self.data_offset() + children as usize, "", &mut entries);
+            walk_bst(
+                self,
+                self.data_offset() + children as usize,
+                "",
+                &mut entries,
+            );
         }
         entries
     }

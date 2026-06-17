@@ -18,25 +18,25 @@
 //! Use [`PropArea`] for single-file, low-level access.
 //! Use [`PersistStore`] for the on-disk persistent property store.
 
-mod error;
+mod appcompat;
 mod area;
-mod trie;
-mod info;
-mod dict;
-mod harvest;
+mod bionic;
 mod compact;
 mod context;
-mod bionic;
-mod persist;
-mod appcompat;
-mod wait;
-pub mod seal;
+mod dict;
+mod error;
+mod harvest;
+mod info;
 pub mod inspect;
 #[cfg(test)]
 mod mock;
+mod persist;
+pub mod seal;
+mod trie;
+mod wait;
 
-pub use error::{Error, Result};
 pub use area::PropArea;
+pub use error::{Error, Result};
 pub use persist::{PersistStore, Record};
 pub use seal::{SealRecord, SealTier};
 
@@ -196,7 +196,8 @@ impl PropArea {
                 None => {
                     let pi_offset = info::alloc_prop_info(self, name, value)?;
                     let relative = (pi_offset - self.data_offset()) as u32;
-                    self.atomic_u32(node_off + 4).store(relative, Ordering::Release);
+                    self.atomic_u32(node_off + 4)
+                        .store(relative, Ordering::Release);
                     return Ok(());
                 }
             }
@@ -304,7 +305,8 @@ impl PropArea {
             return false;
         }
 
-        if let Ok(child) = trie::TrieNode::from_offset(self, self.data_offset() + children as usize) {
+        if let Ok(child) = trie::TrieNode::from_offset(self, self.data_offset() + children as usize)
+        {
             let left = child.left().load(Ordering::Relaxed);
             let right = child.right().load(Ordering::Relaxed);
             left != 0 || right != 0
@@ -564,13 +566,17 @@ impl PropSystem {
     pub fn set(&self, name: &str, value: &str) -> Result<()> {
         if let Some((idx, area)) = self.find_area(name) {
             area.set(name, value)?;
-            self.appcompat_write(idx, |m| { let _ = m.set(name, value); });
+            self.appcompat_write(idx, |m| {
+                let _ = m.set(name, value);
+            });
             self.notify();
             return Ok(());
         }
         if let Some((idx, area)) = self.find_writable(name) {
             area.set(name, value)?;
-            self.appcompat_write(idx, |m| { let _ = m.set(name, value); });
+            self.appcompat_write(idx, |m| {
+                let _ = m.set(name, value);
+            });
             self.notify();
             return Ok(());
         }
@@ -583,13 +589,17 @@ impl PropSystem {
     pub fn set_init(&self, name: &str, value: &str) -> Result<()> {
         if let Some((idx, area)) = self.find_area(name) {
             area.set_init(name, value)?;
-            self.appcompat_write(idx, |m| { let _ = m.set_init(name, value); });
+            self.appcompat_write(idx, |m| {
+                let _ = m.set_init(name, value);
+            });
             self.notify();
             return Ok(());
         }
         if let Some((idx, area)) = self.find_writable(name) {
             area.set_init(name, value)?;
-            self.appcompat_write(idx, |m| { let _ = m.set_init(name, value); });
+            self.appcompat_write(idx, |m| {
+                let _ = m.set_init(name, value);
+            });
             self.notify();
             return Ok(());
         }
@@ -602,12 +612,16 @@ impl PropSystem {
     pub fn set_stealth(&self, name: &str, value: &str) -> Result<()> {
         if let Some((idx, area)) = self.find_area(name) {
             area.set_stealth(name, value)?;
-            self.appcompat_write(idx, |m| { let _ = m.set_stealth(name, value); });
+            self.appcompat_write(idx, |m| {
+                let _ = m.set_stealth(name, value);
+            });
             return Ok(());
         }
         if let Some((idx, area)) = self.find_writable(name) {
             area.set_stealth(name, value)?;
-            self.appcompat_write(idx, |m| { let _ = m.set_stealth(name, value); });
+            self.appcompat_write(idx, |m| {
+                let _ = m.set_stealth(name, value);
+            });
             return Ok(());
         }
         Err(Error::PermissionDenied(std::io::Error::new(
@@ -619,12 +633,16 @@ impl PropSystem {
     pub fn set_quiet(&self, name: &str, value: &str) -> Result<()> {
         if let Some((idx, area)) = self.find_area(name) {
             area.set_quiet(name, value)?;
-            self.appcompat_write(idx, |m| { let _ = m.set_quiet(name, value); });
+            self.appcompat_write(idx, |m| {
+                let _ = m.set_quiet(name, value);
+            });
             return Ok(());
         }
         if let Some((idx, area)) = self.find_writable(name) {
             area.set_quiet(name, value)?;
-            self.appcompat_write(idx, |m| { let _ = m.set_quiet(name, value); });
+            self.appcompat_write(idx, |m| {
+                let _ = m.set_quiet(name, value);
+            });
             return Ok(());
         }
         Err(Error::PermissionDenied(std::io::Error::new(
@@ -637,7 +655,9 @@ impl PropSystem {
         if let Some((idx, area)) = self.find_area(name) {
             let deleted = area.delete(name)?;
             if deleted {
-                self.appcompat_write(idx, |m| { let _ = m.delete(name); });
+                self.appcompat_write(idx, |m| {
+                    let _ = m.delete(name);
+                });
                 self.notify();
             }
             return Ok(deleted);
@@ -728,11 +748,7 @@ impl PropSystem {
         self.seal_write(name, value)?;
 
         let mirror_path = self.derive_mirror_path(&primary_path, filename);
-        seal::arena::seal_arena_with_mirror(
-            seal::INIT_PID,
-            &primary_path,
-            mirror_path.as_deref(),
-        )?;
+        seal::arena::seal_arena_with_mirror(seal::INIT_PID, &primary_path, mirror_path.as_deref())?;
 
         let record = SealRecord {
             name: name.to_string(),

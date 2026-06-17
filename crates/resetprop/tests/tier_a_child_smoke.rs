@@ -74,7 +74,11 @@ const SENTINEL_POST: u8 = 0xBB;
 /// static initialized by the parent immediately before `fork()`.
 unsafe fn fork_child(child_body: fn() -> !) -> libc::pid_t {
     let pid = libc::fork();
-    assert!(pid >= 0, "fork() failed: {}", std::io::Error::last_os_error());
+    assert!(
+        pid >= 0,
+        "fork() failed: {}",
+        std::io::Error::last_os_error()
+    );
     if pid == 0 {
         child_body();
     }
@@ -251,7 +255,8 @@ fn seal_arena_blocks_child_writes_from_reaching_file() {
             .expect("open tempfile for post-seal reset");
         f.seek(SeekFrom::Start(SENTINEL_OFFSET as u64))
             .expect("seek SENTINEL_OFFSET post-seal");
-        f.write_all(&[SENTINEL_PRE]).expect("write SENTINEL_PRE post-seal");
+        f.write_all(&[SENTINEL_PRE])
+            .expect("write SENTINEL_PRE post-seal");
         f.sync_all().expect("sync_all post-seal");
     }
 

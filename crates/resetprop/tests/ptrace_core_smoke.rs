@@ -30,9 +30,7 @@
 #![cfg(target_arch = "aarch64")]
 
 use resetprop::seal::ptrace::PTRACE_EVENT_STOP;
-use resetprop::seal::{
-    ptrace_detach, ptrace_interrupt, ptrace_seize, remote_syscall, wait_stop,
-};
+use resetprop::seal::{ptrace_detach, ptrace_interrupt, ptrace_seize, remote_syscall, wait_stop};
 
 /// AArch64 syscall number for `getpid()`; local to this test so the syscall
 /// table does not leak onto the `resetprop::seal::ptrace` public surface.
@@ -52,7 +50,11 @@ const NR_GETPID: u64 = 172;
 /// narrower bound is strictly sufficient.
 unsafe fn fork_child(child_body: fn() -> !) -> libc::pid_t {
     let pid = libc::fork();
-    assert!(pid >= 0, "fork() failed: {}", std::io::Error::last_os_error());
+    assert!(
+        pid >= 0,
+        "fork() failed: {}",
+        std::io::Error::last_os_error()
+    );
     if pid == 0 {
         child_body();
     }
@@ -163,10 +165,8 @@ fn remote_getpid_returns_child_pid() {
     // names an RWX page with 4096 bytes of room — far more than the 8 bytes
     // the injector stages at `scratch_pc`. The child is single-threaded and
     // blocked in pause(), so no other thread races on those 8 bytes.
-    let ret = unsafe {
-        remote_syscall(guard.pid(), scratch_pc, NR_GETPID, [0; 6])
-    }
-    .expect("remote_syscall");
+    let ret = unsafe { remote_syscall(guard.pid(), scratch_pc, NR_GETPID, [0; 6]) }
+        .expect("remote_syscall");
 
     assert_eq!(
         ret, child_pid as i64,

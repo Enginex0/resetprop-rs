@@ -287,8 +287,16 @@ mod tests {
         let word = pick.unwrap();
         assert_eq!(word.len(), 7);
         // should be one of the 7-char segments from our area: "thermal", "display", "monitor", "config" (6 != 7)
-        let valid = [b"thermal".to_vec(), b"display".to_vec(), b"monitor".to_vec()];
-        assert!(valid.contains(&word), "unexpected pick: {:?}", String::from_utf8_lossy(&word));
+        let valid = [
+            b"thermal".to_vec(),
+            b"display".to_vec(),
+            b"monitor".to_vec(),
+        ];
+        assert!(
+            valid.contains(&word),
+            "unexpected pick: {:?}",
+            String::from_utf8_lossy(&word)
+        );
     }
 
     #[test]
@@ -337,7 +345,10 @@ mod tests {
             area.foreach(|_, _| c += 1);
             c
         };
-        assert_eq!(before_count, after_count, "prop count changed after hexpatch");
+        assert_eq!(
+            before_count, after_count,
+            "prop count changed after hexpatch"
+        );
     }
 
     #[test]
@@ -390,7 +401,8 @@ mod tests {
         let area = mock.open();
 
         area.set("ro.customromverylongsegment.x", "v").unwrap();
-        area.hexpatch_delete("ro.customromverylongsegment.x").unwrap();
+        area.hexpatch_delete("ro.customromverylongsegment.x")
+            .unwrap();
 
         let mut props = Vec::new();
         area.foreach(|n, _| props.push(n.to_string()));
@@ -421,10 +433,15 @@ mod tests {
         area.delete("a.b.c").unwrap();
 
         let nodes = area.inspect_trie();
-        let orphans: Vec<_> = nodes.iter()
+        let orphans: Vec<_> = nodes
+            .iter()
             .filter(|n| n.prop_offset == 0 && !n.has_children)
             .collect();
-        assert!(orphans.is_empty(), "found {} orphan leaves after prune", orphans.len());
+        assert!(
+            orphans.is_empty(),
+            "found {} orphan leaves after prune",
+            orphans.len()
+        );
     }
 
     #[test]
@@ -457,8 +474,10 @@ mod tests {
         area.delete("c.d").unwrap();
         area.compact().unwrap();
 
-        assert!(area.arena_stats().bytes_used < before,
-            "bytes_used did not decrease after compact");
+        assert!(
+            area.arena_stats().bytes_used < before,
+            "bytes_used did not decrease after compact"
+        );
         assert_eq!(area.get("a.b").unwrap(), "1");
         assert_eq!(area.get("e.f").unwrap(), "3");
         assert!(area.get("c.d").is_none());
@@ -470,7 +489,8 @@ mod tests {
         let area = mock.open();
 
         for i in 0..20 {
-            area.set(&format!("test.prop{i}"), &format!("value{i}")).unwrap();
+            area.set(&format!("test.prop{i}"), &format!("value{i}"))
+                .unwrap();
         }
 
         for i in (0..20).step_by(2) {
@@ -487,8 +507,10 @@ mod tests {
             );
         }
         for i in (0..20).step_by(2) {
-            assert!(area.get(&format!("test.prop{i}")).is_none(),
-                "even prop {i} still present after compact");
+            assert!(
+                area.get(&format!("test.prop{i}")).is_none(),
+                "even prop {i} still present after compact"
+            );
         }
 
         let mut count = 0;
@@ -529,7 +551,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for seg in &segments[1..] {
             assert_eq!(seg.len(), 4);
-            assert!(seen.insert(*seg), "duplicate segment '{}' in mangled name", seg);
+            assert!(
+                seen.insert(*seg),
+                "duplicate segment '{}' in mangled name",
+                seg
+            );
         }
 
         assert!(area.get(&props[0]).is_some());
@@ -544,7 +570,9 @@ mod tests {
 
         // read raw serial before hexpatch via a get (serial encodes length in top byte)
         let (pi_off, _) = crate::trie::find(&area, "ro.serial.test").unwrap();
-        let serial_before = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let serial_before = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
         // counter bits (1-15, 17-23) should be 0 for a freshly created prop
         let counter_before = serial_before & 0x00FE_FFFE;
         assert_eq!(counter_before, 0, "counter non-zero before hexpatch");
@@ -558,7 +586,9 @@ mod tests {
         let (pi_off_after, _) = crate::trie::find(&area, &mangled).unwrap();
         assert_eq!(pi_off, pi_off_after, "prop_info moved after hexpatch");
 
-        let serial_after = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let serial_after = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
         let counter_after = serial_after & 0x00FE_FFFE;
         // Bionic compose: (((0|1)+1) & 0xFFFFFF) = 2. Counter zero would be
         // a propdetect leak (non-init-prefix + counter=0 + value="0").
@@ -580,9 +610,14 @@ mod tests {
         let area = mock.open();
 
         let siblings = [
-            "ro.build.type", "ro.build.tags", "ro.build.date",
-            "ro.build.host", "ro.build.user", "ro.build.keys",
-            "ro.lineage.version", "ro.custom.rom",
+            "ro.build.type",
+            "ro.build.tags",
+            "ro.build.date",
+            "ro.build.host",
+            "ro.build.user",
+            "ro.build.keys",
+            "ro.lineage.version",
+            "ro.custom.rom",
         ];
         for &prop in &siblings {
             area.set(prop, "test").unwrap();
@@ -594,8 +629,10 @@ mod tests {
         // ALL ro.build.* siblings must still be accessible via trie lookup
         for &prop in &siblings[..6] {
             assert_eq!(
-                area.get(prop).unwrap(), "test",
-                "BST corrupted: {} not found after hexpatch", prop
+                area.get(prop).unwrap(),
+                "test",
+                "BST corrupted: {} not found after hexpatch",
+                prop
             );
         }
 
@@ -617,7 +654,9 @@ mod tests {
             for b in name.bytes() {
                 assert!(
                     b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-',
-                    "invalid byte 0x{:02x} in mangled name '{}'", b, name,
+                    "invalid byte 0x{:02x} in mangled name '{}'",
+                    b,
+                    name,
                 );
             }
             assert!(!name.starts_with('.'));
@@ -698,8 +737,14 @@ mod tests {
         assert_eq!(value, "0");
 
         let (pi_off, _) = crate::trie::find(&area, &name).unwrap();
-        let serial = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(serial, 1u32 << 24, "replacement serial should be (1<<24) for value '0'");
+        let serial = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            serial,
+            1u32 << 24,
+            "replacement serial should be (1<<24) for value '0'"
+        );
     }
 
     #[test]
@@ -708,7 +753,8 @@ mod tests {
         let area = mock.open();
 
         for i in 0..10 {
-            area.set(&format!("test.prop.p{i}"), &format!("val{i}")).unwrap();
+            area.set(&format!("test.prop.p{i}"), &format!("val{i}"))
+                .unwrap();
         }
 
         let before = area.arena_stats().bytes_used;
@@ -719,7 +765,13 @@ mod tests {
 
         let after = area.arena_stats().bytes_used;
         let growth = after.saturating_sub(before);
-        assert!(growth < 512, "bytes_used grew too much: {} -> {} (+{})", before, after, growth);
+        assert!(
+            growth < 512,
+            "bytes_used grew too much: {} -> {} (+{})",
+            before,
+            after,
+            growth
+        );
 
         let mut count = 0;
         area.foreach(|n, _| {
@@ -754,16 +806,26 @@ mod tests {
         area.set("ro.test.prop", "hello").unwrap();
 
         let (pi_off, _) = crate::trie::find(&area, "ro.test.prop").unwrap();
-        let serial_before = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let serial_before = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
         let counter_before = serial_before & 0x00FFFFFF;
-        assert_eq!(counter_before, 2, "counter after two writes via write_value: 0 -> 2");
+        assert_eq!(
+            counter_before, 2,
+            "counter after two writes via write_value: 0 -> 2"
+        );
 
         area.set_stealth("ro.test.prop", "world").unwrap();
 
         // Bionic compose advances 2 -> 4: (((2|1)+1) & 0xFFFFFF) = 4
-        let serial_after = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let serial_after = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
         let expected = (5u32 << 24) | 4;
-        assert_eq!(serial_after, expected, "stealth must bionic-bump counter, not zero it");
+        assert_eq!(
+            serial_after, expected,
+            "stealth must bionic-bump counter, not zero it"
+        );
         assert_eq!(area.get("ro.test.prop").unwrap(), "world");
     }
 
@@ -777,8 +839,14 @@ mod tests {
         assert_eq!(area.get("vendor.new.prop").unwrap(), "test_val");
 
         let (pi_off, _) = crate::trie::find(&area, "vendor.new.prop").unwrap();
-        let serial = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(serial, 8u32 << 24, "serial should be (8<<24) for 8-char value");
+        let serial = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            serial,
+            8u32 << 24,
+            "serial should be (8<<24) for 8-char value"
+        );
     }
 
     #[test]
@@ -807,20 +875,33 @@ mod tests {
         area.set("ro.product.brand", "Pixel").unwrap();
 
         let (pi_off, _) = crate::trie::find(&area, "ro.product.brand").unwrap();
-        let before = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let before = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
         let counter_before = before & 0x00FF_FFFF;
-        assert_eq!(counter_before, 2, "two `set` calls (alloc + write_value) produce counter=2");
+        assert_eq!(
+            counter_before, 2,
+            "two `set` calls (alloc + write_value) produce counter=2"
+        );
 
         let count = area.normalize_serial().unwrap();
         assert_eq!(count, 1);
 
-        let after = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed);
+        let after = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
         let counter_after = after & 0x00FF_FFFF;
         // init-style bump: (((2 | 1) + 1) & 0xFFFFFF) = ((3+1) & 0xFFFFFF) = 4
-        assert_eq!(counter_after, 4, "normalize_serial must bionic-bump counter from 2 to 4");
+        assert_eq!(
+            counter_after, 4,
+            "normalize_serial must bionic-bump counter from 2 to 4"
+        );
 
         let len_byte = (after >> 24) & 0xFF;
-        assert_eq!(len_byte, 5, "length byte preserved (value 'Pixel' = 5 bytes)");
+        assert_eq!(
+            len_byte, 5,
+            "length byte preserved (value 'Pixel' = 5 bytes)"
+        );
         assert_eq!(after & 1, 0, "dirty bit cleared after normalize_serial");
         assert_eq!(after & (1 << 16), 0, "long flag not set");
 
@@ -841,17 +922,29 @@ mod tests {
         let (vd_off, _) = crate::trie::find(&area, "vendor.display.config").unwrap();
         let (ps_off, _) = crate::trie::find(&area, "persist.sys.timezone").unwrap();
         let (dv_off, _) = crate::trie::find(&area, "dalvik.vm.heapsize").unwrap();
-        let vd_before = area.atomic_u32(vd_off).load(std::sync::atomic::Ordering::Relaxed);
-        let ps_before = area.atomic_u32(ps_off).load(std::sync::atomic::Ordering::Relaxed);
-        let dv_before = area.atomic_u32(dv_off).load(std::sync::atomic::Ordering::Relaxed);
+        let vd_before = area
+            .atomic_u32(vd_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let ps_before = area
+            .atomic_u32(ps_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let dv_before = area
+            .atomic_u32(dv_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         let count = area.normalize_serial().unwrap();
         assert_eq!(count, 0, "no ro.* props, no rewrites");
 
         // serials must be untouched
-        let vd_after = area.atomic_u32(vd_off).load(std::sync::atomic::Ordering::Relaxed);
-        let ps_after = area.atomic_u32(ps_off).load(std::sync::atomic::Ordering::Relaxed);
-        let dv_after = area.atomic_u32(dv_off).load(std::sync::atomic::Ordering::Relaxed);
+        let vd_after = area
+            .atomic_u32(vd_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let ps_after = area
+            .atomic_u32(ps_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let dv_after = area
+            .atomic_u32(dv_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(vd_before, vd_after);
         assert_eq!(ps_before, ps_after);
         assert_eq!(dv_before, dv_after);
@@ -881,7 +974,10 @@ mod tests {
             ("ro.product.brand", "Pixel"),
             ("ro.product.model", "Pixel 8"),
             ("ro.build.type", "user"),
-            ("ro.build.fingerprint", "google/shiba/shiba:14/UQ1A.231205.015/11084887:user/release-keys"),
+            (
+                "ro.build.fingerprint",
+                "google/shiba/shiba:14/UQ1A.231205.015/11084887:user/release-keys",
+            ),
         ];
         for (name, value) in &pairs {
             area.set(name, value).unwrap();
@@ -907,22 +1003,37 @@ mod tests {
         area.set("ro.product.brand", "Pixel").unwrap();
 
         let (pi_off, _) = crate::trie::find(&area, "ro.product.brand").unwrap();
-        let counter_initial = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed) & 0x00FF_FFFF;
-        assert_eq!(counter_initial, 0, "freshly alloc'd prop starts at counter=0");
+        let counter_initial = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 0x00FF_FFFF;
+        assert_eq!(
+            counter_initial, 0,
+            "freshly alloc'd prop starts at counter=0"
+        );
 
         // first normalize: 0 -> (((0|1)+1) & 0xFFFFFF) = 2
         area.normalize_serial().unwrap();
-        let c1 = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed) & 0x00FF_FFFF;
+        let c1 = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 0x00FF_FFFF;
         assert_eq!(c1, 2);
 
         // second normalize: 2 -> (((2|1)+1) & 0xFFFFFF) = 4
         area.normalize_serial().unwrap();
-        let c2 = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed) & 0x00FF_FFFF;
+        let c2 = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 0x00FF_FFFF;
         assert_eq!(c2, 4);
 
         // third normalize: 4 -> (((4|1)+1) & 0xFFFFFF) = 6
         area.normalize_serial().unwrap();
-        let c3 = area.atomic_u32(pi_off).load(std::sync::atomic::Ordering::Relaxed) & 0x00FF_FFFF;
+        let c3 = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 0x00FF_FFFF;
         assert_eq!(c3, 6);
     }
 
@@ -966,7 +1077,10 @@ mod tests {
         sys.set("vendor.display.config", "auto").unwrap();
 
         let count = sys.normalize_serial().unwrap();
-        assert_eq!(count, 2, "PropSystem::normalize_serial counts the 2 ro.* short props");
+        assert_eq!(
+            count, 2,
+            "PropSystem::normalize_serial counts the 2 ro.* short props"
+        );
 
         // values intact through PropSystem read path
         assert_eq!(sys.get("ro.product.brand").unwrap(), "Pixel");
@@ -1033,9 +1147,7 @@ mod tests {
     #[test]
     fn set_if_match_skips_when_absent() {
         let (_dir, sys) = fresh_sys();
-        let acted = sys
-            .set_if_match("ro.absent", "anything", "value")
-            .unwrap();
+        let acted = sys.set_if_match("ro.absent", "anything", "value").unwrap();
         assert!(!acted);
         assert!(sys.get("ro.absent").is_none());
     }

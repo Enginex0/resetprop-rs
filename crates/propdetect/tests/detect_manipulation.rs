@@ -68,17 +68,26 @@ fn detect_hexpatch_delete() {
     let coherence_findings = propdetect_heuristics::check_name_coherence(&areas);
 
     println!("\n=== HEXPATCH DETECTION RESULTS ===");
-    for f in name_findings.iter().chain(&value_findings).chain(&serial_findings).chain(&coherence_findings) {
+    for f in name_findings
+        .iter()
+        .chain(&value_findings)
+        .chain(&serial_findings)
+        .chain(&coherence_findings)
+    {
         println!("[{}] {}: {}", f.severity, f.check, f.detail);
     }
 
     // value_anomaly should catch the stealth "0" values
-    assert!(!value_findings.is_empty(),
-        "value_anomaly should flag hexpatch stealth values");
+    assert!(
+        !value_findings.is_empty(),
+        "value_anomaly should flag hexpatch stealth values"
+    );
 
     // name_coherence should show NO mismatches (hexpatch renames both trie + prop_info)
-    assert!(coherence_findings.is_empty(),
-        "hexpatch should maintain trie/prop_info name consistency");
+    assert!(
+        coherence_findings.is_empty(),
+        "hexpatch should maintain trie/prop_info name consistency"
+    );
 
     // the original names must be gone
     assert!(area.get("ro.lineage.version").is_none());
@@ -96,7 +105,11 @@ fn detect_plain_delete() {
     area.delete("ro.custom.romname").unwrap();
     let after_count = count_props(&area);
 
-    assert_eq!(before_count - 2, after_count, "plain delete removes from enumeration");
+    assert_eq!(
+        before_count - 2,
+        after_count,
+        "plain delete removes from enumeration"
+    );
 
     let areas = areas_from(&path);
 
@@ -109,7 +122,8 @@ fn detect_plain_delete() {
     }
 
     // trie_structure should detect orphan nodes left behind by delete
-    let orphan_hits: Vec<_> = trie_findings.iter()
+    let orphan_hits: Vec<_> = trie_findings
+        .iter()
         .filter(|f| f.detail.contains("orphan"))
         .collect();
     println!("orphan findings: {}", orphan_hits.len());
@@ -161,13 +175,19 @@ fn snapshot_diff_catches_hexpatch() {
     }
 
     // hexpatch: original name disappears, new name appears
-    assert!(removed.contains(&"ro.lineage.version".to_string()),
-        "original prop name should show as removed in diff");
-    assert_eq!(added.len(), 1,
-        "exactly one new prop name should appear (the renamed one)");
+    assert!(
+        removed.contains(&"ro.lineage.version".to_string()),
+        "original prop name should show as removed in diff"
+    );
+    assert_eq!(
+        added.len(),
+        1,
+        "exactly one new prop name should appear (the renamed one)"
+    );
 
     // the added prop should have value "0"
-    let added_entry = diffs.iter()
+    let added_entry = diffs
+        .iter()
         .find(|d| matches!(d.kind, propdetect_snapshot::DiffKind::Added { .. }))
         .unwrap();
     if let propdetect_snapshot::DiffKind::Added { value } = &added_entry.kind {
@@ -175,8 +195,10 @@ fn snapshot_diff_catches_hexpatch() {
     }
 
     // total count should be unchanged
-    assert_eq!(snap_before.total_count, snap_after.total_count,
-        "hexpatch must not change total property count");
+    assert_eq!(
+        snap_before.total_count, snap_after.total_count,
+        "hexpatch must not change total property count"
+    );
 }
 
 #[test]
@@ -202,22 +224,29 @@ fn snapshot_diff_catches_plain_delete() {
     println!("\n=== SNAPSHOT DIFF (PLAIN DELETE) ===");
     for d in &diffs {
         match &d.kind {
-            propdetect_snapshot::DiffKind::Removed { value } => println!("- [{}] = {value}", d.name),
+            propdetect_snapshot::DiffKind::Removed { value } => {
+                println!("- [{}] = {value}", d.name)
+            }
             propdetect_snapshot::DiffKind::Added { value } => println!("+ [{}] = {value}", d.name),
             _ => {}
         }
     }
 
-    let removed: Vec<_> = diffs.iter()
+    let removed: Vec<_> = diffs
+        .iter()
         .filter(|d| matches!(d.kind, propdetect_snapshot::DiffKind::Removed { .. }))
         .map(|d| d.name.clone())
         .collect();
-    let added: Vec<_> = diffs.iter()
+    let added: Vec<_> = diffs
+        .iter()
         .filter(|d| matches!(d.kind, propdetect_snapshot::DiffKind::Added { .. }))
         .collect();
 
     assert!(removed.contains(&"ro.lineage.version".to_string()));
-    assert!(added.is_empty(), "plain delete should not add any properties");
+    assert!(
+        added.is_empty(),
+        "plain delete should not add any properties"
+    );
     assert_eq!(snap_after.total_count, snap_before.total_count - 1);
 }
 
@@ -234,11 +263,15 @@ fn delete_compact_leaves_no_orphans() {
     let areas = areas_from(&path);
     let trie_findings = propdetect_heuristics::check_trie_structure(&areas);
 
-    let orphan_hits: Vec<_> = trie_findings.iter()
+    let orphan_hits: Vec<_> = trie_findings
+        .iter()
         .filter(|f| f.detail.contains("orphan"))
         .collect();
-    assert!(orphan_hits.is_empty(),
-        "found {} orphan findings after delete+compact", orphan_hits.len());
+    assert!(
+        orphan_hits.is_empty(),
+        "found {} orphan findings after delete+compact",
+        orphan_hits.len()
+    );
 }
 
 fn count_props(area: &PropArea) -> usize {

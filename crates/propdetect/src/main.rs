@@ -86,17 +86,32 @@ fn run_detect(sys: &PropSystem) -> Result<(), String> {
     findings.extend(heuristics::check_name_coherence(sys.areas()));
 
     if findings.is_empty() {
-        println!("propdetect: no anomalies detected ({} properties scanned)", all_props.len());
+        println!(
+            "propdetect: no anomalies detected ({} properties scanned)",
+            all_props.len()
+        );
         return Ok(());
     }
 
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
-    println!("=== propdetect report ({} properties scanned) ===\n", all_props.len());
+    println!(
+        "=== propdetect report ({} properties scanned) ===\n",
+        all_props.len()
+    );
 
-    let crit = findings.iter().filter(|f| f.severity == heuristics::Severity::Critical).count();
-    let warn = findings.iter().filter(|f| f.severity == heuristics::Severity::Warn).count();
-    let info = findings.iter().filter(|f| f.severity == heuristics::Severity::Info).count();
+    let crit = findings
+        .iter()
+        .filter(|f| f.severity == heuristics::Severity::Critical)
+        .count();
+    let warn = findings
+        .iter()
+        .filter(|f| f.severity == heuristics::Severity::Warn)
+        .count();
+    let info = findings
+        .iter()
+        .filter(|f| f.severity == heuristics::Severity::Info)
+        .count();
 
     for f in &findings {
         println!("[{}] {}: {}", f.severity, f.check, f.detail);
@@ -119,8 +134,10 @@ fn run_diff(before: &Path, after: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("=== property diff ({} -> {} properties) ===\n",
-        snap_before.total_count, snap_after.total_count);
+    println!(
+        "=== property diff ({} -> {} properties) ===\n",
+        snap_before.total_count, snap_after.total_count
+    );
 
     for e in &entries {
         match &e.kind {
@@ -140,12 +157,26 @@ fn run_diff(before: &Path, after: &Path) -> Result<(), String> {
     }
 
     println!();
-    let added = entries.iter().filter(|e| matches!(e.kind, snapshot::DiffKind::Added { .. })).count();
-    let removed = entries.iter().filter(|e| matches!(e.kind, snapshot::DiffKind::Removed { .. })).count();
-    let changed = entries.iter().filter(|e| matches!(e.kind, snapshot::DiffKind::Changed { .. })).count();
-    let serial = entries.iter().filter(|e| matches!(e.kind, snapshot::DiffKind::SerialChanged { .. })).count();
+    let added = entries
+        .iter()
+        .filter(|e| matches!(e.kind, snapshot::DiffKind::Added { .. }))
+        .count();
+    let removed = entries
+        .iter()
+        .filter(|e| matches!(e.kind, snapshot::DiffKind::Removed { .. }))
+        .count();
+    let changed = entries
+        .iter()
+        .filter(|e| matches!(e.kind, snapshot::DiffKind::Changed { .. }))
+        .count();
+    let serial = entries
+        .iter()
+        .filter(|e| matches!(e.kind, snapshot::DiffKind::SerialChanged { .. }))
+        .count();
 
-    println!("summary: +{added} added, -{removed} removed, ~{changed} changed, s{serial} serial-only");
+    println!(
+        "summary: +{added} added, -{removed} removed, ~{changed} changed, s{serial} serial-only"
+    );
 
     Ok(())
 }

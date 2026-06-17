@@ -54,9 +54,8 @@ pub(super) fn parse_line(line: &str, pid: libc::pid_t) -> Result<Option<MapEntry
         return Ok(None);
     }
 
-    let corrupt = |detail: &str| -> Error {
-        Error::AreaCorrupt(format!("/proc/{pid}/maps: {detail}"))
-    };
+    let corrupt =
+        |detail: &str| -> Error { Error::AreaCorrupt(format!("/proc/{pid}/maps: {detail}")) };
 
     // Columns: ADDR perms offset dev inode [path]. Split on exactly the first
     // five single-space separators so any spaces inside the path column
@@ -79,7 +78,9 @@ pub(super) fn parse_line(line: &str, pid: libc::pid_t) -> Result<Option<MapEntry
         .map_err(|_| corrupt(&format!("invalid end address '{end_s}'")))?;
 
     if perms_tok.len() != 4 {
-        return Err(corrupt(&format!("perms column is not 4 bytes: '{perms_tok}'")));
+        return Err(corrupt(&format!(
+            "perms column is not 4 bytes: '{perms_tok}'"
+        )));
     }
     let mut perms = [0u8; 4];
     perms.copy_from_slice(perms_tok.as_bytes());

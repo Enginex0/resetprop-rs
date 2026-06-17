@@ -148,7 +148,9 @@ fn skip_field(data: &[u8], mut pos: usize, wire_type: u8) -> Result<usize> {
         2 => {
             let len = read_varint(data, &mut pos)? as usize;
             if pos + len > data.len() {
-                return Err(Error::PersistCorrupt("truncated length-delimited field".into()));
+                return Err(Error::PersistCorrupt(
+                    "truncated length-delimited field".into(),
+                ));
             }
             Ok(pos + len)
         }
@@ -158,7 +160,9 @@ fn skip_field(data: &[u8], mut pos: usize, wire_type: u8) -> Result<usize> {
             }
             Ok(pos + 4)
         }
-        _ => Err(Error::PersistCorrupt(format!("unknown wire type {wire_type}"))),
+        _ => Err(Error::PersistCorrupt(format!(
+            "unknown wire type {wire_type}"
+        ))),
     }
 }
 
@@ -190,9 +194,18 @@ mod tests {
     #[test]
     fn round_trip_multiple() {
         let records = vec![
-            Record { name: "persist.sys.timezone".into(), value: "UTC".into() },
-            Record { name: "persist.sys.language".into(), value: "en".into() },
-            Record { name: "persist.vendor.test".into(), value: "1".into() },
+            Record {
+                name: "persist.sys.timezone".into(),
+                value: "UTC".into(),
+            },
+            Record {
+                name: "persist.sys.language".into(),
+                value: "en".into(),
+            },
+            Record {
+                name: "persist.vendor.test".into(),
+                value: "1".into(),
+            },
         ];
         let encoded = encode(&records);
         let decoded = decode(&encoded).unwrap();
@@ -228,7 +241,10 @@ mod tests {
 
     #[test]
     fn wire_format_field_order() {
-        let records = vec![Record { name: "persist.a".into(), value: "v".into() }];
+        let records = vec![Record {
+            name: "persist.a".into(),
+            value: "v".into(),
+        }];
         let encoded = encode(&records);
         assert_eq!(encoded[0], 0x0A);
         let mut pos = 1;
@@ -243,7 +259,10 @@ mod tests {
 
     #[test]
     fn skips_unknown_fields() {
-        let records = vec![Record { name: "persist.x".into(), value: "y".into() }];
+        let records = vec![Record {
+            name: "persist.x".into(),
+            value: "y".into(),
+        }];
         let mut encoded = encode(&records);
         // append an unknown varint field (field 15, wire type 0, value 42)
         encoded.push(15 << 3);

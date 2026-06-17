@@ -38,10 +38,18 @@ impl PropArea {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path")))?;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid path",
+            ))
+        })?;
 
-        let flags = if writable { libc::O_RDWR } else { libc::O_RDONLY };
+        let flags = if writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
         let fd = unsafe { libc::open(c_path.as_ptr(), flags | libc::O_NOFOLLOW) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -57,7 +65,9 @@ impl PropArea {
         let file_size = stat.st_size as usize;
         if file_size < HEADER_SIZE {
             unsafe { libc::close(fd) };
-            return Err(Error::AreaCorrupt(format!("file too small: {file_size} bytes")));
+            return Err(Error::AreaCorrupt(format!(
+                "file too small: {file_size} bytes"
+            )));
         }
 
         let prot = if writable {
@@ -67,7 +77,14 @@ impl PropArea {
         };
 
         let ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), file_size, prot, libc::MAP_SHARED, fd, 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_size,
+                prot,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
         };
         unsafe { libc::close(fd) };
 
@@ -143,7 +160,10 @@ impl PropArea {
 
     pub(crate) fn atomic_u32(&self, offset: usize) -> &AtomicU32 {
         assert!(offset + 4 <= self.len);
-        assert!(offset.is_multiple_of(4), "AtomicU32 requires 4-byte alignment, got offset {offset}");
+        assert!(
+            offset.is_multiple_of(4),
+            "AtomicU32 requires 4-byte alignment, got offset {offset}"
+        );
         unsafe { AtomicU32::from_ptr(self.base.add(offset) as *mut u32) }
     }
 
@@ -217,7 +237,12 @@ impl PropArea {
                 return Err(Error::AreaFull);
             }
             if bu
-                .compare_exchange_weak(current, current + aligned as u32, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(
+                    current,
+                    current + aligned as u32,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
                 return Ok(HEADER_SIZE + current as usize);
@@ -231,8 +256,12 @@ impl PropArea {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path")))?;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid path",
+            ))
+        })?;
 
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW) };
         if fd < 0 {

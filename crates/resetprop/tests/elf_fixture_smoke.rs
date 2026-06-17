@@ -71,14 +71,9 @@ fn fixture_symbol_resolves() {
             workspace_root().join("target/release/libelf_fixture.so")
         }
     };
-    assert!(
-        so_path.exists(),
-        "cdylib missing at {}",
-        so_path.display()
-    );
+    assert!(so_path.exists(), "cdylib missing at {}", so_path.display());
 
-    let file = File::open(&so_path)
-        .unwrap_or_else(|e| panic!("open {}: {e}", so_path.display()));
+    let file = File::open(&so_path).unwrap_or_else(|e| panic!("open {}: {e}", so_path.display()));
     let view = parse_libc_elf(&file).expect("parse_libc_elf on elf_fixture");
 
     let resolved = resolve_symbol(&view, FIXTURE_SYMBOL)

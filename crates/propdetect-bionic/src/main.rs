@@ -42,12 +42,24 @@ struct Snapshot {
 }
 
 extern "C" fn foreach_cb(pi: *const prop_info, cookie: *mut c_void) {
-
-    extern "C" fn read_cb(cookie: *mut c_void, name: *const c_char, value: *const c_char, serial: u32) {
+    extern "C" fn read_cb(
+        cookie: *mut c_void,
+        name: *const c_char,
+        value: *const c_char,
+        serial: u32,
+    ) {
         let collector = unsafe { &*(cookie as *const PropCollector) };
-        let name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
-        let value = unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned();
-        collector.props.lock().unwrap().insert(name, PropValue { value, serial });
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        let value = unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned();
+        collector
+            .props
+            .lock()
+            .unwrap()
+            .insert(name, PropValue { value, serial });
     }
 
     unsafe {
@@ -75,20 +87,32 @@ fn main() -> ExitCode {
         Some("--snapshot") => {
             let path = match args.get(1) {
                 Some(p) => p,
-                None => { eprintln!("usage: propdetect-bionic --snapshot <file>"); return ExitCode::FAILURE; }
+                None => {
+                    eprintln!("usage: propdetect-bionic --snapshot <file>");
+                    return ExitCode::FAILURE;
+                }
             };
             cmd_snapshot(Path::new(path))
         }
         Some("--diff") => {
             let (a, b) = match (args.get(1), args.get(2)) {
                 (Some(a), Some(b)) => (a, b),
-                _ => { eprintln!("usage: propdetect-bionic --diff <before> <after>"); return ExitCode::FAILURE; }
+                _ => {
+                    eprintln!("usage: propdetect-bionic --diff <before> <after>");
+                    return ExitCode::FAILURE;
+                }
             };
             cmd_diff(Path::new(a), Path::new(b))
         }
-        Some("-h" | "--help") => { print_usage(); ExitCode::SUCCESS }
+        Some("-h" | "--help") => {
+            print_usage();
+            ExitCode::SUCCESS
+        }
         None => cmd_detect(),
-        Some(s) => { eprintln!("unknown arg: {s}"); ExitCode::FAILURE }
+        Some(s) => {
+            eprintln!("unknown arg: {s}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -121,21 +145,88 @@ fn cmd_detect() -> ExitCode {
     }
 
     let known_prefixes: std::collections::HashSet<&str> = [
-        "ro", "persist", "sys", "init", "net", "gsm", "ril", "dalvik", "hw",
-        "wifi", "bluetooth", "dhcp", "service", "selinux", "debug", "log",
-        "ctl", "vendor", "config", "security", "cache", "dev", "vold",
-        "media", "audio", "camera", "pm", "am", "wm", "input",
-        "telephony", "phone", "ims", "runtime", "libc", "wrap", "drm",
-        "apex", "adb", "external_storage",
-    ].into_iter().collect();
+        "ro",
+        "persist",
+        "sys",
+        "init",
+        "net",
+        "gsm",
+        "ril",
+        "dalvik",
+        "hw",
+        "wifi",
+        "bluetooth",
+        "dhcp",
+        "service",
+        "selinux",
+        "debug",
+        "log",
+        "ctl",
+        "vendor",
+        "config",
+        "security",
+        "cache",
+        "dev",
+        "vold",
+        "media",
+        "audio",
+        "camera",
+        "pm",
+        "am",
+        "wm",
+        "input",
+        "telephony",
+        "phone",
+        "ims",
+        "runtime",
+        "libc",
+        "wrap",
+        "drm",
+        "apex",
+        "adb",
+        "external_storage",
+    ]
+    .into_iter()
+    .collect();
 
     let numeric_hints: &[&str] = &[
-        "debuggable", "secure", "adb", "enabled", "connected", "locked",
-        "booted", "ready", "completed", "running", "active", "supported",
-        "present", "available", "configured", "mounted", "visible",
-        "count", "size", "max", "min", "timeout", "delay", "interval",
-        "level", "version", "index", "id", "port", "pid", "uid",
-        "width", "height", "density", "dpi", "fps", "encrypted",
+        "debuggable",
+        "secure",
+        "adb",
+        "enabled",
+        "connected",
+        "locked",
+        "booted",
+        "ready",
+        "completed",
+        "running",
+        "active",
+        "supported",
+        "present",
+        "available",
+        "configured",
+        "mounted",
+        "visible",
+        "count",
+        "size",
+        "max",
+        "min",
+        "timeout",
+        "delay",
+        "interval",
+        "level",
+        "version",
+        "index",
+        "id",
+        "port",
+        "pid",
+        "uid",
+        "width",
+        "height",
+        "density",
+        "dpi",
+        "fps",
+        "encrypted",
     ];
 
     for (name, pv) in &props {
@@ -157,7 +248,8 @@ fn cmd_detect() -> ExitCode {
 
         // serial analysis: counter is bits 1-15 (lower half, excluding dirty bit 0)
         let counter = (pv.serial >> 1) & 0x7FFF;
-        let is_init = name.starts_with("ro.") || name.starts_with("dalvik.") || name.starts_with("persist.");
+        let is_init =
+            name.starts_with("ro.") || name.starts_with("dalvik.") || name.starts_with("persist.");
         if !is_init && counter == 0 && pv.value == "0" {
             println!("[WARN] serial: [{name}]=0 serial=0 (possible hexpatch artifact)");
             warnings += 1;
@@ -178,10 +270,25 @@ fn cmd_diff(a: &Path, b: &Path) -> ExitCode {
         serde_json::from_str(&data).map_err(|e| format!("{}: {e}", p.display()))
     };
 
-    let before = match load(a) { Ok(s) => s, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
-    let after = match load(b) { Ok(s) => s, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
+    let before = match load(a) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let after = match load(b) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    println!("=== property diff ({} -> {} props) ===\n", before.total_count, after.total_count);
+    println!(
+        "=== property diff ({} -> {} props) ===\n",
+        before.total_count, after.total_count
+    );
 
     let mut added = 0u32;
     let mut removed = 0u32;
@@ -190,7 +297,10 @@ fn cmd_diff(a: &Path, b: &Path) -> ExitCode {
 
     for (name, old) in &before.props {
         match after.props.get(name) {
-            None => { println!("- [{name}] = {}", old.value); removed += 1; }
+            None => {
+                println!("- [{name}] = {}", old.value);
+                removed += 1;
+            }
             Some(new) if old.value != new.value => {
                 println!("~ [{name}] {} -> {}", old.value, new.value);
                 changed += 1;
@@ -215,7 +325,7 @@ fn cmd_diff(a: &Path, b: &Path) -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-"propdetect-bionic - non-root property detector (bionic FFI)
+        "propdetect-bionic - non-root property detector (bionic FFI)
 
 Uses __system_property_foreach, same API as any Android app.
 

@@ -343,14 +343,14 @@ pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
 
     let lock_list_page = remote_mmap_anon_rw_page(pid, scratch_pc)?;
 
-    let saved_prologue =
-        match write_sentinel_and_snapshot_prologue(pid, lock_list_page, target_fn) {
-            Ok(p) => p,
-            Err(e) => {
-                best_effort_remote_munmap(pid, scratch_pc, lock_list_page);
-                return Err(e);
-            }
-        };
+    let saved_prologue = match write_sentinel_and_snapshot_prologue(pid, lock_list_page, target_fn)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            best_effort_remote_munmap(pid, scratch_pc, lock_list_page);
+            return Err(e);
+        }
+    };
 
     let body_bytes = build_hook_body_bytes(saved_prologue, lock_list_page, target_fn + 16);
 
@@ -471,9 +471,9 @@ fn write_host_hook_file(pid: libc::pid_t, body_bytes: &[u8]) -> Result<PathBuf> 
 /// would overflow the page.
 fn layout_hook_page_bytes(body_bytes: &[u8]) -> Result<Vec<u8>> {
     let body_start = HOOK_BODY_OFFSET as usize;
-    let body_end = body_start.checked_add(body_bytes.len()).ok_or_else(|| {
-        Error::HookInstallFailed("stage-B: hook body offset overflow".into())
-    })?;
+    let body_end = body_start
+        .checked_add(body_bytes.len())
+        .ok_or_else(|| Error::HookInstallFailed("stage-B: hook body offset overflow".into()))?;
     if body_end > HOOK_PAGE_SIZE as usize {
         return Err(Error::HookInstallFailed(format!(
             "stage-B: hook body ({} bytes) exceeds page capacity at offset {}",
@@ -503,9 +503,7 @@ fn mmap_file_backed_in_tracee(
     // SAFETY: best-effort close; tracee still stopped. Close errors are
     // diagnostic-only because the fd leaks to init's fd table at worst,
     // which self-reclaims on next exec.
-    let _ = unsafe {
-        remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0])
-    };
+    let _ = unsafe { remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0]) };
     mmap_result
 }
 
@@ -1211,7 +1209,11 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
                 NR_MEMBARRIER,
                 [
                     MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE,
-                    0, 0, 0, 0, 0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                 ],
             )
         }
@@ -1979,8 +1981,10 @@ mod tests {
             "oracle blob must be 35 words × 4 = 140 bytes; regenerate via oracle/hook_body.s"
         );
 
-        let template_bytes: Vec<u8> =
-            HOOK_BODY_TEMPLATE.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let template_bytes: Vec<u8> = HOOK_BODY_TEMPLATE
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
 
         for (i, (tpl, gold)) in template_bytes
             .chunks_exact(4)

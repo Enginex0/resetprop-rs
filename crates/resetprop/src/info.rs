@@ -230,7 +230,8 @@ impl<'a> PropInfo<'a> {
             *ptr.add(value.len()) = 0;
         }
 
-        let new_serial = ((serial + 2) & 0x00FFFFFF) | LONG_FLAG | ((value.len() as u32 & 0xFF) << 24);
+        let new_serial =
+            ((serial + 2) & 0x00FFFFFF) | LONG_FLAG | ((value.len() as u32 & 0xFF) << 24);
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
         self.area.futex_wake(self.offset);

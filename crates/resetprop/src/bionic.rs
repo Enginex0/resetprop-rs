@@ -14,8 +14,7 @@ mod inner {
         Option<unsafe extern "C" fn(*const c_void, *mut c_void)>,
         *mut c_void,
     ) -> c_int;
-    type WaitFn =
-        unsafe extern "C" fn(*const c_void, u32, *mut u32, *const libc::timespec) -> bool;
+    type WaitFn = unsafe extern "C" fn(*const c_void, u32, *mut u32, *const libc::timespec) -> bool;
 
     struct BionicFns {
         find: FindFn,
@@ -140,17 +139,17 @@ mod inner {
         ctx.results
     }
 
-    pub(crate) fn wait_prop(
-        name: &str,
-        old_serial: u32,
-        timeout: Option<Duration>,
-    ) -> Option<u32> {
+    pub(crate) fn wait_prop(name: &str, old_serial: u32, timeout: Option<Duration>) -> Option<u32> {
         let fns = fns()?;
         let wait = fns.wait?;
 
         let pi = CString::new(name).ok().and_then(|cname| unsafe {
             let p = (fns.find)(cname.as_ptr());
-            if p.is_null() { None } else { Some(p) }
+            if p.is_null() {
+                None
+            } else {
+                Some(p)
+            }
         });
 
         // null pi = wait on global serial (prop doesn't exist yet)
@@ -168,7 +167,11 @@ mod inner {
 
         let mut new_serial: u32 = 0;
         let ok = unsafe { (wait)(pi_ptr, old_serial, &mut new_serial, ts_ptr) };
-        if ok { Some(new_serial) } else { None }
+        if ok {
+            Some(new_serial)
+        } else {
+            None
+        }
     }
 }
 

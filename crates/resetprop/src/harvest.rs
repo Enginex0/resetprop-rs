@@ -6,9 +6,8 @@ use crate::area::PropArea;
 use crate::dict;
 
 const STEMS: &[&[u8]] = &[
-    b"hw", b"sv", b"fm", b"nv", b"tp", b"bt", b"qc", b"sf",
-    b"cfg", b"drv", b"hal", b"dev", b"arm", b"log", b"dsp",
-    b"svc", b"v8a", b"gpu", b"adb", b"vhw", b"mmc", b"usb",
+    b"hw", b"sv", b"fm", b"nv", b"tp", b"bt", b"qc", b"sf", b"cfg", b"drv", b"hal", b"dev", b"arm",
+    b"log", b"dsp", b"svc", b"v8a", b"gpu", b"adb", b"vhw", b"mmc", b"usb",
 ];
 
 fn rand_index(n: usize) -> usize {
@@ -50,11 +49,7 @@ impl SegmentPool {
     }
 }
 
-pub(crate) fn replacement(
-    original: &[u8],
-    used: &HashSet<Vec<u8>>,
-    pool: &SegmentPool,
-) -> Vec<u8> {
+pub(crate) fn replacement(original: &[u8], used: &HashSet<Vec<u8>>, pool: &SegmentPool) -> Vec<u8> {
     let len = original.len();
 
     if let Some(w) = pool.pick(len, used) {
@@ -134,7 +129,9 @@ pub(crate) fn generate_name(area: &PropArea, exclude: &HashSet<String>) -> Strin
 
     let fallbacks: &[&str] = &["sys.", "vendor."];
     let prefixes: Vec<&str> = match best {
-        Some(p) => std::iter::once(p).chain(fallbacks.iter().copied()).collect(),
+        Some(p) => std::iter::once(p)
+            .chain(fallbacks.iter().copied())
+            .collect(),
         None => fallbacks.to_vec(),
     };
 

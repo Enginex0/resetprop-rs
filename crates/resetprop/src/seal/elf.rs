@@ -204,9 +204,9 @@ fn vaddr_to_foff(pt_loads: &[(u64, u64, u64)], vaddr: u64) -> Option<usize> {
 /// here (`Elf64_Ehdr`, `Elf64_Phdr`, `Elf64_Dyn`, `Elf64_Sym`) satisfy this.
 fn read_struct<T: Copy>(bytes: &[u8], off: usize, what: &str) -> Result<T> {
     let size = mem::size_of::<T>();
-    let end = off.checked_add(size).ok_or_else(|| {
-        Error::ElfParse(format!("offset overflow reading {what}"))
-    })?;
+    let end = off
+        .checked_add(size)
+        .ok_or_else(|| Error::ElfParse(format!("offset overflow reading {what}")))?;
     if end > bytes.len() {
         return Err(Error::ElfParse(format!(
             "truncated {what} at offset {off} (need {size}, have {})",
@@ -270,9 +270,7 @@ pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
         return Err(Error::ElfParse("e_type != ET_DYN".into()));
     }
     if (ehdr.e_phentsize as usize) != mem::size_of::<Elf64_Phdr>() {
-        return Err(Error::ElfParse(
-            "e_phentsize != sizeof(Elf64_Phdr)".into(),
-        ));
+        return Err(Error::ElfParse("e_phentsize != sizeof(Elf64_Phdr)".into()));
     }
 
     // ---- Program headers ----
@@ -285,9 +283,10 @@ pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
 
     for i in 0..phnum {
         let off = phoff
-            .checked_add(i.checked_mul(phentsize).ok_or_else(|| {
-                Error::ElfParse("phdr index overflow".into())
-            })?)
+            .checked_add(
+                i.checked_mul(phentsize)
+                    .ok_or_else(|| Error::ElfParse("phdr index overflow".into()))?,
+            )
             .ok_or_else(|| Error::ElfParse("phdr offset overflow".into()))?;
         let phdr: Elf64_Phdr = read_struct(&bytes, off, "Phdr")?;
 
@@ -302,8 +301,8 @@ pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
         }
     }
 
-    let (_dyn_vaddr, dyn_off, dyn_filesz) = pt_dynamic
-        .ok_or_else(|| Error::ElfParse("PT_DYNAMIC absent".into()))?;
+    let (_dyn_vaddr, dyn_off, dyn_filesz) =
+        pt_dynamic.ok_or_else(|| Error::ElfParse("PT_DYNAMIC absent".into()))?;
 
     // ---- Walk PT_DYNAMIC until DT_NULL or filesz exhausted ----
     let mut symtab_va: Option<u64> = None;
@@ -318,9 +317,10 @@ pub fn parse_libc_elf(file: &File) -> Result<LibcElfView> {
 
     for i in 0..dyn_entries {
         let off = dyn_off
-            .checked_add(i.checked_mul(mem::size_of::<Elf64_Dyn>()).ok_or_else(|| {
-                Error::ElfParse("dyn index overflow".into())
-            })?)
+            .checked_add(
+                i.checked_mul(mem::size_of::<Elf64_Dyn>())
+                    .ok_or_else(|| Error::ElfParse("dyn index overflow".into()))?,
+            )
             .ok_or_else(|| Error::ElfParse("dyn offset overflow".into()))?;
         let d: Elf64_Dyn = read_struct(&bytes, off, "Dyn")?;
 
@@ -562,8 +562,7 @@ pub fn linear_lookup(view: &LibcElfView, name: &str) -> Option<u64> {
     if view.strtab_offset <= view.symtab_offset {
         return None;
     }
-    let entries =
-        (view.strtab_offset - view.symtab_offset) / mem::size_of::<Elf64_Sym>();
+    let entries = (view.strtab_offset - view.symtab_offset) / mem::size_of::<Elf64_Sym>();
 
     for i in 0..entries {
         let sym_off = view
@@ -805,13 +804,7 @@ mod tests {
         // String table.
         bytes[strtab_offset..strtab_offset + strtab_size].copy_from_slice(&strtab);
 
-        LibcElfView::from_parts(
-            bytes,
-            symtab_offset,
-            strtab_offset,
-            strtab_size,
-            Some(0),
-        )
+        LibcElfView::from_parts(bytes, symtab_offset, strtab_offset, strtab_size, Some(0))
     }
 
     /// A chain-matching symbol whose binding is `STB_LOCAL` must be skipped,

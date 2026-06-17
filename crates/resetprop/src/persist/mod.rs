@@ -1,5 +1,5 @@
-pub(crate) mod proto;
 mod io;
+pub(crate) mod proto;
 
 use std::path::{Path, PathBuf};
 
@@ -32,11 +32,15 @@ impl PersistStore {
         } else {
             load_legacy(dir)
         };
-        Ok(Self { dir: dir.to_path_buf(), records })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            records,
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.records.iter()
+        self.records
+            .iter()
             .find(|r| r.name == name)
             .map(|r| r.value.as_str())
     }
@@ -45,7 +49,10 @@ impl PersistStore {
         if let Some(r) = self.records.iter_mut().find(|r| r.name == name) {
             r.value = value.to_string();
         } else {
-            self.records.push(Record { name: name.to_string(), value: value.to_string() });
+            self.records.push(Record {
+                name: name.to_string(),
+                value: value.to_string(),
+            });
         }
         self.flush()
     }
@@ -85,7 +92,10 @@ fn load_legacy(dir: &Path) -> Vec<Record> {
             continue;
         }
         if let Ok(value) = std::fs::read_to_string(entry.path()) {
-            records.push(Record { name, value: value.trim().to_string() });
+            records.push(Record {
+                name,
+                value: value.trim().to_string(),
+            });
         }
     }
     records

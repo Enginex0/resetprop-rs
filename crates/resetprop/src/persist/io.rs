@@ -36,7 +36,9 @@ pub(crate) fn atomic_write(dir: &Path, data: &[u8]) -> Result<()> {
 
     let result = write_and_sync(fd, data, &selinux_ctx);
 
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
 
     if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp);
@@ -57,7 +59,11 @@ fn write_and_sync(fd: i32, data: &[u8], selinux_ctx: &Option<Vec<u8>>) -> Result
     let mut written = 0usize;
     while written < data.len() {
         let n = unsafe {
-            libc::write(fd, data[written..].as_ptr() as *const libc::c_void, data.len() - written)
+            libc::write(
+                fd,
+                data[written..].as_ptr() as *const libc::c_void,
+                data.len() - written,
+            )
         };
         if n < 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -111,7 +117,9 @@ fn fsync_dir(dir: &Path) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     let rc = unsafe { libc::fsync(fd) };
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
     if rc != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
