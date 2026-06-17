@@ -1,0 +1,10 @@
+# Greenfield seed. build-logic imports this by path so the version pins stay one
+# source of truth. Mirrors the law's enforcement toolchain; uncomment the matching
+# implementation lines in build-logic/build.gradle.kts when JVM modules arrive.
+[versions]
+agp = "9.2.0"
+kotlin = "2.3.21"
+
+[libraries]
+android-gradlePlugin = { module = "com.android.tools.build:gradle", version.ref = "agp" }
+kotlin-gradlePlugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }

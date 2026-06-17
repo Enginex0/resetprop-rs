@@ -1,0 +1,32 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{kt,kts}]
+# Line-length ceiling 300: the standard across these projects. A generous
+# ceiling so the gate fires only on genuinely unreadable lines. Note ktlint
+# cannot auto-fix an over-long line (it will not break it for you), so a line
+# past 300 must be wrapped by hand — rare at this ceiling.
+max_line_length = 300
+# Non-auto-fixable comment-placement rules: ktlint flags these but will not fix
+# them, so they cannot belong to a deterministic auto-format gate. Both guard
+# legitimate, readable patterns (labelled Java-interop bool args; an explanatory
+# comment on a single-line if-guard). Comment placement is a sign-plane (review)
+# concern, not a bump-plane (auto-fix) one.
+ktlint_standard_comment-wrapping = disabled
+ktlint_standard_if-else-wrapping = disabled
+
+[*.{c,cc,cpp,h,hpp}]
+indent_size = 2
+
+[*.{yml,yaml,toml,json}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false

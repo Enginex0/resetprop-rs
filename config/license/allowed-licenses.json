@@ -1,0 +1,13 @@
+{
+  "_comment": "Casting-plane JVM license allowlist read by the first-party checkLicense gate in mold.jvm-supply: an external dependency whose POM license matches none of these regexes fails gatesFull. Mirrors the deny.toml policy for the Rust half. A dependency whose license the gate cannot read directly (e.g. declared only in a parent POM) is frozen with a per-module entry ({ \"moduleName\": \"group:artifact\" }) — the brownfield mechanism. Widening the license SET (not a per-module freeze) is an ADR plus a canary promotion.",
+  "allowedLicenses": [
+    { "moduleLicense": ".*Apache.*" },
+    { "moduleLicense": ".*MIT.*" },
+    { "moduleLicense": ".*BSD.*" },
+    { "moduleLicense": ".*ISC.*" },
+    { "moduleLicense": ".*Unicode.*" },
+    { "moduleLicense": ".*CC0.*" },
+    { "moduleLicense": ".*Zlib.*" },
+    { "moduleLicense": ".*Public Domain.*" }
+  ]
+}

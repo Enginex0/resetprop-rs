@@ -1,0 +1,10 @@
+#!/bin/sh
+# Mold casting hook: the full wall (gatesFull) on push.
+# A convenience pre-check, never the wall: `--no-verify` walks past this, the
+# release build does not (ADR-0002). gatesFull also binds at assembleRelease /
+# bundleRelease. Inert where there is no push target (local-only developer).
+set -e
+if [ -x ./gradlew ]; then
+    exec ./gradlew gatesFull --quiet
+fi
+echo "mold pre-push: no ./gradlew found; skipping gatesFull" >&2

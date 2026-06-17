@@ -1,0 +1,35 @@
+# Casting-plane detekt config — the WHOLE active rule set, not an override.
+# The mold.kotlin-quality convention plugin sets buildUponDefaultConfig = false,
+# so detekt's 200-rule default set is OFF and only the rules turned on below run.
+#
+# enforcement.md scopes this gate to two things and nothing else:
+#   - swallowed / empty / over-generic exceptions  (bump)
+#   - a LargeClass / LongMethod hard ceiling        (bump at the ceiling only)
+# The soft size budget is a sign-plane (judgment) concern, not a deterministic
+# gate, so detekt enforces only the hard ceiling here. Formatting belongs to
+# Spotless/ktlint, never detekt — no formatting or style rules live in this file.
+#
+# Per ADR-0007 (certainty over severity): gate only what we are certain about.
+# Widening this set is an ADR plus a canary promotion, not an edit.
+
+# EmptyCatchBlock is in detekt's empty-blocks ruleset, not exceptions.
+empty-blocks:
+  active: true
+  EmptyCatchBlock:
+    active: true
+
+exceptions:
+  active: true
+  SwallowedException:
+    active: true
+  TooGenericExceptionCaught:
+    active: true
+
+complexity:
+  active: true
+  LargeClass:
+    active: true
+    threshold: 600
+  LongMethod:
+    active: true
+    threshold: 60

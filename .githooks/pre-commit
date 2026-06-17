@@ -1,0 +1,9 @@
+#!/bin/sh
+# Mold casting hook: the fast structural gate (gatesFast) on commit.
+# A convenience pre-check, never the wall: `--no-verify` walks past this, the
+# release build does not (ADR-0002). gatesFast also runs on every variant build.
+set -e
+if [ -x ./gradlew ]; then
+    exec ./gradlew gatesFast --quiet
+fi
+echo "mold pre-commit: no ./gradlew found; skipping gatesFast" >&2
