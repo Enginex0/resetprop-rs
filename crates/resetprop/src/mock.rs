@@ -187,13 +187,36 @@ mod tests {
     }
 
     #[test]
-    fn value_too_long() {
+    fn long_value_create_roundtrip() {
         let mock = MockArea::new();
         let area = mock.open();
 
-        let val = "x".repeat(92); // >= PROP_VALUE_MAX
-        let result = area.set("too.long", &val);
-        assert!(result.is_err());
+        let boundary = "a".repeat(92); // first long value (>= PROP_VALUE_MAX)
+        let big = "z".repeat(300); // well past the short cap
+        area.set("long.boundary", &boundary).unwrap();
+        area.set("long.big", &big).unwrap();
+        area.set("short.neighbor", "ok").unwrap();
+
+        // get only returns the value when LONG_FLAG, the self-relative offset, and
+        // the NUL-terminated long value are all correct; a wrong layout would read
+        // back the legacy error message instead.
+        assert_eq!(area.get("long.boundary").unwrap(), boundary);
+        assert_eq!(area.get("long.big").unwrap(), big);
+        assert_eq!(area.get("short.neighbor").unwrap(), "ok");
+
+        // Bionic copies (serial>>24)+1 bytes of value[] into a PROP_VALUE_MAX buffer
+        // before it checks kLongFlag, so a long prop's length byte must stay below
+        // PROP_VALUE_MAX or a mutable read overflows that buffer.
+        let (pi_off, _) = crate::trie::find(&area, "long.big").unwrap();
+        let serial = area
+            .atomic_u32(pi_off)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(serial & (1 << 16), 0, "kLongFlag must be set on a long prop");
+        let length_byte = ((serial >> 24) & 0xFF) as usize;
+        assert!(
+            length_byte < crate::info::PROP_VALUE_MAX,
+            "serial length byte {length_byte} must stay below PROP_VALUE_MAX"
+        );
     }
 
     #[test]

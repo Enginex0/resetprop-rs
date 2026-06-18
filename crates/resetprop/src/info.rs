@@ -231,7 +231,7 @@ impl<'a> PropInfo<'a> {
         }
 
         let new_serial =
-            ((serial + 2) & 0x00FFFFFF) | LONG_FLAG | ((value.len() as u32 & 0xFF) << 24);
+            ((serial + 2) & 0x00FFFFFF) | LONG_FLAG | (LONG_VALUE_SERIAL_LEN << 24);
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
         self.area.futex_wake(self.offset);
@@ -259,7 +259,7 @@ impl<'a> PropInfo<'a> {
         }
 
         let counter = (((serial & 0x00FFFFFF) | 1).wrapping_add(1)) & 0x00FFFFFF;
-        let new_serial = counter | ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
+        let new_serial = counter | (LONG_VALUE_SERIAL_LEN << 24) | LONG_FLAG;
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
         self.area.futex_wake(self.offset);
@@ -322,7 +322,7 @@ impl<'a> PropInfo<'a> {
         }
 
         let counter = (((serial & 0x00FFFFFF) | 1).wrapping_add(1)) & 0x00FFFFFF;
-        let new_serial = counter | ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
+        let new_serial = counter | (LONG_VALUE_SERIAL_LEN << 24) | LONG_FLAG;
         std::sync::atomic::fence(Ordering::Release);
         sa.store(new_serial, Ordering::Release);
 
@@ -374,7 +374,7 @@ impl<'a> PropInfo<'a> {
             *ptr.add(value.len()) = 0;
         }
 
-        let new_serial = (serial & 0x00FFFFFF) | ((value.len() as u32 & 0xFF) << 24) | LONG_FLAG;
+        let new_serial = (serial & 0x00FFFFFF) | (LONG_VALUE_SERIAL_LEN << 24) | LONG_FLAG;
         std::sync::atomic::fence(Ordering::Release);
         self.serial_atomic().store(new_serial, Ordering::Release);
 
@@ -491,7 +491,7 @@ impl<'a> PropInfo<'a> {
 
 pub(crate) fn alloc_prop_info(area: &PropArea, name: &str, value: &str) -> Result<usize> {
     if value.len() >= PROP_VALUE_MAX {
-        return Err(Error::ValueTooLong { len: value.len() });
+        return alloc_long_prop_info(area, name, value);
     }
 
     let name_bytes = name.as_bytes();
@@ -516,4 +516,49 @@ pub(crate) fn alloc_prop_info(area: &PropArea, name: &str, value: &str) -> Resul
     }
 
     Ok(offset)
+}
+
+// Bionic stores this in value[] of every long prop so callers on the legacy
+// __system_property_get path get a canonical message instead of raw offset
+// bytes. Reproducing it byte-for-byte keeps a created long prop
+// indistinguishable from an init-written one.
+const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to read";
+const _: () = assert!(LONG_LEGACY_ERROR.len() < LONG_PROP_ERROR_SIZE);
+
+// A long prop's serial length byte is the error-message length, not the value
+// length. Bionic's ReadMutablePropertyValue copies (serial>>24)+1 bytes from the
+// inline value[] into a PROP_VALUE_MAX buffer before it ever checks kLongFlag, so
+// a length byte >= PROP_VALUE_MAX overflows that buffer (FORTIFY abort). The real
+// value length is recovered via strlen at the offset.
+const LONG_VALUE_SERIAL_LEN: u32 = LONG_LEGACY_ERROR.len() as u32;
+
+fn alloc_long_prop_info(area: &PropArea, name: &str, value: &str) -> Result<usize> {
+    let name_bytes = name.as_bytes();
+    let pi_total = (PROP_INFO_FIXED + name_bytes.len() + 1 + 3) & !3;
+    let pi_offset = area.alloc(pi_total)?;
+    let val_offset = area.alloc(value.len() + 1)?;
+    let rel_offset = (val_offset - pi_offset) as u32;
+
+    unsafe {
+        let base = area.base().add(pi_offset);
+        std::ptr::write_bytes(base, 0, pi_total);
+
+        let err_ptr = base.add(4);
+        std::ptr::copy_nonoverlapping(LONG_LEGACY_ERROR.as_ptr(), err_ptr, LONG_LEGACY_ERROR.len());
+
+        let off_ptr = base.add(4 + LONG_PROP_ERROR_SIZE) as *mut u32;
+        off_ptr.write(rel_offset);
+
+        let name_ptr = base.add(PROP_INFO_FIXED);
+        std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_ptr, name_bytes.len());
+
+        let serial = LONG_FLAG | (LONG_VALUE_SERIAL_LEN << 24);
+        (base as *mut u32).write(serial);
+
+        let val_ptr = area.base().add(val_offset);
+        std::ptr::copy_nonoverlapping(value.as_ptr(), val_ptr, value.len());
+        *val_ptr.add(value.len()) = 0;
+    }
+
+    Ok(pi_offset)
 }
