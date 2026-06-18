@@ -1,5 +1,5 @@
 plan: resetprop-rs-injectrc-ports
-updated: 2026-06-17
+updated: 2026-06-18
 tasks:
   T01: done
   T02: done
@@ -7,14 +7,14 @@ tasks:
   T04: done
   T05: done
   T06: backlog
-  T07: backlog
+  T07: done
   T08: backlog
   T09: backlog
   T10: backlog
   T11: cut
   T12: done
   T13: done
-  T14: backlog
+  T14: done
   T15: done
   T16: done
   T17: backlog
