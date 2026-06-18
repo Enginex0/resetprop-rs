@@ -3,7 +3,7 @@
   <p align="center"><b>Pure Rust Android Property Manipulation</b></p>
   <p align="center">Get. Set. Delete. Stealth. Nuke. No Magisk required.</p>
   <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.5.0-blue?style=for-the-badge" alt="v0.5.0">
+    <img src="https://img.shields.io/badge/version-v0.6.0-blue?style=for-the-badge" alt="v0.6.0">
     <img src="https://img.shields.io/badge/Android-10%2B-green?style=for-the-badge&logo=android" alt="Android 10+">
     <img src="https://img.shields.io/badge/Rust-stable-orange?style=for-the-badge&logo=rust" alt="Rust">
     <img src="https://img.shields.io/badge/Telegram-community-blue?style=for-the-badge&logo=telegram" alt="Telegram">
@@ -43,7 +43,7 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 
 ⚡ **Tiny Footprint**: ~320KB ARM64, ~240KB ARMv7. Hand-rolled CLI parser, `panic=abort`, LTO, single codegen unit. Only dependency: `libc`.
 
-🧪 **Tested Off-Device**: 133 unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, stealth, nuke, compaction, context parsing, trie integrity, serial preservation, name consistency, conditional primitives, A64 encoder vectors, ELF parsing, ptrace primitives.
+🧪 **Tested Off-Device**: 165 unit tests against synthetic property areas. Verified: get, set, overwrite, delete, hexpatch, stealth, nuke, compaction, context parsing, trie integrity, serial preservation, name consistency, conditional primitives, long-value create, A64 encoder vectors, ELF parsing, ptrace primitives.
 
 ---
 
@@ -79,7 +79,7 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 
 **Format Support**
 - [x] **Short values**: ≤91 bytes, inline in prop_info
-- [x] **Long values**: Android 12+, >92 bytes via self-relative arena offset
+- [x] **Long values**: Android 12+, ≥92 bytes via self-relative arena offset. Create, read, and overwrite are all supported. A long prop is byte-identical to one init writes (kLongFlag, legacy error message in `value[]`, serial length byte = error-message length). Read-only (`ro.*`) long props read back in full via `getprop`; mutable long props return the bionic legacy error string to `__system_property_get`/`getprop` by design, and the full value only via `__system_property_read_callback` or this tool
 - [x] **Serial protocol**: spin-wait on dirty bit, verification loop for concurrent reads
 - [x] **Length-first comparison**: matches AOSP's `cmp_prop_name` exactly
 
@@ -99,11 +99,14 @@ It also introduces operations no existing tool provides: `--stealth` for detecti
 - [x] **Two-tier seal**: stealth write + ptrace-driven lock against init-mediated writers; no `setprop`, `property_service`, or bionic `__system_property_set` caller can revert a sealed prop
 - [x] **Tier B default (`-sl` / `--seal`)**: per-prop hook on `__system_property_update` inside init; only the sealed prop freezes, neighbors continue to update normally
 - [x] **Tier A fallback (`-sla` / `--seal-arena`)**: arena-level `MAP_PRIVATE|MAP_FIXED` remap in init; guaranteed to work but freezes every prop in the same arena as a side-effect
+- [x] **Repeatable seal**: `--seal A v1 --seal B v2` locks several props in one run as a single multi-entry lock list inside init, instead of one process per prop
+- [x] **Dry-run (`--check`)**: `--seal NAME --check` resolves `__system_property_update` in init and validates the splice site without writing anything
+- [x] **Observe init (`--observe-init`)**: ptrace init (PID 1) and print its `/dev/kmsg` writes for a window (default 5s, aarch64); shows which init thread services a write before you seal it
 - [x] **`-st` semantics unchanged**: pure stealth write, no ptrace, no hook, no arena remap; 100% back-compat for existing scripts
 - [x] **Bypass surface (direct-mmap writers)**: callers that write `/dev/__properties__/<ctx>` directly route around init and defeat both tiers. Confirmed bypass vectors: KernelSU's `/data/adb/ksu/bin/resetprop` for every `ro.*` key and every `-n` / `--skip-svc` write (its dispatch branch at `sys_prop.rs:580` forces direct-mmap for those paths, landing bytes via `core::ptr::copy_nonoverlapping` at `mmap_prop_area.rs:277`), Magisk's resetprop (same pattern), and `resetprop-rs` itself invoked against a sealed prop. Seal protects against init-mediated reverts, not against another root tool writing the arena inode. The threat model is init-routed writers, not every root process on the device.
-- [x] **Detection signature (Tier B installed hook)**: a rooted observer inspecting `/proc/1/maps` sees the hook body as a `PROT_R|X` file-backed mapping whose backing inode has been unlinked: `/data/adb/resetprop-rs/hook-<pid>-<nanos>.bin (deleted)`. The on-disk file is written, opened + mmap'd in init, then immediately unlinked from the host so the kernel keeps the inode alive only via init's mapping reference (`hook.rs:428-488`). This path is used instead of an anonymous RWX mapping so init's `process:execmem` SELinux class is not exercised on stock Xiaomi HyperOS policies.
+- [x] **Detection signature (Tier B installed hook)**: a rooted observer inspecting `/proc/1/maps` sees the hook body as a `PROT_R|X` mapping backed by an anonymous `memfd` whose inode shows the kernel's standard `(deleted)` suffix: `/memfd:resetprop-hook (deleted)`. The tracee creates the memfd, this process fills it via `/proc/<pid>/fd`, and init maps it `PROT_R|X` (`hook.rs:451`, `install_memfd_hook_page`). There is no on-disk file, so nothing is written to or unlinked from `/data`. The memfd is mapped `PROT_R|X` rather than as an anonymous RWX page so init's `process:execmem` SELinux class is not exercised on stock Xiaomi HyperOS policies.
 - [x] **In-session only**: `SealRecord` lives in process memory; seals do not persist across reboots, `SystemProperties::Reload`, or init restart. Re-run `--seal` / `--seal-arena` after every boot
-- [x] **Attach-window stall**: the first `-sl` / `-sla` call on a process ptrace-attaches to init and installs the trampoline in a 15–40 ms window on modern ARM64 handsets; any thread that blocks on init for a property write during that window waits out the full stall (zygote, system_server, init-launched daemons included). Subsequent calls skip the ELF parse and remote mmap, so they complete substantially faster.
+- [x] **Attach-window stall**: the first `-sl` / `-sla` call on a process ptrace-attaches to init and installs the trampoline in a 15-40 ms window on modern ARM64 handsets; any thread that blocks on init for a property write during that window waits out the full stall (zygote, system_server, init-launched daemons included). Subsequent calls skip the ELF parse and remote mmap, so they complete substantially faster.
 - [x] **Futex waiters stall silently on sealed props**: `__system_property_wait(pi, ...)` waits on init's private serial copy; a sealed prop's serial never bumps in the caller's view, so waiters never wake. Aligned with seal intent (a sealed prop should not notify of spurious updates); downstream test authors must not use waiter-based probes on sealed props.
 
 ---
@@ -212,6 +215,12 @@ resetprop-rs --init -f props.txt
 resetprop-rs --seal ro.telephony.default_network 0
 resetprop-rs -sl ro.telephony.default_network 0
 
+# Seal several props in one run (single multi-entry lock list inside init)
+resetprop-rs --seal ro.telephony.default_network 0 --seal ro.boot.verifiedbootstate green
+
+# Dry-run the Tier B install: resolve in init, write nothing
+resetprop-rs --seal ro.telephony.default_network --check
+
 # Tier A seal (fallback): arena-level MAP_PRIVATE in init. Freezes every prop in
 # the same arena. Invoke manually after --seal reports a Tier B install failure.
 resetprop-rs --seal-arena ro.telephony.default_network 0
@@ -231,9 +240,9 @@ from a fresh invocation. To confirm a seal is active on the device, inspect
 init's mappings and read the prop back:
 
 ```sh
-# Tier B leaves a file-backed hook page in init as a deleted inode.
-adb shell 'grep "resetprop-rs" /proc/1/maps'
-# 7f8036b000-7f8036c000 r-xp ... /data/adb/resetprop-rs/hook-1-<nanos>.bin (deleted)
+# Tier B leaves an executable memfd-backed hook page in init as a deleted inode.
+adb shell 'grep "resetprop-hook" /proc/1/maps'
+# 7f8036b000-7f8036c000 r-xp ... /memfd:resetprop-hook (deleted)
 
 # Confirm the prop value is pinned to the sealed value.
 adb shell 'getprop ro.telephony.default_network'
@@ -259,6 +268,19 @@ where init's `libc.so` shape breaks the ELF walker (`HookInstallFailed`,
 in the same arena as a side effect; for `ro.telephony.default_network` on
 stock Xiaomi the arena is `telephony_prop`, so all `ro.telephony.*` reads
 would then return their pre-seal values.
+
+### Observing init
+
+```sh
+# Trace init (PID 1) writes to /dev/kmsg for 5 seconds (aarch64 only)
+resetprop-rs --observe-init
+
+# Trace for a custom window
+resetprop-rs --observe-init --duration 15
+```
+
+Use this to see which init thread emits a property-related kmsg line before you
+seal a prop. aarch64 only; other ABIs return `Error::Unsupported`.
 
 ### Deleting properties
 
@@ -306,11 +328,14 @@ resetprop-rs --wait ro.crypto.state encrypted --timeout 30
 | `--if-diff` | With positional NAME VALUE: write only when the property exists and the current value differs |
 | `--if-match NEEDLE` | With positional NAME VALUE: write only when the current value equals NEEDLE and differs from VALUE |
 | `--delete-if-exist NAME` | Delete NAME only when the property is present; exit 0 on absent |
-| `--seal NAME VALUE`, `-sl NAME VALUE` | Tier B seal (default): stealth write + per-prop init hook. Does not persist across reboots. |
+| `--seal NAME VALUE`, `-sl NAME VALUE` | Tier B seal (default): stealth write + per-prop init hook. Repeatable: pass `--seal` multiple times to lock several props in one run. Does not persist across reboots. |
 | `--seal-arena NAME VALUE`, `-sla NAME VALUE` | Tier A seal (fallback): stealth write + arena-level `MAP_PRIVATE` in init. Broader blast radius; no auto-fallback. Invoke manually after `--seal` reports a Tier B install failure. |
 | `--unseal NAME` | Remove NAME from the Tier B in-init lock list. |
 | `--unseal-arena NAME` | Revert Tier A privatization for the arena holding NAME. |
 | `--seals` | List active seals (name, tier, arena). |
+| `--check` | With `--seal NAME`: dry-run the Tier B install (resolve in init, write nothing). |
+| `--observe-init` | Trace init (PID 1) writes to `/dev/kmsg` for a window. aarch64 only. |
+| `--duration SECS` | Observe window for `--observe-init` (default: 5). |
 | `-p` | Persist mode: write/delete affects both memory and `/data/property/` on disk |
 | `-P` | Read from the persist file on disk, not from the mmap'd property area |
 | `-d NAME` | Delete a property |
@@ -331,7 +356,7 @@ resetprop-rs --wait ro.crypto.state encrypted --timeout 30
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-resetprop = "0.5"
+resetprop = "0.6"
 ```
 
 Or from git:
@@ -526,9 +551,9 @@ The `--wait` command also uses bionic's `__system_property_wait` when available,
 
 | | Status |
 |---|---|
-| **Android** | 10 – 15 |
+| **Android** | 10-15 |
 | **Architecture** | ARM64, ARMv7, x86_64, x86 |
-| **Value format** | Short (≤91B) + Long (Android 12+, >92B) |
+| **Value format** | Short (≤91B) + Long (Android 12+, ≥92B) |
 | **Root** | KernelSU, Magisk, APatch, any `su` |
 
 ---
