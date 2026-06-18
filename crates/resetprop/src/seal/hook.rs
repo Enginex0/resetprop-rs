@@ -373,8 +373,12 @@ pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
             "install throttled after {MAX_INSTALL_HARD_FAILURES} hard failures this boot"
         )));
     }
-    install_init_hook_inner(pid).inspect_err(|_| {
-        INSTALL_HARD_FAILURES.fetch_add(1, Ordering::Relaxed);
+    install_init_hook_inner(pid).inspect_err(|e| {
+        // `AlreadyHooked` is an idempotency signal (init is already sealed),
+        // not a step that can bootloop init — it must not advance the throttle.
+        if !matches!(e, Error::AlreadyHooked) {
+            INSTALL_HARD_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
     })
 }
 
@@ -408,6 +412,24 @@ fn install_init_hook_locked(attach: &seal::arena::RemoteAttach) -> Result<HookHa
     let pid = attach.pid();
 
     let (libc_base, libc_end, target_fn) = stage_a_locked(pid)?;
+
+    // RT-02: reject a re-seal over an init whose `target_fn` already holds a
+    // trampoline from a prior process. The per-process `HookHandle` does not
+    // survive a CLI exit, so a fresh process re-enters this first-seal path and
+    // would snapshot the live trampoline as the "original" prologue, corrupting
+    // the restore path. Read only the 8-byte trampoline head here — before any
+    // page is mapped or byte poked — so a rejected re-seal leaves init
+    // byte-for-byte unchanged and allocates nothing.
+    //
+    // SAFETY: `attach` holds the tracee ptrace-stopped; `target_fn` is inside
+    // the libc.text `r-xp` row stage-A just resolved; `read_remote` needs read
+    // permission only.
+    let mut prologue_head = [0u8; 16];
+    unsafe { read_remote(pid, target_fn, &mut prologue_head) }
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: read prologue head: {e}")))?;
+    if prologue_holds_trampoline(&prologue_head) {
+        return Err(Error::AlreadyHooked);
+    }
 
     // SAFETY: `attach` holds the tracee ptrace-stopped; `libc_base..libc_end`
     // is the `r-xp` row just returned by stage-A on the same process.
@@ -491,8 +513,12 @@ pub(crate) fn install_and_seal_first(pid: libc::pid_t, name: &str) -> Result<Fir
             "install throttled after {MAX_INSTALL_HARD_FAILURES} hard failures this boot"
         )));
     }
-    install_and_seal_first_inner(pid, name).inspect_err(|_| {
-        INSTALL_HARD_FAILURES.fetch_add(1, Ordering::Relaxed);
+    install_and_seal_first_inner(pid, name).inspect_err(|e| {
+        // `AlreadyHooked` is an idempotency signal (init is already sealed),
+        // not a step that can bootloop init — it must not advance the throttle.
+        if !matches!(e, Error::AlreadyHooked) {
+            INSTALL_HARD_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
     })
 }
 
@@ -1242,6 +1268,26 @@ fn revert_trampoline(pid: libc::pid_t, target_fn: u64, scratch_pc: u64, saved_pr
     if let Err(e) = unsafe { execute_remote_isb(pid, scratch_pc) } {
         eprintln!("resetprop: revert_trampoline i-cache resync failed: {e}");
     }
+}
+
+/// The leading 8 bytes every installed trampoline carries, regardless of its
+/// branch target: `ldr x16,[pc,#8]` packed with `br x16`, exactly the `word_lo`
+/// [`install_trampoline_locked`] POKEs at `target_fn`. The trailing 8 bytes
+/// (`word_hi`, the absolute literal target) vary per install, so the predicate
+/// keys off this fixed prefix alone.
+const TRAMPOLINE_WORD_LO: u64 = (encoder::LDR_X16_PC8 as u64) | ((encoder::BR_X16 as u64) << 32);
+
+/// True iff `prologue`'s first 8 bytes are the position-independent trampoline
+/// head ([`TRAMPOLINE_WORD_LO`]).
+///
+/// Pure: a prologue snapshot read elsewhere is handed here so a re-seal over an
+/// already-trampolined init can be rejected ([`Error::AlreadyHooked`]) before
+/// any tracee page is mapped or byte poked. Re-installing would snapshot the
+/// live trampoline as init's "original" prologue and corrupt the restore path
+/// (RT-02).
+fn prologue_holds_trampoline(prologue: &[u8; 16]) -> bool {
+    let head = u64::from_le_bytes(prologue[..8].try_into().expect("8-byte prologue head"));
+    head == TRAMPOLINE_WORD_LO
 }
 
 /// Compare the trampoline bytes read back from the tracee against the two
@@ -2425,6 +2471,35 @@ mod tests {
             matches!(err, Error::HookInstallFailed(ref m) if m.contains("read-back mismatch")),
             "torn write must surface as HookInstallFailed, got {err:?}"
         );
+    }
+
+    // RT-02 — re-seal trampoline guard predicate
+
+    /// A prologue whose first 8 bytes are the trampoline head — built from the
+    /// same words `install_trampoline` POKEs — is recognised, so a re-seal over
+    /// trampolined init can be rejected before any tracee write. The body target
+    /// in the trailing 8 bytes is irrelevant to the predicate.
+    #[test]
+    fn prologue_holds_trampoline_true_on_trampoline_pattern() {
+        let (word_lo, word_hi) = intended_trampoline_words(0x0000_7fff_dead_beef);
+        let mut prologue = [0u8; 16];
+        prologue[..8].copy_from_slice(&word_lo.to_le_bytes());
+        prologue[8..].copy_from_slice(&word_hi.to_le_bytes());
+
+        assert!(prologue_holds_trampoline(&prologue));
+    }
+
+    /// A representative untouched bionic prologue (`stp x29,x30 / mov x29,sp /
+    /// mov x0,#0 / ret`) is not mistaken for a trampoline, so a genuine first
+    /// seal is never wrongly rejected as already hooked.
+    #[test]
+    fn prologue_holds_trampoline_false_on_real_prologue() {
+        let real_prologue: [u8; 16] = [
+            0xfd, 0x7b, 0xbf, 0xa9, 0xfd, 0x03, 0x00, 0x91, // stp x29,x30 / mov x29,sp
+            0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6, // mov x0,#0 / ret
+        ];
+
+        assert!(!prologue_holds_trampoline(&real_prologue));
     }
 
     /// End-to-end of the rollback contract against a 16-byte model of

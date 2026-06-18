@@ -31,6 +31,13 @@ pub enum Error {
     /// Raised by the M1 init-identity guard before any RemoteAttach / poke,
     /// so a non-init PID-1 stand-in is rejected before a single byte is written.
     NotInit(String),
+    /// init's `__system_property_update` prologue already holds a trampoline
+    /// from a prior invocation (its first 8 bytes are `ldr x16,[pc,#8]; br x16`).
+    /// The per-process hook handle does not survive a CLI exit, so a fresh
+    /// process cannot extend the existing seal; re-installing would snapshot the
+    /// live trampoline as the "original" prologue and corrupt init's restore
+    /// path. An idempotency signal, not a hard failure — init is left untouched.
+    AlreadyHooked,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -67,6 +74,10 @@ impl fmt::Display for Error {
             Self::HookInstallFailed(msg) => write!(f, "hook install failed: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             Self::NotInit(msg) => write!(f, "target pid is not init: {msg}"),
+            Self::AlreadyHooked => write!(
+                f,
+                "init is already sealed by a prior invocation; a process-local handle cannot extend it"
+            ),
         }
     }
 }
