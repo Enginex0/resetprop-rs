@@ -243,7 +243,7 @@ enum StopVerdict {
 fn classify_stop(status: i32, expected_event: u32) -> StopVerdict {
     let is_stopped = libc::WIFSTOPPED(status);
     let sig = libc::WSTOPSIG(status);
-    let event = ((status >> 16) & 0xffff) as u32;
+    let event = ((status >> 16) & 0xff) as u32;
     if is_stopped && sig == libc::SIGCHLD {
         return StopVerdict::ContAndRetry;
     }
