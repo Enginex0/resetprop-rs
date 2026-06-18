@@ -18,7 +18,7 @@ pub(crate) fn decode(data: &[u8]) -> Result<Vec<Record>> {
             continue;
         }
         let len = read_varint(data, &mut pos)? as usize;
-        if pos + len > data.len() {
+        if len > data.len() - pos {
             return Err(Error::PersistCorrupt("record length exceeds data".into()));
         }
         records.push(decode_record(&data[pos..pos + len])?);
@@ -41,7 +41,7 @@ fn decode_record(data: &[u8]) -> Result<Record> {
             continue;
         }
         let len = read_varint(data, &mut pos)? as usize;
-        if pos + len > data.len() {
+        if len > data.len() - pos {
             return Err(Error::PersistCorrupt("field length exceeds record".into()));
         }
         let s = std::str::from_utf8(&data[pos..pos + len])
@@ -147,7 +147,7 @@ fn skip_field(data: &[u8], mut pos: usize, wire_type: u8) -> Result<usize> {
         }
         2 => {
             let len = read_varint(data, &mut pos)? as usize;
-            if pos + len > data.len() {
+            if len > data.len() - pos {
                 return Err(Error::PersistCorrupt(
                     "truncated length-delimited field".into(),
                 ));
@@ -169,6 +169,16 @@ fn skip_field(data: &[u8], mut pos: usize, wire_type: u8) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_overflowing_record_length() {
+        // A record whose varint length is `u64::MAX`: the old `pos + len` bound
+        // wrapped in release and panicked the slice. The length must be rejected
+        // without the add.
+        let mut buf = vec![0x0A];
+        buf.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        assert!(matches!(decode(&buf), Err(Error::PersistCorrupt(_))));
+    }
 
     #[test]
     fn round_trip_empty() {
