@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.6.0
+
+### Seal: new capabilities
+- Repeatable `--seal`. `resetprop --seal A v1 --seal B v2` seals several properties in one run, building a single multi-entry lock list inside init instead of spawning one process per prop.
+- `--seal NAME --check`: dry-run the Tier B install. Resolves `__system_property_update` in init and validates the splice site without ptrace-writing anything. Single NAME only.
+- `--observe-init [--duration SECS]`: ptrace init (PID 1) and print its `/dev/kmsg` writes for a window (default 5s, aarch64 only). Use it to confirm which init thread services a property write before you seal it.
+
+### Hook page now backed by memfd
+- The Tier B hook body is mapped into init from an anonymous `memfd`, not a file under `/data/adb/resetprop-rs/`. Nothing is written to or unlinked from disk. In `/proc/1/maps` the page shows as `/memfd:resetprop-hook (deleted)`, mapped `PROT_R|X` so init's `process:execmem` SELinux class is never exercised.
+
+### Long values: create support
+- `set()` now creates properties of 92 bytes or more, not just reads and overwrites them. A created long prop is byte-identical to one init writes: `kLongFlag`, the bionic legacy error string in `value[]`, the self-relative offset to the full value, and a serial length byte equal to the error-message length.
+- Fix: a long prop's serial length byte stores the error-message length, not the value length. Bionic copies `(serial>>24)+1` bytes of `value[]` into a `PROP_VALUE_MAX` buffer before it checks `kLongFlag`, so a length byte at or above `PROP_VALUE_MAX` overflows that buffer and trips a FORTIFY abort.
+
+### Seal hardening
+- Stop init's entire thread group before poking, and resume any partially seized threads when `PTRACE_SEIZE` fails midway. No more half-stopped init.
+- Verify init's identity before the first poke, and reject a re-seal over an init that already carries our trampoline.
+- Read the trampoline back after writing it to confirm the bytes landed.
+- Split the ptrace register layout per architecture (aarch64, arm, x86_64, x86) instead of sharing one struct.
+- Free the remote bootstrap page when an arena step fails, tolerate benign signal-stops while waiting on the tracee, and throttle hook-install retries.
+- Encoder fix: `.advance` now emits `ldrb` with a `#1` post-index.
+
+### Persist
+- Reject a persistent-property field whose declared length overflows the record instead of trusting the on-disk length.
+
+### Build and CI
+- Pin the Rust toolchain to 1.96.0.
+- Run the full fmt, clippy, and test wall on every PR.
+
+### Testing
+- 165 library unit tests (up from 133 at v0.5.0).
+- Per-arch ptrace smoke fixtures plus an independent A64 assembler oracle that re-derives the hook body from canonical opcodes.
+- Long-value create roundtrip test that asserts the serial length byte stays below `PROP_VALUE_MAX`.
+
 ## v0.5.0
 
 ### Seal (Two-Tier Property Locking)
