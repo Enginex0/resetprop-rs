@@ -7,6 +7,7 @@
 
 # seal: regenerable output + agent scratch (keep execution sessions lean)
 *.bak
+.serena/
 graphify-out/
 target/
 .gradle/
