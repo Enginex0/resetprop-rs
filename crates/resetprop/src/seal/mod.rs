@@ -1,9 +1,4 @@
 //! Seal feature root — module tree for Tier A (arena-level) and Tier B (per-prop hook) seals.
-//!
-//! NOTE: Public re-exports of `maps::*` and `ptrace::*` are intentionally deferred.
-//! P01 Task 1 ships the submodule declarations and public types only; the
-//! `pub use` re-exports will be added incrementally by P01 Task 2 (`maps`)
-//! and P01 Task 3/4 (`ptrace`) when the corresponding items land.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};

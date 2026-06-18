@@ -302,11 +302,11 @@ impl Drop for RemoteAttach {
 ///    — before any error-check can `?` — so libc.text is always left
 ///    pristine.
 /// 6. Write the NUL-terminated arena path to `bootstrap_page` via
-///    `write_remote`; `remote_syscall` openat (scratch_pc=bootstrap_page,
-///    the fresh RWX page); `remote_syscall` mmap
-///    (`MAP_PRIVATE|MAP_FIXED` or `MAP_SHARED|MAP_FIXED` per `flags`) over
-///    the arena VMA — must return exactly `mapping.start`; `remote_syscall`
-///    close the fd.
+///    `write_remote`; `remote_syscall_via_poke` openat
+///    (scratch_pc=bootstrap_page, the fresh RWX page);
+///    `remote_syscall_via_poke` mmap (`MAP_PRIVATE|MAP_FIXED` or
+///    `MAP_SHARED|MAP_FIXED` per `flags`) over the arena VMA, which must
+///    return exactly `mapping.start`; `remote_syscall_via_poke` close the fd.
 /// 7. munmap the bootstrap page (runs on every post-mmap exit), then
 ///    `guard.detach()` returns cleanly.
 ///
@@ -334,16 +334,7 @@ pub(crate) unsafe fn remote_remap_private(
 
     // --- Locate a libc.text NOP slide in the tracee ----------------------
     let maps_entries = super::maps::parse_maps(pid)?;
-    let libc_text = maps_entries
-        .iter()
-        .find(|e| {
-            e.perms.starts_with(b"r-x")
-                && e.path
-                    .as_deref()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == "libc.so" || n.starts_with("libc.so."))
-        })
+    let libc_text = super::hook::find_libc_text_row(&maps_entries)
         .ok_or_else(|| Error::HookInstallFailed("no libc.so r-x mapping in target".into()))?;
 
     let scan_len = (libc_text.end - libc_text.start).min(LIBC_SCAN_LIMIT as u64) as usize;

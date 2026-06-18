@@ -111,6 +111,12 @@ pub(crate) const HOOK_BODY_OFFSET: u64 = 1024;
 /// `P04-tier-b-part2.md §Operational Envelope`.
 pub(crate) const LOCK_LIST_CAPACITY: u64 = 1024;
 
+/// A lock-list entry must never reach the install-time path staged at
+/// [`PATH_STAGE_OFFSET`], or the in-init walker would read those path bytes
+/// as a lock name. Binding the two constants fails the build on a future
+/// capacity bump instead of letting the list silently overrun.
+const _: () = assert!(LOCK_LIST_CAPACITY < PATH_STAGE_OFFSET);
+
 /// `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE` — kernel cmd byte
 /// that registers the calling task's intent to later issue
 /// `PRIVATE_EXPEDITED_SYNC_CORE`. Without this registration, the SYNC_CORE
@@ -198,6 +204,13 @@ pub(crate) fn is_libc_row(entry: &MapEntry) -> bool {
             .is_some_and(|s| s.ends_with("/libc.so"))
 }
 
+/// Locate the executable `libc.so` row in a parsed maps file via the hardened
+/// [`is_libc_row`] gate. Stage-A and the Tier A remap share this so both pin
+/// libc.text by the identical rule rather than drifting predicates.
+pub(crate) fn find_libc_text_row(entries: &[MapEntry]) -> Option<&MapEntry> {
+    entries.iter().find(|e| is_libc_row(e))
+}
+
 /// Stage-A of the hook install pipeline — RUN UNDER ATTACH.
 ///
 /// Returns `(libc_base, libc_end, target_fn)` where `libc_base` / `libc_end`
@@ -219,7 +232,7 @@ fn stage_a_locked(pid: libc::pid_t) -> Result<(u64, u64, u64)> {
     let entries = seal::maps::parse_maps(pid)
         .map_err(|e| Error::HookInstallFailed(format!("stage-A: parse_maps: {e}")))?;
 
-    let libc_row = entries.iter().find(|e| is_libc_row(e)).ok_or_else(|| {
+    let libc_row = find_libc_text_row(&entries).ok_or_else(|| {
         Error::HookInstallFailed(format!("stage-A: libc row not found in /proc/{pid}/maps"))
     })?;
 
@@ -501,8 +514,9 @@ fn remote_mmap_anon_rw_page(pid: libc::pid_t, scratch_pc: u64) -> Result<u64> {
     Ok(ret as u64)
 }
 
-/// Write the 4-byte empty-list sentinel to `lock_list_page + 0` and
-/// snapshot the 16-byte prologue at `target_fn`.
+/// Write the empty-list sentinel to `lock_list_page + 0` (one NUL marks the
+/// list empty; the write zeroes a 4-byte word) and snapshot the 16-byte
+/// prologue at `target_fn`.
 fn write_sentinel_and_snapshot_prologue(
     pid: libc::pid_t,
     lock_list_page: u64,
@@ -1396,9 +1410,11 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
 ///
 /// Returns `None` if the new sentinel offset would lie at or past
 /// `capacity`; callers surface this as [`Error::HookInstallFailed`]. The
-/// bounds check uses `>= capacity` rather than `> capacity - 1` because a
-/// sentinel at offset `capacity` would be the first byte of the hook body
-/// at `HOOK_BODY_OFFSET` and clobber init's trampoline target.
+/// bound is `>= capacity` because the sentinel occupies the byte it names,
+/// so offset `capacity` is the first byte past the lock list's reserved
+/// region. Callers pass [`LOCK_LIST_CAPACITY`], which sits below
+/// [`PATH_STAGE_OFFSET`], so a list that respects the bound never lets the
+/// in-init walker read the path bytes staged there during install.
 ///
 /// Interior-NUL rejection is the caller's responsibility — this helper
 /// assumes `name` is a validated C-string body.
