@@ -26,6 +26,7 @@
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
@@ -66,6 +67,20 @@ const PATH_STAGE_OFFSET: u64 = 2048;
 /// slot. Matches `seal::arena::LIBC_SCAN_LIMIT` (64 KiB) so the two stage
 /// pipelines share identical scan behaviour.
 const LIBC_SCAN_LIMIT: usize = 64 * 1024;
+
+/// Hard install failures tolerated before [`install_init_hook`] stops
+/// attaching for the rest of the process. A seal install pokes init's
+/// prologue; a load that keeps failing is a fault that retrying only drives
+/// toward a bootloop, so the installer gives up rather than keep hammering
+/// PID 1. Mirrors ReZygisk's `MAX_RETRY_COUNT` ptrace-monitor ceiling
+/// (loader/src/ptracer/monitor.c).
+const MAX_INSTALL_HARD_FAILURES: u32 = 5;
+
+/// Count of hard [`install_init_hook`] failures this process has seen. Module-
+/// static rather than a [`HookHandle`] field because a handle only exists
+/// after a *successful* install, so the throttle must outlive the failed
+/// attempts that never produce one.
+static INSTALL_HARD_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 // P04 T3 — hook-page layout and i-cache sync constants
 
@@ -328,7 +343,28 @@ unsafe fn derive_libc_scratch_pc(pid: libc::pid_t, libc_base: u64, libc_end: u64
 /// lock-list mmap + prologue snapshot + host file write + remote
 /// openat / mmap / close + unlink. Any thread that blocks on init
 /// for a property write during this window waits out the full stall.
+///
+/// # Throttle
+///
+/// After [`MAX_INSTALL_HARD_FAILURES`] hard failures in one process the
+/// installer refuses further attempts before the M1 identity check or any
+/// ptrace attach, so a load that bootloops init cannot be retried into the
+/// ground.
 pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
+    if INSTALL_HARD_FAILURES.load(Ordering::Relaxed) >= MAX_INSTALL_HARD_FAILURES {
+        return Err(Error::HookInstallFailed(format!(
+            "install throttled after {MAX_INSTALL_HARD_FAILURES} hard failures this boot"
+        )));
+    }
+    install_init_hook_inner(pid).inspect_err(|_| {
+        INSTALL_HARD_FAILURES.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+/// Uncounted install body. [`install_init_hook`] wraps this with the per-boot
+/// hard-failure throttle; every `Err` it returns advances the counter that
+/// eventually trips the guard.
+fn install_init_hook_inner(pid: libc::pid_t) -> Result<HookHandle> {
     // M1: reject a non-init PID-1 stand-in before attaching or poking.
     seal::arena::verify_init_identity(pid)?;
 
@@ -2319,5 +2355,41 @@ mod tests {
         assert_eq!(r.libc_end, 0x7000_0010_0000);
         assert_eq!(r.target_fn, 0x7000_0001_2340);
         assert_eq!(r.scratch_pc, 0x7000_0000_1000);
+    }
+
+    // T08 / M4 / R3: per-boot install throttle
+
+    /// After [`MAX_INSTALL_HARD_FAILURES`] hard failures the next
+    /// `install_init_hook` is refused by the throttle guard, returning the
+    /// reused [`Error::HookInstallFailed`] before the M1 identity check or
+    /// any ptrace attach. `pid_t::MAX` names no live process, so every
+    /// pre-threshold call fails in `verify_init_identity`'s `/proc` read with
+    /// no remote work, forcing the counter to the ceiling off-device. This is
+    /// the only test that touches `INSTALL_HARD_FAILURES`; it brackets the
+    /// body with a reset so a parallel run starts and leaves it clean.
+    #[test]
+    fn install_init_hook_throttles_after_max_hard_failures() {
+        INSTALL_HARD_FAILURES.store(0, Ordering::Relaxed);
+
+        let absent_pid = libc::pid_t::MAX;
+        for _ in 0..MAX_INSTALL_HARD_FAILURES {
+            let Err(err) = install_init_hook(absent_pid) else {
+                panic!("install_init_hook on an absent pid must fail without a live init");
+            };
+            assert!(
+                !matches!(&err, Error::HookInstallFailed(m) if m.contains("throttled")),
+                "pre-threshold failure must be a real install fault, not the throttle: {err:?}"
+            );
+        }
+
+        let Err(err) = install_init_hook(absent_pid) else {
+            panic!("a throttled install must return Err, not a handle");
+        };
+        assert!(
+            matches!(&err, Error::HookInstallFailed(m) if m.contains("throttled")),
+            "after {MAX_INSTALL_HARD_FAILURES} hard failures the next install must be throttled: {err:?}"
+        );
+
+        INSTALL_HARD_FAILURES.store(0, Ordering::Relaxed);
     }
 }
