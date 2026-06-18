@@ -31,6 +31,7 @@ fn run() -> Result<(), String> {
     let mut wait_value: Option<String> = None;
     let mut timeout_secs: Option<u64> = None;
     let mut seal: Option<String> = None;
+    let mut check = false;
     let mut seal_arena: Option<String> = None;
     let mut unseal: Option<String> = None;
     let mut unseal_arena: Option<String> = None;
@@ -65,6 +66,7 @@ fn run() -> Result<(), String> {
                 i += 1;
                 seal = Some(arg_val(&args, i, "--seal")?);
             }
+            "--check" => check = true,
             "--seal-arena" | "-sla" => {
                 i += 1;
                 seal_arena = Some(arg_val(&args, i, "--seal-arena")?);
@@ -260,6 +262,26 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(ref name) = seal {
+        if check {
+            // Dry-run: resolve the Tier B facts in init without poking it. No
+            // value is written and no trampoline is installed, so VALUE is not
+            // required here. INIT_PID is `1` (crate-internal in resetprop).
+            return match resetprop::seal::hook::check_init_hook(1) {
+                Ok(r) => {
+                    println!(
+                        "check [{name}]: libc_base={:#x} libc_end={:#x} target_fn={:#x} scratch_pc={:#x}",
+                        r.libc_base, r.libc_end, r.target_fn, r.scratch_pc
+                    );
+                    Ok(())
+                }
+                Err(
+                    e @ (Error::HookInstallFailed(_)
+                    | Error::ElfParse(_)
+                    | Error::SymbolNotFound(_)),
+                ) => Err(format!("Tier B dry-run failed: {e}")),
+                Err(e) => Err(format!("check failed: {e}")),
+            };
+        }
         let value = positional
             .first()
             .ok_or_else(|| "--seal requires NAME VALUE (VALUE missing)".to_string())?;
@@ -471,6 +493,7 @@ Usage:
   resetprop --stealth|-st NAME VALUE     Set with zeroed serial, no wake signals
   resetprop --stealth|-st -p NAME VALUE  Set stealth + persist to disk
   resetprop --seal|-sl NAME VALUE    Stealth write + Tier B per-prop init hook (default seal)
+  resetprop --seal|-sl NAME --check  Dry-run: resolve Tier B in init, write nothing
   resetprop --seal-arena|-sla NAME VALUE  Stealth write + Tier A arena privatize (fallback)
   resetprop --unseal NAME            Remove NAME from the Tier B lock list
   resetprop --unseal-arena NAME      Revert Tier A arena privatization for NAME
@@ -494,6 +517,7 @@ Options:
   --delete-if-exist NAME  Conditional delete: no-op when NAME is absent
   --stealth, -st  Stealth write: bionic compose, no futex wake, no global notify
   --seal, -sl     Tier B seal: stealth write + per-prop hook on __system_property_update in init
+  --check         With --seal: dry-run the Tier B install (resolve only, no ptrace write)
   --seal-arena, -sla  Tier A seal: stealth write + remap init's arena as MAP_PRIVATE|MAP_FIXED
   --unseal NAME   Remove NAME from the in-init Tier B lock list
   --unseal-arena NAME  Revert Tier A privatization for the arena holding NAME

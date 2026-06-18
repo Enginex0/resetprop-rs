@@ -381,6 +381,65 @@ pub fn install_init_hook(pid: libc::pid_t) -> Result<HookHandle> {
     })
 }
 
+/// Result of a [`check_init_hook`] dry-run: the stage-A / scratch-slot facts
+/// that the real install would compute, surfaced for an operator to validate
+/// on-device before committing to the trampoline patch.
+///
+/// Every field is a pure observation — no page was mapped, no prologue byte
+/// was written. `target_fn` is `__system_property_update` resolved in init's
+/// running libc; `scratch_pc` is the 8-byte-aligned slot the install would
+/// reuse for `remote_syscall_via_poke`.
+pub struct CheckReport {
+    pub libc_base: u64,
+    pub libc_end: u64,
+    pub target_fn: u64,
+    pub scratch_pc: u64,
+}
+
+/// Dry-run the per-prop hook install: resolve everything the real path reads,
+/// write nothing.
+///
+/// Runs ONLY the no-side-effect sub-ops of [`install_init_hook`] — identity
+/// check, stage-A (`/proc/<pid>/maps` + libc ELF + symbol resolution), and
+/// scratch-slot derivation — under the same single `RemoteAttach` window, then
+/// detaches. The attach is `PTRACE_SEIZE + INTERRUPT` (a group-stop control
+/// op, not a memory write); it exists so `derive_libc_scratch_pc`'s
+/// `process_vm_readv` snapshot of libc.text cannot race a concurrent
+/// APEX/Mainline hot-swap. No `remote_syscall_via_poke`, `ptrace_poketext`, or
+/// `write_remote` runs on this path, so init's text and registers are left
+/// byte-for-byte unchanged and no trampoline is installed.
+///
+/// Lets an operator confirm Tier B will resolve cleanly (no `SymbolNotFound`,
+/// no missing libc row, a usable scratch slot) on a given device before the
+/// real `--seal` pokes PID 1.
+pub fn check_init_hook(pid: libc::pid_t) -> Result<CheckReport> {
+    // M1: reject a non-init PID-1 stand-in before attaching.
+    seal::arena::verify_init_identity(pid)?;
+
+    let guard = seal::arena::RemoteAttach::new(pid)
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: attach: {e}")))?;
+
+    let (libc_base, libc_end, target_fn) = stage_a_locked(pid)?;
+
+    // SAFETY: `guard` holds the tracee ptrace-stopped; `libc_base..libc_end`
+    // is the `r-xp` row just returned by stage-A on the same process.
+    let scratch_pc = unsafe { derive_libc_scratch_pc(pid, libc_base, libc_end) }?;
+
+    // No writes happened — detach and report. (Drop would resume the group
+    // too, but detaching explicitly keeps the no-side-effect contract obvious
+    // and surfaces a detach error rather than swallowing it.)
+    guard
+        .detach()
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: detach: {e}")))?;
+
+    Ok(CheckReport {
+        libc_base,
+        libc_end,
+        target_fn,
+        scratch_pc,
+    })
+}
+
 /// Allocate a fresh 4 KiB `PROT_READ | PROT_WRITE` anonymous page in the
 /// tracee. Used for both the runtime lock list and as the staging buffer
 /// for the hook file path during install.
@@ -2240,5 +2299,25 @@ mod tests {
             cell, saved_prologue,
             "revert must leave init's prologue byte-for-byte intact"
         );
+    }
+
+    /// `check_init_hook`'s remote sub-ops (attach + `process_vm_readv`) need a
+    /// live aarch64 init and are exercised on-device in P05, not from an
+    /// x86_64 host — same constraint as `install_init_hook` and the Drop body.
+    /// What we can pin off-device is the public dry-run report surface: every
+    /// resolved fact is reachable, matching the `hook_handle_size` field-layout
+    /// check above.
+    #[test]
+    fn check_report_fields_reachable() {
+        let r = CheckReport {
+            libc_base: 0x7000_0000_0000,
+            libc_end: 0x7000_0010_0000,
+            target_fn: 0x7000_0001_2340,
+            scratch_pc: 0x7000_0000_1000,
+        };
+        assert_eq!(r.libc_base, 0x7000_0000_0000);
+        assert_eq!(r.libc_end, 0x7000_0010_0000);
+        assert_eq!(r.target_fn, 0x7000_0001_2340);
+        assert_eq!(r.scratch_pc, 0x7000_0000_1000);
     }
 }
