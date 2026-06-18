@@ -23,17 +23,15 @@
 //! prefixed message (`"stage-A: <step>: <cause>"` /
 //! `"stage-B: <step>: <cause>"`) per the P03 checklist FR-18 / FR-19.
 
+use std::ffi::CString;
 use std::fs::File;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::seal;
 use crate::seal::arena::{
-    find_scratch_slot, AT_FDCWD, MAP_PRIVATE, MAP_PRIVATE_ANON, NR_CLOSE, NR_MMAP, NR_MUNMAP,
-    NR_OPENAT, O_RDONLY, PROT_RW, PROT_RX,
+    find_scratch_slot, MAP_PRIVATE, MAP_PRIVATE_ANON, MFD_CLOEXEC, NR_CLOSE, NR_MEMFD_CREATE,
+    NR_MMAP, NR_MUNMAP, PROT_RW, PROT_RX,
 };
 use crate::seal::maps::MapEntry;
 use crate::seal::ptrace::{
@@ -48,13 +46,6 @@ use crate::seal::ptrace::{
 /// contained. Kept as `u64` because the remote-syscall ABI is 64-bit and
 /// the value flows straight into `remote_syscall_via_poke` args.
 const HOOK_PAGE_SIZE: u64 = 4096;
-
-/// Host directory that receives the stage-B hook body before it is mmap'd
-/// file-backed into init. Auto-labels as `u:object_r:adb_data_file:s0` on
-/// write, which matches init's `adb_data_file:file { execute map }` allow
-/// rule and so avoids the `execmem` denial that anonymous `PROT_READ |
-/// PROT_EXEC` would hit on OEMs stripping `process:execmem` from init.
-const HOOK_FILE_DIR: &str = "/data/adb/resetprop-rs";
 
 /// Byte offset inside `lock_list_page` where the host-written hook file
 /// path is staged before the remote `openat`. Lives past
@@ -85,7 +76,7 @@ static INSTALL_HARD_FAILURES: AtomicU32 = AtomicU32::new(0);
 // P04 T3 — hook-page layout and i-cache sync constants
 
 /// Hook page byte offset where [`build_hook_body_bytes`]'s 140-byte body
-/// lands in the file-backed mapping. Held at 1024 rather than 0 to keep
+/// lands in the hook-page mapping. Held at 1024 rather than 0 to keep
 /// binary compatibility with existing trampoline encoders and tests that
 /// reference the canonical offset; the preceding 1024 bytes of the hook
 /// page are zero-padding.
@@ -161,11 +152,11 @@ pub(crate) const NR_MEMBARRIER: u64 = 283;
 #[allow(dead_code)]
 pub struct HookHandle {
     pub(crate) pid: libc::pid_t,
-    /// File-backed `PROT_READ | PROT_EXEC` page in the tracee holding the
-    /// 140-byte hook body at [`HOOK_BODY_OFFSET`]. Source file is
-    /// [`HOOK_FILE_DIR`]`/hook-<pid>-<nanos>.bin`, unlinked immediately
-    /// after mmap (kernel retains the mapping via the deleted-inode
-    /// mechanism, same as bionic's seccomp filter page).
+    /// `PROT_READ | PROT_EXEC` page in the tracee holding the 140-byte hook
+    /// body at [`HOOK_BODY_OFFSET`], mapped from an anonymous `memfd` the
+    /// tracee created and this process filled. The fd is closed after mmap;
+    /// the mapping survives via the fd's anonymous inode, leaving no on-disk
+    /// residue.
     pub(crate) hook_page: u64,
     /// Anonymous `PROT_READ | PROT_WRITE` page in the tracee holding the
     /// variable-length lock list at offset 0 (up to [`LOCK_LIST_CAPACITY`]
@@ -322,40 +313,37 @@ unsafe fn derive_libc_scratch_pc(pid: libc::pid_t, libc_base: u64, libc_end: u64
 ///
 /// # Page layout
 ///
-/// * `lock_list_page` — anonymous `PROT_READ | PROT_WRITE`. Holds the
+/// * `lock_list_page`: anonymous `PROT_READ | PROT_WRITE`. Holds the
 ///   runtime lock list at offset 0 (up to [`LOCK_LIST_CAPACITY`] bytes)
-///   and temporarily stages the hook file path at [`PATH_STAGE_OFFSET`]
+///   and temporarily stages the memfd name at [`PATH_STAGE_OFFSET`]
 ///   during this install only.
-/// * `hook_page` — file-backed `PROT_READ | PROT_EXEC`, sourced from
-///   [`HOOK_FILE_DIR`]`/hook-<pid>-<nanos>.bin` (written and unlinked
-///   within this function). Contains the 140-byte hook body at
+/// * `hook_page`: `PROT_READ | PROT_EXEC`, mapped from an anonymous
+///   `memfd` the tracee created. Contains the 140-byte hook body at
 ///   [`HOOK_BODY_OFFSET`]; zero padding elsewhere.
 ///
-/// The file-backed page is what lets stage-B run on OEMs that strip
-/// `process:execmem` from init's SELinux domain: init keeps the
-/// `adb_data_file:file { execute map }` allow rule regardless, so a
-/// file written under [`HOOK_FILE_DIR`] (auto-labels as
-/// `adb_data_file`) is mmap'able `PROT_R|X` inside init without an
-/// SELinux denial. The host file is unlinked immediately after mmap;
-/// the kernel retains the mapping via the deleted-inode mechanism.
+/// The memfd relabel is what lets stage-B run on OEMs that strip
+/// `process:execmem` from init's SELinux domain: the fd is relabelled to
+/// the libc.so context init may execute, via `setfilecon` on
+/// `/proc/<pid>/fd/<memfd>`, so init maps it `PROT_R|X` without an
+/// `execmem` or file-execute denial. Nothing reaches disk, so there is no
+/// residue to unlink.
 ///
 /// # Error cleanup
 ///
 /// Any error after `lock_list_page` is mapped issues a best-effort
 /// remote `munmap` of `lock_list_page` under the same attach window,
-/// so the tracee does not leak a 4 KiB page on cold paths. Host file
-/// cleanup happens inside the file-backed installer regardless of
-/// outcome.
+/// so the tracee does not leak a 4 KiB page on cold paths. The memfd is
+/// closed in the tracee inside the installer on every path.
 ///
 /// # Latency
 ///
 /// The install runs inside one `RemoteAttach` window. Observed
 /// wall-clock on a modern ARM64 handset (Snapdragon-class SoC, bionic
 /// libc.so ~1.2 MiB, ~5000 `.dynsym` entries): 20-50 ms for the full
-/// sequence — `/proc/<pid>/maps` + libc ELF parse + GNU_HASH walk +
-/// lock-list mmap + prologue snapshot + host file write + remote
-/// openat / mmap / close + unlink. Any thread that blocks on init
-/// for a property write during this window waits out the full stall.
+/// sequence of `/proc/<pid>/maps`, libc ELF parse, GNU_HASH walk,
+/// lock-list mmap, prologue snapshot, remote memfd_create, procfs write,
+/// relabel, and remote mmap / close. Any thread that blocks on init for
+/// a property write during this window waits out the full stall.
 ///
 /// # Throttle
 ///
@@ -404,7 +392,7 @@ fn install_init_hook_inner(pid: libc::pid_t) -> Result<HookHandle> {
     let body_bytes = build_hook_body_bytes(saved_prologue, lock_list_page, target_fn + 16);
 
     let hook_page =
-        match install_file_backed_hook_page(pid, scratch_pc, lock_list_page, &body_bytes) {
+        match install_memfd_hook_page(pid, scratch_pc, lock_list_page, &body_bytes) {
             Ok(addr) => addr,
             Err(e) => {
                 best_effort_remote_munmap(pid, scratch_pc, lock_list_page);
@@ -533,46 +521,86 @@ fn write_sentinel_and_snapshot_prologue(
     Ok(saved_prologue)
 }
 
-/// Materialise the hook body as a file-backed `PROT_READ | PROT_EXEC`
-/// mapping in the tracee, using `stage_page + PATH_STAGE_OFFSET` as a
-/// scratch buffer for the `openat` pathname.
+/// Name attached to the in-init memfd; surfaces only as the basename in
+/// `/proc/<pid>/fd/<n>` and `/proc/<pid>/maps`. Cosmetic, not a real path.
+const MEMFD_NAME: &[u8] = b"resetprop-hook";
+
+/// Materialise the hook body as a `PROT_READ | PROT_EXEC` mapping in the
+/// tracee, backed by an anonymous in-memory file. No bytes reach disk.
 ///
-/// Host file is always removed before this returns (success or failure);
-/// init retains the successful mapping via the deleted-inode mechanism.
-fn install_file_backed_hook_page(
+/// Ported from injectrc's init_injector: the tracee creates a `memfd`, this
+/// process fills it through `/proc/<pid>/fd/<memfd>` and relabels it to the
+/// libc.so SELinux context, then the tracee maps and closes its own fd. The
+/// mapping outlives the close via the fd's anonymous inode, so there is no
+/// on-disk residue and no `adb_data_file:file execute` denial to dodge.
+fn install_memfd_hook_page(
     pid: libc::pid_t,
     scratch_pc: u64,
     stage_page: u64,
     body_bytes: &[u8],
 ) -> Result<u64> {
-    let host_path = write_host_hook_file(pid, body_bytes)?;
-    let result = mmap_file_backed_in_tracee(pid, scratch_pc, stage_page, &host_path);
-    let _ = std::fs::remove_file(&host_path);
-    result
+    let page = layout_hook_page_bytes(body_bytes)?;
+    let name_vaddr = stage_cstr_in_tracee(pid, stage_page, MEMFD_NAME)?;
+    run_memfd_install(
+        name_vaddr,
+        // SAFETY: tracee is ptrace-stopped under the caller's attach;
+        // `scratch_pc` is a libc.text r-xp slot valid for the POKE-driven
+        // remote syscall ABI.
+        |syscall_no, args| unsafe { remote_syscall_via_poke(pid, scratch_pc, syscall_no, args) },
+        |memfd| publish_page_to_memfd(pid, memfd, &page),
+    )
 }
 
-/// Write the 4 KiB hook page image to disk under [`HOOK_FILE_DIR`].
-///
-/// File layout: zero-padded 4 KiB, with `body_bytes` placed at
-/// [`HOOK_BODY_OFFSET`]. Auto-labels as `adb_data_file` so init can
-/// open + mmap `PROT_R|X` without an SELinux denial.
-fn write_host_hook_file(pid: libc::pid_t, body_bytes: &[u8]) -> Result<PathBuf> {
-    let dir = Path::new(HOOK_FILE_DIR);
-    std::fs::create_dir_all(dir).map_err(|e| {
-        Error::HookInstallFailed(format!("stage-B: mkdir_p {}: {e}", dir.display()))
-    })?;
+/// Drive the memfd install sequence: remote `memfd_create`, host-side
+/// `publish` (fill + relabel the fd), remote `mmap` `PROT_R|X`, remote
+/// `close`. Generic over the remote-syscall executor and `publish` so the
+/// sequence is exercised off-device with both mocked.
+fn run_memfd_install<S, P>(name_vaddr: u64, mut remote_syscall: S, publish: P) -> Result<u64>
+where
+    S: FnMut(u64, [u64; 6]) -> Result<i64>,
+    P: FnOnce(u64) -> Result<()>,
+{
+    let memfd = remote_syscall(NR_MEMFD_CREATE, [name_vaddr, MFD_CLOEXEC, 0, 0, 0, 0])?;
+    if memfd < 0 {
+        return Err(Error::HookInstallFailed(format!(
+            "stage-B: memfd_create returned -errno={}",
+            -memfd
+        )));
+    }
+    let memfd = memfd as u64;
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::HookInstallFailed(format!("stage-B: clock skew: {e}")))?
-        .as_nanos();
+    publish(memfd)?;
 
-    let host_path = dir.join(format!("hook-{pid}-{nanos}.bin"));
-    let file_bytes = layout_hook_page_bytes(body_bytes)?;
-    std::fs::write(&host_path, &file_bytes).map_err(|e| {
-        Error::HookInstallFailed(format!("stage-B: write {}: {e}", host_path.display()))
-    })?;
-    Ok(host_path)
+    let mapped = remote_syscall(NR_MMAP, [0, HOOK_PAGE_SIZE, PROT_RX, MAP_PRIVATE, memfd, 0])?;
+    if (-4095..=-1).contains(&mapped) {
+        let _ = remote_syscall(NR_CLOSE, [memfd, 0, 0, 0, 0, 0]);
+        return Err(Error::HookInstallFailed(format!(
+            "stage-B: memfd mmap returned -errno={}",
+            -mapped
+        )));
+    }
+
+    let _ = remote_syscall(NR_CLOSE, [memfd, 0, 0, 0, 0, 0]);
+    Ok(mapped as u64)
+}
+
+/// `/proc/<pid>/fd/<fd>`: the procfs handle this process writes the page
+/// image through and relabels.
+fn proc_fd_path(pid: libc::pid_t, fd: u64) -> String {
+    format!("/proc/{pid}/fd/{fd}")
+}
+
+/// Fill init's `memfd` with the 4 KiB page image through `/proc/<pid>/fd/<memfd>`
+/// and relabel it to the libc.so SELinux context so init can map it `PROT_R|X`.
+/// Runs while the tracee is ptrace-stopped under the caller's attach.
+fn publish_page_to_memfd(pid: libc::pid_t, memfd: u64, page: &[u8]) -> Result<()> {
+    let fd_path = proc_fd_path(pid, memfd);
+    std::fs::write(&fd_path, page)
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: write {fd_path}: {e}")))?;
+    let c_path = CString::new(fd_path.clone())
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: nul in {fd_path}: {e}")))?;
+    seal::selinux::relabel_to_libc_context(&c_path)
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: relabel memfd: {e}")))
 }
 
 /// Pure helper: assemble a 4 KiB page image with `body_bytes` placed at
@@ -595,91 +623,30 @@ fn layout_hook_page_bytes(body_bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Open the host file inside the tracee, map it `PROT_R|X`, and close
-/// the fd. Caller unlinks the host file.
-fn mmap_file_backed_in_tracee(
-    pid: libc::pid_t,
-    scratch_pc: u64,
-    stage_page: u64,
-    host_path: &Path,
-) -> Result<u64> {
-    stage_path_in_tracee(pid, stage_page, host_path)?;
-    let path_vaddr = stage_page + PATH_STAGE_OFFSET;
-
-    let fd = remote_openat_rdonly(pid, scratch_pc, path_vaddr)?;
-    let mmap_result = remote_mmap_file_backed_rx(pid, scratch_pc, fd);
-
-    // SAFETY: best-effort close; tracee still stopped. Close errors are
-    // diagnostic-only because the fd leaks to init's fd table at worst,
-    // which self-reclaims on next exec.
-    let _ = unsafe { remote_syscall_via_poke(pid, scratch_pc, NR_CLOSE, [fd, 0, 0, 0, 0, 0]) };
-    mmap_result
-}
-
-/// POKE the NUL-terminated host path into the tracee at
-/// `stage_page + PATH_STAGE_OFFSET`.
-fn stage_path_in_tracee(pid: libc::pid_t, stage_page: u64, host_path: &Path) -> Result<()> {
-    let path_bytes = host_path.as_os_str().as_bytes();
+/// POKE a NUL-terminated C string into the tracee at `stage_page +
+/// PATH_STAGE_OFFSET` and return its tracee vaddr. Stages the memfd name; the
+/// bytes are abandoned once `memfd_create` reads them. The slot sits above
+/// [`LOCK_LIST_CAPACITY`] (const-asserted below it), so the in-init lock
+/// walker never reaches these bytes.
+fn stage_cstr_in_tracee(pid: libc::pid_t, stage_page: u64, bytes: &[u8]) -> Result<u64> {
     let max_bytes = HOOK_PAGE_SIZE
         .saturating_sub(PATH_STAGE_OFFSET)
         .saturating_sub(1);
-    if (path_bytes.len() as u64) > max_bytes {
+    if (bytes.len() as u64) > max_bytes {
         return Err(Error::HookInstallFailed(format!(
-            "stage-B: host path too long for stage slot ({} bytes, max {})",
-            path_bytes.len(),
+            "stage-B: staged string too long ({} bytes, max {})",
+            bytes.len(),
             max_bytes
         )));
     }
-    let mut nul_path = Vec::with_capacity(path_bytes.len() + 1);
-    nul_path.extend_from_slice(path_bytes);
-    nul_path.push(0);
+    let vaddr = stage_page + PATH_STAGE_OFFSET;
+    let mut nul = Vec::with_capacity(bytes.len() + 1);
+    nul.extend_from_slice(bytes);
+    nul.push(0);
     // SAFETY: `stage_page` is the fresh PROT_RW anon page; tracee stopped.
-    unsafe { write_remote(pid, stage_page + PATH_STAGE_OFFSET, &nul_path) }
-        .map_err(|e| Error::HookInstallFailed(format!("stage-B: stage path: {e}")))
-}
-
-/// `openat(AT_FDCWD, path_vaddr, O_RDONLY, 0)` in the tracee.
-fn remote_openat_rdonly(pid: libc::pid_t, scratch_pc: u64, path_vaddr: u64) -> Result<u64> {
-    // SAFETY: scratch_pc invariants as in `remote_mmap_anon_rw_page`.
-    let ret = unsafe {
-        remote_syscall_via_poke(
-            pid,
-            scratch_pc,
-            NR_OPENAT,
-            [AT_FDCWD, path_vaddr, O_RDONLY, 0, 0, 0],
-        )
-    }
-    .map_err(|e| Error::HookInstallFailed(format!("stage-B: openat: {e}")))?;
-
-    if ret < 0 {
-        return Err(Error::HookInstallFailed(format!(
-            "stage-B: openat returned -errno={}",
-            -ret
-        )));
-    }
-    Ok(ret as u64)
-}
-
-/// `mmap(NULL, 4096, PROT_R|X, MAP_PRIVATE, fd, 0)` in the tracee.
-fn remote_mmap_file_backed_rx(pid: libc::pid_t, scratch_pc: u64, fd: u64) -> Result<u64> {
-    // SAFETY: scratch_pc invariants as in `remote_mmap_anon_rw_page`.
-    let ret = unsafe {
-        remote_syscall_via_poke(
-            pid,
-            scratch_pc,
-            NR_MMAP,
-            [0, HOOK_PAGE_SIZE, PROT_RX, MAP_PRIVATE, fd, 0],
-        )
-    }
-    .map_err(|e| Error::HookInstallFailed(format!("stage-B: mmap file-backed: {e}")))?;
-
-    if (-4095..=-1).contains(&ret) {
-        return Err(Error::HookInstallFailed(format!(
-            "stage-B: mmap file-backed returned -errno={}",
-            -ret
-        )));
-    }
-    Ok(ret as u64)
+    unsafe { write_remote(pid, vaddr, &nul) }
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: stage string: {e}")))?;
+    Ok(vaddr)
 }
 
 /// Best-effort remote `munmap` for cleanup paths. Errors are swallowed.
@@ -1237,9 +1204,9 @@ fn verify_trampoline_readback(word_lo: u64, word_hi: u64, readback: &[u8; 16]) -
 /// half-written trampoline.
 pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
     // Step 1: compute the trampoline's branch target. The 140-byte hook body
-    // already lives at `hook_page + HOOK_BODY_OFFSET` — `install_init_hook`
-    // materialised it as a file-backed PROT_R|X mapping, so no runtime
-    // body write is required here.
+    // already lives at `hook_page + HOOK_BODY_OFFSET`; `install_init_hook`
+    // mapped it from init's memfd PROT_R|X, so no runtime body write is
+    // required here.
     let hook_body_vaddr = handle.hook_page + HOOK_BODY_OFFSET;
 
     // Step 2: acquire attach RAII guard.
@@ -2407,5 +2374,91 @@ mod tests {
         );
 
         INSTALL_HARD_FAILURES.store(0, Ordering::Relaxed);
+    }
+
+    // T09 / Port 1: memfd install round-trip
+
+    /// `proc_fd_path` formats the procfs handle this process fills and relabels.
+    #[test]
+    fn proc_fd_path_formats_procfs_link() {
+        assert_eq!(proc_fd_path(1, 7), "/proc/1/fd/7");
+    }
+
+    /// `run_memfd_install` threads the fd from `memfd_create` into the `mmap`
+    /// and `close`, runs `publish` against it, and returns the mapped address.
+    /// Mocked remote syscalls return a non-zero address, exercising the
+    /// sequence off-device.
+    #[test]
+    fn run_memfd_install_threads_fd_and_returns_mapped_addr() {
+        use std::cell::RefCell;
+
+        let fake_memfd: i64 = 7;
+        let fake_addr: i64 = 0x0000_7f00_0000;
+        let calls: RefCell<Vec<(u64, [u64; 6])>> = RefCell::new(Vec::new());
+        let published = RefCell::new(None);
+
+        let addr = run_memfd_install(
+            0xdead_beef,
+            |syscall_no, args| {
+                calls.borrow_mut().push((syscall_no, args));
+                match syscall_no {
+                    NR_MEMFD_CREATE => Ok(fake_memfd),
+                    NR_MMAP => Ok(fake_addr),
+                    NR_CLOSE => Ok(0),
+                    other => panic!("unexpected remote syscall {other}"),
+                }
+            },
+            |memfd| {
+                *published.borrow_mut() = Some(memfd);
+                Ok(())
+            },
+        )
+        .expect("memfd install must succeed with mocked syscalls");
+
+        assert_eq!(addr, fake_addr as u64, "returns the mmap address as the hook page");
+        assert_eq!(
+            published.borrow().unwrap(),
+            fake_memfd as u64,
+            "publish runs against the created fd"
+        );
+
+        let calls = calls.borrow();
+        assert_eq!(calls[0].0, NR_MEMFD_CREATE);
+        assert_eq!(calls[0].1[0], 0xdead_beef, "memfd_create reads the staged name vaddr");
+        assert_eq!(calls[0].1[1], MFD_CLOEXEC);
+        assert_eq!(calls[1].0, NR_MMAP);
+        assert_eq!(calls[1].1[2], PROT_RX, "hook page is mapped PROT_R|X");
+        assert_eq!(calls[1].1[4], fake_memfd as u64, "mmap maps the created memfd");
+        assert_eq!(calls[2].0, NR_CLOSE);
+        assert_eq!(calls[2].1[0], fake_memfd as u64, "close releases the memfd");
+    }
+
+    /// A `-errno` return from `mmap` surfaces as `HookInstallFailed` and still
+    /// closes the fd, so a failed install leaves no fd leaked in init.
+    #[test]
+    fn run_memfd_install_closes_fd_on_mmap_failure() {
+        use std::cell::RefCell;
+
+        let closed = RefCell::new(false);
+        let err = run_memfd_install(
+            0,
+            |syscall_no, _args| match syscall_no {
+                NR_MEMFD_CREATE => Ok(9),
+                NR_MMAP => Ok(-12),
+                NR_CLOSE => {
+                    *closed.borrow_mut() = true;
+                    Ok(0)
+                }
+                other => panic!("unexpected remote syscall {other}"),
+            },
+            |_memfd| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::HookInstallFailed(ref m) if m.contains("mmap")),
+            "mmap failure must surface as HookInstallFailed, got {err:?}"
+        );
+        assert!(*closed.borrow(), "the memfd must be closed even when mmap fails");
     }
 }

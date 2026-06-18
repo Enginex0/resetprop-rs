@@ -9,6 +9,7 @@ pub mod elf;
 pub mod hook;
 pub mod maps;
 pub mod ptrace;
+pub mod selinux;
 
 /// Process identifier alias matching the libc type used by ptrace/waitpid.
 pub type Pid = libc::pid_t;

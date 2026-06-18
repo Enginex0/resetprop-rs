@@ -17,10 +17,11 @@ pub(crate) const NR_OPENAT: u64 = 56;
 pub(crate) const NR_MMAP: u64 = 222;
 pub(crate) const NR_CLOSE: u64 = 57;
 pub(crate) const NR_MUNMAP: u64 = 215;
+pub(crate) const NR_MEMFD_CREATE: u64 = 279;
 
 // fcntl/mman constants (asm-generic/fcntl.h, asm-generic/mman-common.h)
 pub(crate) const AT_FDCWD: u64 = -100_i64 as u64; // sign-extended to 64 bits
-pub(crate) const O_RDONLY: u64 = 0;
+pub(crate) const MFD_CLOEXEC: u64 = 0x0001;
 pub(crate) const O_RDONLY_NOFOLLOW: u64 = 0x20000;
 pub(crate) const O_RDWR_NOFOLLOW: u64 = 0x20002;
 pub(crate) const PROT_RW: u64 = 0x3;
@@ -725,10 +726,11 @@ mod tests {
         assert_eq!(NR_MMAP, 222);
         assert_eq!(NR_CLOSE, 57);
         assert_eq!(NR_MUNMAP, 215);
+        assert_eq!(NR_MEMFD_CREATE, 279);
 
         // fcntl / mman flags
         assert_eq!(AT_FDCWD, (-100_i64) as u64);
-        assert_eq!(O_RDONLY, 0);
+        assert_eq!(MFD_CLOEXEC, 0x0001);
         assert_eq!(O_RDONLY_NOFOLLOW, 0x20000);
         assert_eq!(O_RDWR_NOFOLLOW, 0x20002);
         assert_eq!(PROT_RW, 0x3);
