@@ -1470,7 +1470,12 @@ fn install_trampoline_locked(
 
     if let Err(e) = trampoline_result {
         // Revert under the caller's still-live attach window; the caller detaches.
-        revert_trampoline(pid, handle.target_fn, handle.scratch_pc, &handle.saved_prologue);
+        revert_trampoline(
+            pid,
+            handle.target_fn,
+            handle.scratch_pc,
+            &handle.saved_prologue,
+        );
         return Err(e);
     }
 
@@ -2559,7 +2564,10 @@ mod tests {
         )
         .expect("memfd install must succeed with mocked syscalls");
 
-        assert_eq!(addr, fake_addr as u64, "returns the mmap address as the hook page");
+        assert_eq!(
+            addr, fake_addr as u64,
+            "returns the mmap address as the hook page"
+        );
         assert_eq!(
             published.borrow().unwrap(),
             fake_memfd as u64,
@@ -2568,11 +2576,17 @@ mod tests {
 
         let calls = calls.borrow();
         assert_eq!(calls[0].0, NR_MEMFD_CREATE);
-        assert_eq!(calls[0].1[0], 0xdead_beef, "memfd_create reads the staged name vaddr");
+        assert_eq!(
+            calls[0].1[0], 0xdead_beef,
+            "memfd_create reads the staged name vaddr"
+        );
         assert_eq!(calls[0].1[1], MFD_CLOEXEC);
         assert_eq!(calls[1].0, NR_MMAP);
         assert_eq!(calls[1].1[2], PROT_RX, "hook page is mapped PROT_R|X");
-        assert_eq!(calls[1].1[4], fake_memfd as u64, "mmap maps the created memfd");
+        assert_eq!(
+            calls[1].1[4], fake_memfd as u64,
+            "mmap maps the created memfd"
+        );
         assert_eq!(calls[2].0, NR_CLOSE);
         assert_eq!(calls[2].1[0], fake_memfd as u64, "close releases the memfd");
     }
@@ -2603,6 +2617,9 @@ mod tests {
             matches!(err, Error::HookInstallFailed(ref m) if m.contains("mmap")),
             "mmap failure must surface as HookInstallFailed, got {err:?}"
         );
-        assert!(*closed.borrow(), "the memfd must be closed even when mmap fails");
+        assert!(
+            *closed.borrow(),
+            "the memfd must be closed even when mmap fails"
+        );
     }
 }

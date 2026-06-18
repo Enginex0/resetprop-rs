@@ -72,7 +72,9 @@ mod android {
         // every symbol eagerly so a missing export fails here, not mid-call.
         let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW) };
         if handle.is_null() {
-            return Err(Error::HookInstallFailed("dlopen libselinux.so failed".into()));
+            return Err(Error::HookInstallFailed(
+                "dlopen libselinux.so failed".into(),
+            ));
         }
         // The handle is intentionally never `dlclose`d: libselinux stays
         // resident for the single per-boot install and the process is short.
@@ -80,8 +82,14 @@ mod android {
         // libselinux ABI; a null lookup is rejected before transmute.
         unsafe {
             Ok(Libselinux {
-                getfilecon: std::mem::transmute::<*mut c_void, GetFileCon>(sym(handle, c"getfilecon")?),
-                setfilecon: std::mem::transmute::<*mut c_void, SetFileCon>(sym(handle, c"setfilecon")?),
+                getfilecon: std::mem::transmute::<*mut c_void, GetFileCon>(sym(
+                    handle,
+                    c"getfilecon",
+                )?),
+                setfilecon: std::mem::transmute::<*mut c_void, SetFileCon>(sym(
+                    handle,
+                    c"setfilecon",
+                )?),
                 freecon: std::mem::transmute::<*mut c_void, FreeCon>(sym(handle, c"freecon")?),
             })
         }

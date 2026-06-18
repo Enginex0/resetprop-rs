@@ -44,8 +44,15 @@ pub(crate) fn discover_kmsg_fds_in(fd_dir: &Path) -> Vec<u64> {
     };
     let mut fds: Vec<u64> = entries
         .flatten()
-        .filter(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == Path::new(KMSG_DEVICE)))
-        .filter_map(|entry| entry.file_name().to_str().and_then(|name| name.parse::<u64>().ok()))
+        .filter(|entry| {
+            fs::read_link(entry.path()).is_ok_and(|target| target == Path::new(KMSG_DEVICE))
+        })
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u64>().ok())
+        })
         .collect();
     fds.sort_unstable();
     fds

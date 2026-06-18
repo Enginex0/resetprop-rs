@@ -203,7 +203,8 @@ fn run() -> Result<(), String> {
     .map_err(|e| format!("failed to open property system: {e}"))?;
 
     if observe_init {
-        let duration = std::time::Duration::from_secs(duration_secs.unwrap_or(DEFAULT_OBSERVE_SECS));
+        let duration =
+            std::time::Duration::from_secs(duration_secs.unwrap_or(DEFAULT_OBSERVE_SECS));
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         let count = sys
@@ -331,9 +332,9 @@ fn run() -> Result<(), String> {
         // shared: the first append installs the trampoline, the rest extend the
         // same lock list. The first hard install failure aborts the batch.
         for (name, value) in &seals {
-            let value = value.as_deref().ok_or_else(|| {
-                format!("--seal requires NAME VALUE (VALUE missing for {name})")
-            })?;
+            let value = value
+                .as_deref()
+                .ok_or_else(|| format!("--seal requires NAME VALUE (VALUE missing for {name})"))?;
             match sys.seal(name, value) {
                 Ok(record) => {
                     if verbose {
