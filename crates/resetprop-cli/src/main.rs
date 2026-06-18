@@ -3,6 +3,9 @@ use std::process::ExitCode;
 
 use resetprop::{Error, PersistStore, PropSystem};
 
+/// Default observe-init window when `--duration` is omitted.
+const DEFAULT_OBSERVE_SECS: u64 = 5;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -30,7 +33,7 @@ fn run() -> Result<(), String> {
     let mut wait_name: Option<String> = None;
     let mut wait_value: Option<String> = None;
     let mut timeout_secs: Option<u64> = None;
-    let mut seal: Option<String> = None;
+    let mut seals: Vec<(String, Option<String>)> = Vec::new();
     let mut check = false;
     let mut seal_arena: Option<String> = None;
     let mut unseal: Option<String> = None;
@@ -39,6 +42,8 @@ fn run() -> Result<(), String> {
     let mut if_diff = false;
     let mut if_match: Option<String> = None;
     let mut delete_if_exist: Option<String> = None;
+    let mut observe_init = false;
+    let mut duration_secs: Option<u64> = None;
     let mut positional = Vec::new();
 
     let mut i = 0;
@@ -64,7 +69,17 @@ fn run() -> Result<(), String> {
             "--stealth" | "-st" => stealth = true,
             "--seal" | "-sl" => {
                 i += 1;
-                seal = Some(arg_val(&args, i, "--seal")?);
+                let name = arg_val(&args, i, "--seal")?;
+                // VALUE is the next arg unless it is another flag (e.g. --check,
+                // a dry-run that takes only NAME). Repeating --seal builds a
+                // multi-entry lock list under one process / one HookHandle.
+                let value = if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    Some(args[i].clone())
+                } else {
+                    None
+                };
+                seals.push((name, value));
             }
             "--check" => check = true,
             "--seal-arena" | "-sla" => {
@@ -114,6 +129,15 @@ fn run() -> Result<(), String> {
                         .map_err(|_| "--timeout requires a number".to_string())?,
                 );
             }
+            "--observe-init" => observe_init = true,
+            "--duration" => {
+                i += 1;
+                let s = arg_val(&args, i, "--duration")?;
+                duration_secs = Some(
+                    s.parse::<u64>()
+                        .map_err(|_| "--duration requires a number".to_string())?,
+                );
+            }
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -133,11 +157,12 @@ fn run() -> Result<(), String> {
         || compact
         || file.is_some()
         || wait_name.is_some()
-        || seal.is_some()
+        || !seals.is_empty()
         || seal_arena.is_some()
         || unseal.is_some()
         || unseal_arena.is_some()
-        || list_seals;
+        || list_seals
+        || observe_init;
     let any_mode_flag = init || persist || persist_read || stealth || quiet;
 
     if if_diff && if_match.is_some() {
@@ -176,6 +201,19 @@ fn run() -> Result<(), String> {
         None => PropSystem::open(),
     }
     .map_err(|e| format!("failed to open property system: {e}"))?;
+
+    if observe_init {
+        let duration = std::time::Duration::from_secs(duration_secs.unwrap_or(DEFAULT_OBSERVE_SECS));
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let count = sys
+            .observe_init(duration, &mut out)
+            .map_err(|e| format!("observe-init failed: {e}"))?;
+        if verbose {
+            eprintln!("observe-init: captured {count} kmsg line(s)");
+        }
+        return Ok(());
+    }
 
     if let Some(name) = hexpatch {
         return bool_op(sys.hexpatch_delete(&name), &name, "hexpatch", verbose);
@@ -229,7 +267,7 @@ fn run() -> Result<(), String> {
     }
 
     let seal_flag_count = [
-        seal.is_some(),
+        !seals.is_empty(),
         seal_arena.is_some(),
         unseal.is_some(),
         unseal_arena.is_some(),
@@ -261,11 +299,18 @@ fn run() -> Result<(), String> {
         return bool_op(sys.unseal_arena(name), name, "unsealed(arena)", verbose);
     }
 
-    if let Some(ref name) = seal {
+    if !seals.is_empty() {
         if check {
             // Dry-run: resolve the Tier B facts in init without poking it. No
-            // value is written and no trampoline is installed, so VALUE is not
-            // required here. INIT_PID is `1` (crate-internal in resetprop).
+            // value is written and no trampoline is installed. Single-NAME only;
+            // the resolution is name-independent. INIT_PID is `1`.
+            if seals.len() != 1 {
+                return Err(
+                    "--seal --check is a single-NAME dry-run; pass exactly one --seal NAME"
+                        .to_string(),
+                );
+            }
+            let (name, _) = &seals[0];
             return match resetprop::seal::hook::check_init_hook(1) {
                 Ok(r) => {
                     println!(
@@ -282,28 +327,37 @@ fn run() -> Result<(), String> {
                 Err(e) => Err(format!("check failed: {e}")),
             };
         }
-        let value = positional
-            .first()
-            .ok_or_else(|| "--seal requires NAME VALUE (VALUE missing)".to_string())?;
-        return match sys.seal(name, value) {
-            Ok(record) => {
-                if verbose {
-                    eprintln!(
-                        "sealed: [{}] tier={:?} arena={}",
-                        record.name,
-                        record.tier,
-                        record.arena_path.display()
-                    );
+        // Seal each prop under one process so the lazily-installed HookHandle is
+        // shared: the first append installs the trampoline, the rest extend the
+        // same lock list. The first hard install failure aborts the batch.
+        for (name, value) in &seals {
+            let value = value.as_deref().ok_or_else(|| {
+                format!("--seal requires NAME VALUE (VALUE missing for {name})")
+            })?;
+            match sys.seal(name, value) {
+                Ok(record) => {
+                    if verbose {
+                        eprintln!(
+                            "sealed: [{}] tier={:?} arena={}",
+                            record.name,
+                            record.tier,
+                            record.arena_path.display()
+                        );
+                    }
                 }
-                Ok(())
+                Err(
+                    e @ (Error::HookInstallFailed(_)
+                    | Error::ElfParse(_)
+                    | Error::SymbolNotFound(_)),
+                ) => {
+                    return Err(format!(
+                        "Tier B hook install failed for {name}: {e}. Try --seal-arena for Tier A fallback."
+                    ))
+                }
+                Err(e) => return Err(format!("seal failed for {name}: {e}")),
             }
-            Err(
-                e @ (Error::HookInstallFailed(_) | Error::ElfParse(_) | Error::SymbolNotFound(_)),
-            ) => Err(format!(
-                "Tier B hook install failed: {e}. Try --seal-arena for Tier A fallback."
-            )),
-            Err(e) => Err(format!("seal failed: {e}")),
-        };
+        }
+        return Ok(());
     }
 
     if let Some(ref name) = seal_arena {
@@ -493,6 +547,7 @@ Usage:
   resetprop --stealth|-st NAME VALUE     Set with zeroed serial, no wake signals
   resetprop --stealth|-st -p NAME VALUE  Set stealth + persist to disk
   resetprop --seal|-sl NAME VALUE    Stealth write + Tier B per-prop init hook (default seal)
+  resetprop --seal A v1 --seal B v2  Seal several props in one run (one multi-entry lock list)
   resetprop --seal|-sl NAME --check  Dry-run: resolve Tier B in init, write nothing
   resetprop --seal-arena|-sla NAME VALUE  Stealth write + Tier A arena privatize (fallback)
   resetprop --unseal NAME            Remove NAME from the Tier B lock list
@@ -505,6 +560,7 @@ Usage:
   resetprop -f FILE                  Load properties from file (name=value)
   resetprop --wait NAME [VALUE]      Wait for property to exist or equal VALUE
   resetprop --timeout SECS           Timeout for --wait (default: forever)
+  resetprop --observe-init [--duration SECS]  Trace init's /dev/kmsg writes for a window (aarch64)
   resetprop --dir PATH               Use custom property directory
 
 Options:
@@ -516,12 +572,14 @@ Options:
   --if-match NEEDLE  Conditional set: write NAME=VALUE only when current value equals NEEDLE
   --delete-if-exist NAME  Conditional delete: no-op when NAME is absent
   --stealth, -st  Stealth write: bionic compose, no futex wake, no global notify
-  --seal, -sl     Tier B seal: stealth write + per-prop hook on __system_property_update in init
+  --seal, -sl     Tier B seal: stealth write + per-prop hook on __system_property_update in init (repeatable: one run, one multi-entry lock list)
   --check         With --seal: dry-run the Tier B install (resolve only, no ptrace write)
   --seal-arena, -sla  Tier A seal: stealth write + remap init's arena as MAP_PRIVATE|MAP_FIXED
   --unseal NAME   Remove NAME from the in-init Tier B lock list
   --unseal-arena NAME  Revert Tier A privatization for the arena holding NAME
   --seals         List currently active seals for this session
+  --observe-init  Trace init (PID 1) writes to /dev/kmsg and print them (aarch64 only)
+  --duration SECS With --observe-init: observe window in seconds (default: 5)
   --compact   Reclaim arena space left by deleted properties
   -v          Verbose output
   -h, --help  Show this help"
