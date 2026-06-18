@@ -25,3 +25,5 @@ __pycache__/
 .mold/
 bucket/
 phases/seal/
+/.context/
+/tests/
