@@ -19,3 +19,4 @@ vectors.db
 vectors.db-shm
 vectors.db-wal
 logs_llm/
+__pycache__/
