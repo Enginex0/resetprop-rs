@@ -27,3 +27,5 @@ bucket/
 phases/seal/
 /.context/
 /tests/
+/planning/
+/CLAUDE.md
