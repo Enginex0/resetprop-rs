@@ -7,6 +7,7 @@ use std::time::SystemTime;
 pub mod arena;
 pub mod elf;
 pub mod hook;
+pub mod kmsg_observer;
 pub mod maps;
 pub mod ptrace;
 pub mod selinux;
@@ -43,7 +44,7 @@ pub use arena::{seal_arena, seal_arena_with_mirror, unseal_arena, unseal_arena_w
 pub use maps::{parse_maps, MapEntry};
 pub use ptrace::{
     getregset, ptrace_detach, ptrace_interrupt, ptrace_peektext, ptrace_poketext, ptrace_seize,
-    remote_syscall, setregset, wait_stop, UserPtRegs,
+    remote_syscall_via_poke, setregset, wait_stop, UserPtRegs,
 };
 
 /// Process-wide in-memory registry of active seals.

@@ -351,80 +351,30 @@ pub(crate) unsafe fn remote_remap_private(
     })?;
     let scratch_pc = libc_text.start + slide_offset as u64;
 
-    // --- Bootstrap: POKEDATA an svc+brk blob at scratch_pc ---------------
-    let saved_bytes = super::ptrace::ptrace_peektext(guard.pid(), scratch_pc)?;
-
-    // trap (low 4 bytes) ; brk (high 4 bytes), little-endian pack
-    let trap_brk: u64 =
-        (super::ptrace::TRAP_INSN as u64) | ((super::ptrace::BRK_INSN as u64) << 32);
-    super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, trap_brk)?;
-
+    // --- Bootstrap: mmap a fresh RW scratch page via the shared injector --
+    // mmap(NULL, 4096, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0) — data-only, no
+    // execmem requested. Staged through the libc.text `scratch_pc` by the same
+    // peek/poke injector every other remote syscall in this function uses.
+    //
+    // SAFETY: `scratch_pc` is the libc.text NOP slide located above; the tracee
+    // is ptrace-stopped via `guard`; `remote_syscall_via_poke` saves and
+    // restores both the scratch word and the register snapshot internally.
     let bootstrap_page = {
-        let saved_regs = super::ptrace::getregset(guard.pid())?;
-        let mut work = saved_regs;
-        // mmap(NULL, 4096, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0) — page is
-        // data-only, so no execmem is requested. Staged through the arch-
-        // neutral interface so no raw register index appears here.
-        super::ptrace::set_syscall_args(
-            &mut work,
-            scratch_pc,
-            NR_MMAP,
-            [
-                0,                   // addr = NULL
-                BOOTSTRAP_PAGE_SIZE, // len  = 4096
-                PROT_RW,             // prot
-                MAP_PRIVATE_ANON,    // flags
-                (-1_i64) as u64,     // fd = -1
-                0,                   // offset
-            ],
-        );
-
-        super::ptrace::setregset(guard.pid(), &work)?;
-
-        // SAFETY: `libc::ptrace` FFI; tracee is stopped per RemoteAttach's
-        // post-wait_stop contract; `addr` / `data` are NULL per the
-        // PTRACE_CONT contract.
-        let rc = unsafe {
-            libc::ptrace(
-                super::ptrace::PTRACE_CONT as _,
+        let ret = unsafe {
+            super::ptrace::remote_syscall_via_poke(
                 guard.pid(),
-                std::ptr::null_mut::<libc::c_void>(),
-                std::ptr::null_mut::<libc::c_void>(),
-            )
+                scratch_pc,
+                NR_MMAP,
+                [
+                    0,                   // addr = NULL
+                    BOOTSTRAP_PAGE_SIZE, // len  = 4096
+                    PROT_RW,             // prot
+                    MAP_PRIVATE_ANON,    // flags
+                    (-1_i64) as u64,     // fd = -1
+                    0,                   // offset
+                ],
+            )?
         };
-        if rc == -1 {
-            // Best-effort restore before propagating, so libc.text isn't
-            // left with the svc+brk bytes in place.
-            let _ = super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes);
-            let _ = super::ptrace::setregset(guard.pid(), &saved_regs);
-            return Err(Error::PtraceOp(std::io::Error::last_os_error()));
-        }
-
-        // Always restore scratch bytes + registers before inspecting the
-        // result. A failure in `wait_stop` or `getregset` must not leave
-        // libc.text containing live svc+brk or the tracee's saved regs in
-        // work-state — RemoteAttach::drop would release init into that
-        // poisoned state and the next thread scheduled at scratch_pc would
-        // trap on brk #0. On the pre-restore failure paths the errors from
-        // the restore calls are discarded in favor of the original cause.
-        let wait_result = super::ptrace::wait_stop(guard.pid(), 0);
-        if wait_result.is_err() {
-            let _ = super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes);
-            let _ = super::ptrace::setregset(guard.pid(), &saved_regs);
-        }
-        wait_result?;
-
-        let out_result = super::ptrace::getregset(guard.pid());
-        if out_result.is_err() {
-            let _ = super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes);
-            let _ = super::ptrace::setregset(guard.pid(), &saved_regs);
-        }
-        let out = out_result?;
-        let ret = super::ptrace::get_syscall_return(&out);
-
-        super::ptrace::ptrace_poketext(guard.pid(), scratch_pc, saved_bytes)?;
-        super::ptrace::setregset(guard.pid(), &saved_regs)?;
-
         if (-4095..=-1).contains(&ret) {
             return Err(Error::HookInstallFailed(format!(
                 "bootstrap mmap failed: errno={}",

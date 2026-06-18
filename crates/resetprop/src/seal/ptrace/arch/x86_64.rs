@@ -86,6 +86,29 @@ pub fn get_syscall_return(regs: &UserPtRegs) -> i64 {
     regs.rax as i64
 }
 
+/// Read the syscall number at a syscall-entry stop. The kernel clobbers `rax`
+/// to `-ENOSYS` on entry and preserves the real number in `orig_rax`, so the
+/// snoop reads `orig_rax` rather than the injection-side `rax`.
+#[inline]
+pub fn syscall_nr(regs: &UserPtRegs) -> u64 {
+    regs.orig_rax
+}
+
+/// Read syscall argument `n` (`0..6` → `rdi, rsi, rdx, r10, r8, r9`) at a
+/// syscall-entry stop.
+#[inline]
+pub fn nth_syscall_arg(regs: &UserPtRegs, n: usize) -> u64 {
+    match n {
+        0 => regs.rdi,
+        1 => regs.rsi,
+        2 => regs.rdx,
+        3 => regs.r10,
+        4 => regs.r8,
+        5 => regs.r9,
+        _ => panic!("syscall arg index {n} out of range (0..6)"),
+    }
+}
+
 /// Point the program counter (`rip`) at `pc` without touching the syscall
 /// registers. Used by the trampoline i-cache-sync path, which resumes the
 /// tracee at a staged instruction blob and exchanges no syscall arguments.

@@ -61,6 +61,22 @@ pub fn get_syscall_return(regs: &UserPtRegs) -> i64 {
     regs.uregs[0] as i32 as i64
 }
 
+/// Read the syscall number (`r7` = `uregs[7]`) at a syscall-entry stop.
+#[inline]
+pub fn syscall_nr(regs: &UserPtRegs) -> u64 {
+    regs.uregs[7] as u64
+}
+
+/// Read syscall argument `n` (`0..6` → `r0..r5` = `uregs[0..6]`) at a
+/// syscall-entry stop.
+#[inline]
+pub fn nth_syscall_arg(regs: &UserPtRegs, n: usize) -> u64 {
+    match n {
+        0..=5 => regs.uregs[n] as u64,
+        _ => panic!("syscall arg index {n} out of range (0..6)"),
+    }
+}
+
 /// Point the program counter (`uregs[15]`) at `pc` (truncated to the 32-bit
 /// register width) without touching the syscall registers. Used by the
 /// trampoline i-cache-sync path, which resumes the tracee at a staged

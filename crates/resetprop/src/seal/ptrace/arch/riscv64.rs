@@ -90,6 +90,27 @@ pub fn get_syscall_return(regs: &UserPtRegs) -> i64 {
     regs.a0 as i64
 }
 
+/// Read the syscall number (`a7`) at a syscall-entry stop. Provided for facade
+/// totality; the riscv64 runtime path is deferred (see module note).
+#[inline]
+pub fn syscall_nr(regs: &UserPtRegs) -> u64 {
+    regs.a7
+}
+
+/// Read syscall argument `n` (`0..6` → `a0..a5`) at a syscall-entry stop.
+#[inline]
+pub fn nth_syscall_arg(regs: &UserPtRegs, n: usize) -> u64 {
+    match n {
+        0 => regs.a0,
+        1 => regs.a1,
+        2 => regs.a2,
+        3 => regs.a3,
+        4 => regs.a4,
+        5 => regs.a5,
+        _ => panic!("syscall arg index {n} out of range (0..6)"),
+    }
+}
+
 /// Point the program counter (`pc`) at `pc` without touching the syscall
 /// registers. Provided for facade totality; the riscv64 runtime seal path is
 /// deferred (see module note), so this is not exercised against a live tracee.

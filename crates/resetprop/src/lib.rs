@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const PROP_DIR: &str = "/dev/__properties__";
 
@@ -795,13 +795,14 @@ impl PropSystem {
     ///    `set_init` otherwise). Runs BEFORE any ptrace work so a
     ///    misconfigured context fails fast.
     /// 3. Lazily initialise the shared `HookHandle` under the per-process
-    ///    `OnceLock<Mutex<Option<HookHandle>>>`. `install_init_hook` walks
-    ///    init's `/proc/1/maps` + libc ELF, then `install_trampoline`
-    ///    patches the 16-byte prologue. A failure between the two leaves
-    ///    the slot `None` so the next `seal()` can retry cleanly.
-    /// 4. `seal::hook::seal_prop(handle, name)` appends the name under the
-    ///    hook's atomic-append invariant (entry bytes → trailing sentinel
-    ///    → length counter).
+    ///    `OnceLock<Mutex<Option<HookHandle>>>`. The first seal runs
+    ///    `install_and_seal_first`, which walks init's `/proc/1/maps` + libc
+    ///    ELF, patches the 16-byte prologue, and appends the name — all under
+    ///    one thread-group stop (audit M5). A failure leaves the slot `None`
+    ///    so the next `seal()` can retry cleanly.
+    /// 4. Subsequent seals call `seal::hook::seal_prop(handle, name)` to append
+    ///    the name under the hook's atomic-append invariant (entry bytes →
+    ///    trailing sentinel → length counter).
     /// 5. Record the operation in the process-wide `seals_registry()` as
     ///    `SealTier::Prop`; existing entries with the same `(name, tier)`
     ///    have their timestamp refreshed rather than duplicated.
@@ -828,14 +829,24 @@ impl PropSystem {
             poisoned.into_inner()
         });
         if guard.is_none() {
-            let mut handle = seal::hook::install_init_hook(seal::INIT_PID)?;
-            seal::hook::install_trampoline(&mut handle)?;
-            *guard = Some(handle);
+            // First seal: install + trampoline + first append under one
+            // thread-group stop on init (audit M5). The handle is recorded
+            // whenever the trampoline went live — even if the append failed —
+            // so a retry appends against the live hook instead of re-installing
+            // over already-trampolined init.
+            match seal::hook::install_and_seal_first(seal::INIT_PID, name)? {
+                seal::hook::FirstSeal::Sealed(handle) => *guard = Some(handle),
+                seal::hook::FirstSeal::InstalledNotSealed(handle, e) => {
+                    *guard = Some(handle);
+                    return Err(e);
+                }
+            }
+        } else {
+            let handle = guard
+                .as_mut()
+                .expect("hook handle present: slot is Some on this branch");
+            seal::hook::seal_prop(handle, name)?;
         }
-        let handle = guard
-            .as_mut()
-            .expect("hook handle initialised above or was already present");
-        seal::hook::seal_prop(handle, name)?;
         drop(guard);
 
         let record = SealRecord {
@@ -877,6 +888,26 @@ impl PropSystem {
             entries.retain(|r| !(r.name == name && r.tier == SealTier::Prop));
         }
         Ok(removed)
+    }
+
+    /// Observe-init: trace init (PID 1) for `duration`, mirroring every
+    /// `write(2)` it makes to a `/dev/kmsg` fd to `sink`. Returns the number
+    /// of kmsg lines captured.
+    ///
+    /// Read-only with respect to init's memory: it single-steps the leader
+    /// with `PTRACE_SYSCALL` for the window, surfacing the kernel-log lines
+    /// init emits (e.g. while applying a property set) for diagnostics.
+    /// AArch64-only, matching the seal subsystem's syscall-number convention;
+    /// other arches return [`Error::Unsupported`].
+    pub fn observe_init(&self, duration: Duration, sink: &mut dyn std::io::Write) -> Result<usize> {
+        require_aarch64()?;
+        let kmsg_fds = seal::kmsg_observer::discover_kmsg_fds(seal::INIT_PID);
+        seal::kmsg_observer::snoop_kmsg_writes_for_duration(
+            seal::INIT_PID,
+            &kmsg_fds,
+            duration,
+            sink,
+        )
     }
 
     /// Returns a snapshot of the process-wide seal registry. The returned

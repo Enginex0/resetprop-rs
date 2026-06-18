@@ -30,13 +30,19 @@ use std::io;
 use libc::{c_int, c_void, iovec, process_vm_readv, process_vm_writev};
 
 pub use arch::active::{
-    get_syscall_return, set_pc, set_syscall_args, UserPtRegs, BRK_INSN, NT_PRSTATUS_SIZE, TRAP_INSN,
+    get_syscall_return, nth_syscall_arg, set_pc, set_syscall_args, syscall_nr, UserPtRegs,
+    BRK_INSN, NT_PRSTATUS_SIZE, TRAP_INSN,
 };
 
 // PTRACE request numbers — from bionic/libc/kernel/uapi/linux/ptrace.h
 
 /// `PTRACE_CONT` — resume a stopped tracee. source: linux/ptrace.h:17
 pub const PTRACE_CONT: c_int = 7;
+
+/// `PTRACE_SYSCALL` — resume a stopped tracee, stopping again at the next
+/// syscall entry or exit. Drives the observe-init kmsg snoop's single-step
+/// across init's syscall boundaries. source: linux/ptrace.h:18
+pub const PTRACE_SYSCALL: c_int = 24;
 
 /// `PTRACE_DETACH` — detach from tracee. source: linux/ptrace.h:21
 pub const PTRACE_DETACH: c_int = 17;
@@ -79,6 +85,16 @@ pub const PTRACE_O_TRACESYSGOOD: c_int = 1;
 /// PTRACE_INTERRUPT` group-stop. Distinct from brk-trap (event == 0).
 /// source: linux/ptrace.h:99
 pub const PTRACE_EVENT_STOP: u32 = 128;
+
+/// `PTRACE_GET_SYSCALL_INFO` — report whether the current syscall-stop is the
+/// entry or the exit (and, in its tail, the syscall number / args). The snoop
+/// consumes only the leading `op` byte, so the variable `union` tail never has
+/// to be modelled. source: linux/ptrace.h:104 (Linux 5.3+)
+pub const PTRACE_GET_SYSCALL_INFO: c_int = 0x420e;
+
+/// `PTRACE_SYSCALL_INFO_ENTRY` — the `op` value flagging a syscall-entry stop
+/// in [`PTRACE_GET_SYSCALL_INFO`]. source: linux/ptrace.h:108
+pub const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
 
 /// `NT_PRSTATUS` — note type selecting general-purpose regs for REGSET ops.
 /// source: linux/elf.h:301
@@ -365,6 +381,56 @@ pub fn ptrace_detach(pid: Pid) -> Result<()> {
     Ok(())
 }
 
+/// `PTRACE_SYSCALL` — resume `pid` until its next syscall entry/exit stop,
+/// delivering `sig` to the tracee (`0` = none). The observe-init snoop passes
+/// `0` to step across a syscall boundary and the pending signal number to
+/// forward a signal-delivery stop, so init's own signal handling is preserved
+/// while it is traced.
+pub fn ptrace_syscall(pid: Pid, sig: c_int) -> Result<()> {
+    // SAFETY: `libc::ptrace` FFI; `addr` is NULL per PTRACE_SYSCALL, `data`
+    // carries the signal to inject (integer-in-pointer, standard pattern). The
+    // tracee is ptrace-stopped (caller just observed a stop), so the resume is
+    // legal.
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_SYSCALL as _,
+            pid,
+            std::ptr::null_mut::<c_void>(),
+            sig as *mut c_void,
+        )
+    };
+    if rc == -1 {
+        return Err(last_ptrace_op_err());
+    }
+    Ok(())
+}
+
+/// Read the `op` discriminant of [`PTRACE_GET_SYSCALL_INFO`] for the tracee's
+/// current syscall-stop: [`PTRACE_SYSCALL_INFO_ENTRY`] vs the exit value.
+///
+/// Only the first byte (`op`, offset 0, stable across kernel versions) is
+/// requested, so the variable `union` tail — awkward to mirror and not needed
+/// here — is never read. The snoop reads register values through the
+/// size-asserted [`getregset`] facade instead.
+pub fn syscall_stop_op(pid: Pid) -> Result<u8> {
+    let mut op: u8 = 0;
+    // SAFETY: `libc::ptrace` FFI. For PTRACE_GET_SYSCALL_INFO `addr` is the
+    // destination buffer size (1 byte) and `data` points at that buffer; the
+    // kernel writes `min(addr, available)` bytes, so exactly `op` is filled.
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_GET_SYSCALL_INFO as _,
+            pid,
+            std::ptr::without_provenance_mut::<c_void>(1),
+            &mut op as *mut u8 as *mut c_void,
+        )
+    };
+    if rc == -1 {
+        return Err(last_ptrace_op_err());
+    }
+    Ok(op)
+}
+
 // Thread-group stop — T15 / Defect B (freeze every init thread before any poke)
 
 /// Upper bound on re-scan passes before a thread group is declared
@@ -378,7 +444,7 @@ const MAX_GROUP_SCAN_PASSES: u32 = 8;
 /// `ESRCH` from seize/interrupt/detach and a thread-exit wait status surfaced by
 /// [`wait_stop`] as [`Error::PtraceUnexpectedStatus`]. Per-tid `ESRCH` tolerance
 /// (T15): such a tid is skipped, never a hard error.
-fn is_thread_gone(err: &Error) -> bool {
+pub(crate) fn is_thread_gone(err: &Error) -> bool {
     match err {
         Error::PtraceAttach(e) | Error::PtraceOp(e) => e.raw_os_error() == Some(libc::ESRCH),
         Error::PtraceUnexpectedStatus(status) => {
@@ -754,172 +820,54 @@ pub(crate) unsafe fn write_remote(pid: Pid, remote_addr: u64, buf: &[u8]) -> Res
     Ok(())
 }
 
-// remote_syscall — stage `svc #0 ; brk #0` and run one syscall in the tracee
+// run_remote_payload — the single staged-trap injector skeleton
 
-/// Execute `syscall_no(args...)` inside `pid` by staging an 8-byte
-/// `svc #0 ; brk #0` blob at `scratch_pc`, resuming until the `brk` traps,
-/// and reading `x0` back.
+/// Run one staged-payload trap in the tracee under a live ptrace stop.
 ///
-/// Caller must have already:
-/// - invoked [`ptrace_seize`] + [`ptrace_interrupt`] on `pid`;
-/// - consumed the initial SEIZE stop via [`wait_stop`];
-/// - ensured `scratch_pc` is 4-byte aligned and points inside an executable
-///   mapping in the tracee with at least 8 bytes of readable+writable+
-///   executable room (typically a bootstrap `mmap` page or a located libc
-///   padding region, per linux-arm64-abi.md §8).
+/// Saves the word at `scratch_pc`, POKEs `payload` (a two-instruction blob
+/// packed low-half | high-half, the high half always a `brk` so the tracee
+/// re-traps), snapshots the registers, applies `setup` to a work copy, resumes
+/// with `PTRACE_CONT`, waits for the `brk`, then restores the registers and the
+/// scratch word. Returns the post-trap register snapshot for the caller to
+/// decode (or ignore, for a pure-instruction payload).
 ///
-/// Returns the raw `x0` as `i64`; values in `-4095..=-1` are `-errno`.
-///
-/// # Safety
-///
-/// Caller guarantees (a) the tracee is ptrace-stopped at entry, (b)
-/// `scratch_pc` satisfies the alignment/mapping contract above, and (c) no
-/// other thread in the tracee is racing on those 8 bytes.
-pub unsafe fn remote_syscall(
-    pid: Pid,
-    scratch_pc: u64,
-    syscall_no: u64,
-    args: [u64; 6],
-) -> Result<i64> {
-    // Payload: trap-then-breakpoint little-endian. Derived from the two
-    // arch-neutral instruction constants so the encoding cannot drift from
-    // the per-arch ISA citations.
-    let trap_bytes = TRAP_INSN.to_le_bytes();
-    let brk_bytes = BRK_INSN.to_le_bytes();
-    let mut payload = [0u8; 8];
-    payload[..4].copy_from_slice(&trap_bytes);
-    payload[4..].copy_from_slice(&brk_bytes);
-
-    // (§7 step 2) Save the 8 bytes we are about to clobber.
-    let mut saved_bytes = [0u8; 8];
-    // SAFETY: forwards caller's `scratch_pc` readability guarantee.
-    unsafe { read_remote(pid, scratch_pc, &mut saved_bytes)? };
-
-    // (§7 step 3) Stage the trap+brk blob.
-    // SAFETY: forwards caller's `scratch_pc` writability guarantee.
-    unsafe { write_remote(pid, scratch_pc, &payload)? };
-
-    // (§7 step 4) Snapshot registers so we can restore on exit.
-    let saved_regs = getregset(pid)?;
-
-    // (§7 step 5) Build the work register set via the arch-neutral interface:
-    // pc=scratch, syscall-number register, arg registers. Stack/flags/link
-    // are left untouched — the kernel uses its own stack across the trap.
-    let mut work = saved_regs;
-    set_syscall_args(&mut work, scratch_pc, syscall_no, args);
-
-    // (§7 step 6) Install the work regs, then resume.
-    setregset(pid, &work)?;
-
-    // SAFETY: `libc::ptrace` FFI. `addr`/`data` are NULL per PTRACE_CONT
-    // contract. Tracee is guaranteed ptrace-stopped by the function's own
-    // safety contract, so a CONT is legal here.
-    let rc = unsafe {
-        libc::ptrace(
-            PTRACE_CONT as _,
-            pid,
-            std::ptr::null_mut::<c_void>(),
-            std::ptr::null_mut::<c_void>(),
-        )
-    };
-    if rc == -1 {
-        // Best-effort restore before propagating: libc.text (or whichever
-        // scratch VMA the caller picked) must not retain live svc+brk, and
-        // the tracee's saved regs must not remain in work-state. Any error
-        // here is discarded — the original cause is more informative.
-        // SAFETY: forwards caller's `scratch_pc` writability guarantee.
-        let _ = unsafe { write_remote(pid, scratch_pc, &saved_bytes) };
-        let _ = setregset(pid, &saved_regs);
-        return Err(last_ptrace_op_err());
-    }
-
-    // (§7 step 7) Wait for the brk trap. `wait_stop` verifies
-    // `WIFSTOPPED && WSTOPSIG == SIGTRAP && event == 0` atomically per its
-    // contract — group-stops (event=128) and syscall-stops (signal=0x85) are
-    // rejected as `Error::PtraceUnexpectedStatus`.
-    let wait_result = wait_stop(pid, 0);
-    if wait_result.is_err() {
-        // SAFETY: forwards caller's `scratch_pc` writability guarantee.
-        let _ = unsafe { write_remote(pid, scratch_pc, &saved_bytes) };
-        let _ = setregset(pid, &saved_regs);
-    }
-    wait_result?;
-
-    // (§7 step 8) Read the syscall return register from the post-trap state.
-    let out_result = getregset(pid);
-    if out_result.is_err() {
-        // SAFETY: forwards caller's `scratch_pc` writability guarantee.
-        let _ = unsafe { write_remote(pid, scratch_pc, &saved_bytes) };
-        let _ = setregset(pid, &saved_regs);
-    }
-    let out = out_result?;
-    let ret = get_syscall_return(&out);
-
-    // (§7 step 9) Restore in order: regs first (so pc points back at the
-    // caller's resume address), then the scratch bytes (so a subsequent
-    // `remote_syscall` invocation sees pristine memory to clobber).
-    setregset(pid, &saved_regs)?;
-    // SAFETY: forwards caller's `scratch_pc` writability guarantee.
-    unsafe { write_remote(pid, scratch_pc, &saved_bytes)? };
-
-    Ok(ret)
-}
-
-// remote_syscall_via_poke — same as remote_syscall, but PEEK/POKEDATA scratch
-
-/// Execute `syscall_no(args...)` inside `pid` by staging an 8-byte
-/// `svc #0 ; brk #0` blob at `scratch_pc` via [`ptrace_peektext`] /
-/// [`ptrace_poketext`] (word-granularity PEEK/POKEDATA) rather than
-/// [`read_remote`] / [`write_remote`] (process_vm_readv/writev).
-///
-/// Rationale: `process_vm_writev` respects VMA write bits and EFAULTs on
-/// `r-xp` libc.text; `PTRACE_POKEDATA` bypasses the write bit via the
-/// `ptrace_access_vm` kernel path. Use this variant when `scratch_pc` lives
-/// inside a libc.text NOP slide (i.e. always, in P02's post-bootstrap flow).
-///
-/// Behavior and return semantics are otherwise identical to
-/// [`remote_syscall`] — caller contract matches verbatim.
+/// Every error path after the POKE issues a best-effort restore of both the
+/// scratch word and the saved registers before propagating, so libc.text is
+/// never left holding a live `…; brk` blob and the tracee never detaches with
+/// its registers in work-state. This is the one skeleton behind
+/// [`remote_syscall_via_poke`] (syscall payload) and
+/// `super::hook::execute_remote_isb` (instruction payload); keeping it single
+/// is what closed the Defect-A drift surface where four near-identical copies
+/// disagreed on the trap constant.
 ///
 /// # Safety
 ///
-/// Caller guarantees (a) the tracee is ptrace-stopped at entry, (b)
-/// `scratch_pc` is 4-byte aligned and points inside an executable mapping
-/// with at least 8 bytes of readable+executable room, (c) no other thread
-/// in the tracee is racing on those 8 bytes. Unlike [`remote_syscall`] the
-/// scratch VMA does NOT need to be writable: PEEK/POKEDATA bypass VMA
-/// write bits, so an `r-xp` libc.text NOP slide is a legal target.
-pub(crate) unsafe fn remote_syscall_via_poke(
+/// Caller holds the tracee ptrace-stopped (typically a `RemoteAttach`);
+/// `scratch_pc` is 4-byte aligned and points inside an executable mapping with
+/// at least 8 bytes of room, and no other thread races those 8 bytes.
+/// PEEK/POKEDATA bypasses VMA write bits, so an `r-xp` libc.text NOP slide is a
+/// legal `scratch_pc`.
+pub(crate) unsafe fn run_remote_payload(
     pid: Pid,
     scratch_pc: u64,
-    syscall_no: u64,
-    args: [u64; 6],
-) -> Result<i64> {
-    // Payload: trap-then-breakpoint little-endian packed into one 64-bit word
-    // (low half = `TRAP_INSN`, high half = `BRK_INSN`). Same byte pattern as
-    // [`remote_syscall`]; construction differs only in transport.
-    let trap_brk: u64 = (TRAP_INSN as u64) | ((BRK_INSN as u64) << 32);
-
+    payload: u64,
+    setup: impl FnOnce(&mut UserPtRegs),
+) -> Result<UserPtRegs> {
     // Save the 8 bytes we are about to clobber (one PEEKDATA word on LP64).
     let saved_word = ptrace_peektext(pid, scratch_pc)?;
 
-    // Stage the trap+brk blob via POKEDATA — bypasses VMA write bits so the
-    // scratch may be an `r-xp` libc.text NOP slide.
-    ptrace_poketext(pid, scratch_pc, trap_brk)?;
+    // Stage the payload via POKEDATA — bypasses VMA write bits so the scratch
+    // may be an `r-xp` libc.text NOP slide.
+    ptrace_poketext(pid, scratch_pc, payload)?;
 
-    // Snapshot registers so we can restore on exit.
+    // Snapshot registers so we can restore on exit, then build the work set.
     let saved_regs = getregset(pid)?;
-
-    // Build the work register set via the arch-neutral interface: pc=scratch,
-    // syscall-number register, arg registers. Stack/flags/link are left
-    // untouched — the kernel uses its own stack across the trap.
     let mut work = saved_regs;
-    set_syscall_args(&mut work, scratch_pc, syscall_no, args);
-
-    // Install the work regs, then resume.
+    setup(&mut work);
     setregset(pid, &work)?;
 
-    // SAFETY: `libc::ptrace` FFI. `addr`/`data` are NULL per PTRACE_CONT
-    // contract. Tracee is guaranteed ptrace-stopped by the function's own
+    // SAFETY: `libc::ptrace` FFI. `addr`/`data` are NULL per the PTRACE_CONT
+    // contract. The tracee is guaranteed ptrace-stopped by this function's
     // safety contract, so a CONT is legal here.
     let rc = unsafe {
         libc::ptrace(
@@ -930,11 +878,10 @@ pub(crate) unsafe fn remote_syscall_via_poke(
         )
     };
     if rc == -1 {
-        // Best-effort restore before propagating: libc.text must not retain
-        // live trap+brk at scratch_pc, and the tracee's saved regs must not
-        // remain in work-state (pc=scratch_pc, syscall register set).
-        // Otherwise RemoteAttach::drop detaches init into a poisoned state and
-        // the next thread scheduled at scratch_pc traps on the breakpoint.
+        // Best-effort restore before propagating: scratch must not retain the
+        // live payload, and the saved regs must not remain in work-state, or
+        // RemoteAttach::drop detaches the tracee into a poisoned state and the
+        // next thread scheduled at scratch_pc traps on the breakpoint.
         let _ = ptrace_poketext(pid, scratch_pc, saved_word);
         let _ = setregset(pid, &saved_regs);
         return Err(last_ptrace_op_err());
@@ -949,22 +896,60 @@ pub(crate) unsafe fn remote_syscall_via_poke(
     }
     wait_result?;
 
-    // Read the syscall return register from the post-trap state.
+    // Read the post-trap register state for the caller to decode.
     let out_result = getregset(pid);
     if out_result.is_err() {
         let _ = ptrace_poketext(pid, scratch_pc, saved_word);
         let _ = setregset(pid, &saved_regs);
     }
     let out = out_result?;
-    let ret = get_syscall_return(&out);
 
-    // Restore in order: regs first (so pc points back at the caller's resume
-    // address), then the scratch word (so a subsequent
-    // `remote_syscall_via_poke` sees pristine memory to clobber).
-    setregset(pid, &saved_regs)?;
-    ptrace_poketext(pid, scratch_pc, saved_word)?;
+    // Restore regs first (so pc points back at the caller's resume address),
+    // then the scratch word. Capture both results before the first `?` so a
+    // reg-restore failure still triggers the scratch-word restore.
+    let reg_res = setregset(pid, &saved_regs);
+    let poke_res = ptrace_poketext(pid, scratch_pc, saved_word);
+    reg_res?;
+    poke_res?;
 
-    Ok(ret)
+    Ok(out)
+}
+
+// remote_syscall_via_poke — syscall specialization of run_remote_payload
+
+/// Execute `syscall_no(args...)` inside `pid` by staging `svc #0 ; brk #0` at
+/// `scratch_pc` and decoding the syscall return register from the post-trap
+/// snapshot.
+///
+/// Returns the raw return register as `i64`; values in `-4095..=-1` are
+/// `-errno`. The scratch VMA need not be writable: PEEK/POKEDATA bypass VMA
+/// write bits, so an `r-xp` libc.text NOP slide is a legal target.
+///
+/// # Safety
+///
+/// Same contract as [`run_remote_payload`]: tracee ptrace-stopped at entry,
+/// `scratch_pc` 4-byte aligned and inside an executable mapping with at least
+/// 8 bytes of room, no other thread racing those 8 bytes.
+pub unsafe fn remote_syscall_via_poke(
+    pid: Pid,
+    scratch_pc: u64,
+    syscall_no: u64,
+    args: [u64; 6],
+) -> Result<i64> {
+    // trap (low 4 bytes) ; brk (high 4 bytes), little-endian pack.
+    let payload: u64 = (TRAP_INSN as u64) | ((BRK_INSN as u64) << 32);
+
+    // SAFETY: forwards this function's caller contract (tracee stopped,
+    // `scratch_pc` aligned + executable, no racing thread) to the shared
+    // skeleton; `set_syscall_args` stages pc + syscall-number + arg registers
+    // through the arch-neutral facade.
+    let out = unsafe {
+        run_remote_payload(pid, scratch_pc, payload, |work| {
+            set_syscall_args(work, scratch_pc, syscall_no, args);
+        })?
+    };
+
+    Ok(get_syscall_return(&out))
 }
 
 // Unit tests

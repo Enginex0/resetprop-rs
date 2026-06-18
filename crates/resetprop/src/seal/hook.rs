@@ -35,8 +35,7 @@ use crate::seal::arena::{
 };
 use crate::seal::maps::MapEntry;
 use crate::seal::ptrace::{
-    getregset, ptrace_peektext, ptrace_poketext, read_remote, remote_syscall_via_poke, set_pc,
-    setregset, wait_stop, write_remote, PTRACE_CONT,
+    ptrace_poketext, read_remote, remote_syscall_via_poke, run_remote_payload, set_pc, write_remote,
 };
 
 // Stage-B constants (REGISTRY §1 canonical flag values)
@@ -178,6 +177,10 @@ pub struct HookHandle {
     /// on every property update. P04 reverts the trampoline and unmaps
     /// both pages explicitly before the handle is dropped.
     pub(crate) trampoline_installed: bool,
+    /// `/dev/kmsg` file descriptors init held open at install time, discovered
+    /// from `/proc/<pid>/fd` (Port 2). The observe-init snoop reads these to
+    /// recognise `write(kmsg_fd, …)` traffic among init's syscalls.
+    pub(crate) kmsg_fds: Vec<u64>,
 }
 
 /// Predicate picking the executable `libc.so` mapping out of a parsed maps file.
@@ -205,9 +208,11 @@ pub(crate) fn find_libc_text_row(entries: &[MapEntry]) -> Option<&MapEntry> {
 /// Stage-A of the hook install pipeline — RUN UNDER ATTACH.
 ///
 /// Returns `(libc_base, libc_end, target_fn)` where `libc_base` / `libc_end`
-/// are the `r-xp` row's `start` / `end` addresses and
-/// `target_fn = libc_base + st_value("__system_property_update")`
-/// (ET_DYN runtime math per references/android-libc-elf.md §7).
+/// are the `r-xp` row's `start` / `end` addresses and `target_fn` is
+/// `__system_property_update` resolved against the ELF load bias
+/// (`libc_base - r-xp file offset`), not against `libc_base` itself — the
+/// executable segment is mapped at a non-zero file offset (ET_DYN runtime math
+/// per references/android-libc-elf.md §7).
 ///
 /// This MUST be called while the caller holds a live `RemoteAttach` on
 /// `pid`. Every stage-A observation — `/proc/<pid>/maps`, the libc row,
@@ -229,6 +234,7 @@ fn stage_a_locked(pid: libc::pid_t) -> Result<(u64, u64, u64)> {
 
     let libc_base = libc_row.start;
     let libc_end = libc_row.end;
+    let libc_text_offset = libc_row.offset;
 
     // Some Android kernels (observed on Xiaomi 2409BRN2CA, Android 15, kernel
     // 6.6.58) expose /proc/<pid>/map_files at VMA granularity while
@@ -263,7 +269,17 @@ fn stage_a_locked(pid: libc::pid_t) -> Result<(u64, u64, u64)> {
     let st_value = seal::elf::resolve_symbol(&view, "__system_property_update")
         .map_err(|e| Error::HookInstallFailed(format!("stage-A: resolve_symbol: {e}")))?;
 
-    let target_fn = libc_base
+    // A symbol's st_value is a vaddr relative to the ELF load bias, not to the
+    // executable segment's mapped start. bionic's libc maps its r-xp segment at
+    // a non-zero file offset (0x44000 on Android 15 bootstrap libc), and for
+    // these page-aligned PT_LOADs p_vaddr == p_offset, so the load bias is the
+    // segment's mapped start minus that file offset. Adding st_value to
+    // libc_base directly overshoots by the file offset and lands the trampoline
+    // in a neighbouring function.
+    let load_bias = libc_base
+        .checked_sub(libc_text_offset)
+        .ok_or_else(|| Error::HookInstallFailed("stage-A: libc load bias underflow".into()))?;
+    let target_fn = load_bias
         .checked_add(st_value)
         .ok_or_else(|| Error::HookInstallFailed("stage-A: target_fn overflow".into()))?;
 
@@ -369,12 +385,31 @@ fn install_init_hook_inner(pid: libc::pid_t) -> Result<HookHandle> {
     // M1: reject a non-init PID-1 stand-in before attaching or poking.
     seal::arena::verify_init_identity(pid)?;
 
-    let guard = seal::arena::RemoteAttach::new(pid)
+    let attach = seal::arena::RemoteAttach::new(pid)
         .map_err(|e| Error::HookInstallFailed(format!("stage-B: attach: {e}")))?;
+
+    let handle = install_init_hook_locked(&attach)?;
+
+    attach
+        .detach()
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: detach: {e}")))?;
+
+    Ok(handle)
+}
+
+/// Stage-B install body under a caller-held [`RemoteAttach`].
+///
+/// The attach/detach lives in the caller so the first-seal path
+/// ([`install_and_seal_first`]) can run install + trampoline + first append
+/// under one thread-group stop (audit M5) instead of three. The identity guard
+/// and the per-boot throttle stay in the public wrappers; this body assumes a
+/// live, identity-checked attach on init.
+fn install_init_hook_locked(attach: &seal::arena::RemoteAttach) -> Result<HookHandle> {
+    let pid = attach.pid();
 
     let (libc_base, libc_end, target_fn) = stage_a_locked(pid)?;
 
-    // SAFETY: `guard` holds the tracee ptrace-stopped; `libc_base..libc_end`
+    // SAFETY: `attach` holds the tracee ptrace-stopped; `libc_base..libc_end`
     // is the `r-xp` row just returned by stage-A on the same process.
     let scratch_pc = unsafe { derive_libc_scratch_pc(pid, libc_base, libc_end) }?;
 
@@ -391,18 +426,13 @@ fn install_init_hook_inner(pid: libc::pid_t) -> Result<HookHandle> {
 
     let body_bytes = build_hook_body_bytes(saved_prologue, lock_list_page, target_fn + 16);
 
-    let hook_page =
-        match install_memfd_hook_page(pid, scratch_pc, lock_list_page, &body_bytes) {
-            Ok(addr) => addr,
-            Err(e) => {
-                best_effort_remote_munmap(pid, scratch_pc, lock_list_page);
-                return Err(e);
-            }
-        };
-
-    guard
-        .detach()
-        .map_err(|e| Error::HookInstallFailed(format!("stage-B: detach: {e}")))?;
+    let hook_page = match install_memfd_hook_page(pid, scratch_pc, lock_list_page, &body_bytes) {
+        Ok(addr) => addr,
+        Err(e) => {
+            best_effort_remote_munmap(pid, scratch_pc, lock_list_page);
+            return Err(e);
+        }
+    };
 
     Ok(HookHandle {
         pid,
@@ -415,7 +445,105 @@ fn install_init_hook_inner(pid: libc::pid_t) -> Result<HookHandle> {
         libc_end,
         scratch_pc,
         trampoline_installed: false,
+        kmsg_fds: seal::kmsg_observer::discover_kmsg_fds(pid),
     })
+}
+
+/// Outcome of [`install_and_seal_first`].
+///
+/// Once [`install_trampoline_locked`] flips the trampoline live, init is
+/// modified and the handle MUST be recorded by the caller — even if the first
+/// append then fails — so the next seal retries the append against the live
+/// hook instead of re-installing over already-trampolined init. A re-install
+/// would snapshot the trampoline itself as the "original" prologue (see
+/// `write_sentinel_and_snapshot_prologue`) and corrupt the restore path.
+pub(crate) enum FirstSeal {
+    /// Hook installed and the first property appended to the lock list.
+    Sealed(HookHandle),
+    /// Hook installed (trampoline live) but the first append failed. The caller
+    /// must still record the handle; the `Error` is the append failure to
+    /// surface to the user.
+    InstalledNotSealed(HookHandle, Error),
+}
+
+/// Install the per-prop hook AND seal the first property under one
+/// thread-group stop on `pid` (audit M5).
+///
+/// The seal orchestrator used to issue three separate SEIZE/INTERRUPT/DETACH
+/// cycles on PID 1 for the first seal — one each for [`install_init_hook`],
+/// [`install_trampoline`], and [`seal_prop`]. Folding them under a single
+/// [`RemoteAttach`] shrinks the interval init's siblings spend frozen and the
+/// number of attach/detach races on PID 1. Subsequent seals (hook already
+/// installed) keep using [`seal_prop`] with its own short window.
+///
+/// The per-boot install throttle counts failures to *install* the hook
+/// (identity, attach, stage-A, trampoline) — the steps that can bootloop init —
+/// so a load that bootloops the trampoline patch cannot be retried into the
+/// ground. A failure of only the first append does NOT count: the hook is
+/// installed and returned via [`FirstSeal::InstalledNotSealed`] so the next
+/// seal retries the append.
+pub(crate) fn install_and_seal_first(pid: libc::pid_t, name: &str) -> Result<FirstSeal> {
+    if name.as_bytes().contains(&0) {
+        return Err(Error::InvalidKey);
+    }
+    if INSTALL_HARD_FAILURES.load(Ordering::Relaxed) >= MAX_INSTALL_HARD_FAILURES {
+        return Err(Error::HookInstallFailed(format!(
+            "install throttled after {MAX_INSTALL_HARD_FAILURES} hard failures this boot"
+        )));
+    }
+    install_and_seal_first_inner(pid, name).inspect_err(|_| {
+        INSTALL_HARD_FAILURES.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+/// Uncounted first-seal body. [`install_and_seal_first`] wraps this with the
+/// per-boot throttle; only an `Err` here (an install failure) advances the
+/// counter — an installed-but-unsealed outcome is `Ok`.
+fn install_and_seal_first_inner(pid: libc::pid_t, name: &str) -> Result<FirstSeal> {
+    // M1: reject a non-init PID-1 stand-in before attaching or poking.
+    seal::arena::verify_init_identity(pid)?;
+
+    let attach = seal::arena::RemoteAttach::new(pid)
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: attach: {e}")))?;
+
+    // Phase 1a — install the hook page. On failure `install_init_hook_locked`
+    // has already freed its own partial mappings; nothing to preserve.
+    let mut handle = match install_init_hook_locked(&attach) {
+        Ok(handle) => handle,
+        Err(e) => {
+            if let Err(detach_err) = attach.detach() {
+                eprintln!("resetprop: detach after first-seal install error failed: {detach_err}");
+            }
+            return Err(e);
+        }
+    };
+
+    // Phase 1b — patch the trampoline. On failure it has reverted its own
+    // partial write, so init is unmodified. Detach FIRST so the dropped
+    // handle's `drop_best_effort` can re-attach and free the two install pages
+    // (its nested attach would fail if init were still seized here), then
+    // propagate the `Err` (which the throttle counts).
+    if let Err(e) = install_trampoline_locked(&attach, &mut handle) {
+        if let Err(detach_err) = attach.detach() {
+            eprintln!("resetprop: detach after first-seal trampoline error failed: {detach_err}");
+        }
+        return Err(e);
+    }
+
+    // Phase 2 — first append. The trampoline is live now, so the handle MUST
+    // reach the caller regardless of the append outcome; a lost handle here
+    // would make the next seal re-install over trampolined init. Detach runs
+    // unconditionally so init is never left stopped; a detach failure (init
+    // frozen) outranks the append result and surfaces as a hard `Err`.
+    let append = seal_prop_locked(&attach, &mut handle, name);
+    attach
+        .detach()
+        .map_err(|e| Error::HookInstallFailed(format!("stage-B: detach: {e}")))?;
+
+    match append {
+        Ok(()) => Ok(FirstSeal::Sealed(handle)),
+        Err(e) => Ok(FirstSeal::InstalledNotSealed(handle, e)),
+    }
 }
 
 /// Result of a [`check_init_hook`] dry-run: the stage-A / scratch-slot facts
@@ -1036,21 +1164,16 @@ pub fn build_hook_body_bytes(
 // P04 T3 — trampoline installer + i-cache sync
 
 /// Execute a single `isb` in the tracee by staging `isb ; brk #0` at
-/// `scratch_pc`, flipping `pc`, resuming, waiting for the brk trap, and
-/// restoring the original word and registers.
+/// `scratch_pc` through the shared [`run_remote_payload`] skeleton: it flips
+/// `pc` to the staged blob, resumes, waits for the brk, and restores the
+/// original word and registers (best-effort on every error path).
 ///
-/// Mirrors the structural skeleton of
-/// [`crate::seal::ptrace::remote_syscall_via_poke`] (at `ptrace.rs:627-705`)
-/// but carries an instruction payload rather than a syscall payload — the
-/// tracee never enters the kernel, so there is no `x8`, no args, no `x0`
-/// decode. This is the fallback path for `install_trampoline`'s i-cache
-/// sync when `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)` returns `EINVAL`
-/// (cmd missing) or `EPERM` (registration missing).
-///
-/// Errors after the POKE (wait_stop, regs restore) trigger a best-effort
-/// restore of both the scratch word and the saved registers before the
-/// original cause propagates; this matches the pattern in
-/// `remote_syscall_via_poke` so libc.text is never left poisoned.
+/// Instruction payload, not a syscall: the tracee never enters the kernel, so
+/// there is no syscall-number register, no args, and no return to decode — the
+/// post-trap regs are discarded. This is the fallback path for
+/// `install_trampoline`'s i-cache sync when
+/// `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)` returns `EINVAL` (cmd missing) or
+/// `EPERM` (registration missing), and the i-cache resync on the revert path.
 ///
 /// # Safety
 ///
@@ -1060,47 +1183,11 @@ pub fn build_hook_body_bytes(
 unsafe fn execute_remote_isb(pid: libc::pid_t, scratch_pc: u64) -> Result<()> {
     let payload: u64 = (encoder::ISB_SY as u64) | ((encoder::BRK_0 as u64) << 32);
 
-    let saved_word = ptrace_peektext(pid, scratch_pc)?;
-    ptrace_poketext(pid, scratch_pc, payload)?;
-
-    let saved_regs = getregset(pid)?;
-    let mut work = saved_regs;
-    set_pc(&mut work, scratch_pc);
-    setregset(pid, &work)?;
-
-    // SAFETY: `libc::ptrace` FFI; `addr` / `data` are NULL per PTRACE_CONT
-    // contract; tracee is ptrace-stopped via the caller's RemoteAttach.
-    let rc = unsafe {
-        libc::ptrace(
-            PTRACE_CONT as _,
-            pid,
-            std::ptr::null_mut::<libc::c_void>(),
-            std::ptr::null_mut::<libc::c_void>(),
-        )
-    };
-    if rc == -1 {
-        let _ = ptrace_poketext(pid, scratch_pc, saved_word);
-        let _ = setregset(pid, &saved_regs);
-        return Err(Error::PtraceOp(std::io::Error::last_os_error()));
+    // SAFETY: forwards the caller's RemoteAttach + scratch_pc contract to the
+    // shared injector; `set_pc` is the only register staged (no syscall ABI).
+    unsafe {
+        run_remote_payload(pid, scratch_pc, payload, |work| set_pc(work, scratch_pc))?;
     }
-
-    let wait_result = wait_stop(pid, 0);
-    if wait_result.is_err() {
-        let _ = ptrace_poketext(pid, scratch_pc, saved_word);
-        let _ = setregset(pid, &saved_regs);
-    }
-    wait_result?;
-
-    // Success-path restore is symmetric: capture both results before the
-    // first `?` so that a failure in `setregset` still triggers the
-    // `ptrace_poketext` scratch-word restore. The P02 fix at commit
-    // 910ce69 applied the same pattern to `remote_syscall_via_poke`;
-    // mirroring it here ensures libc.text cannot be left holding the
-    // `isb; brk` staged payload if the reg-restore FFI fails.
-    let reg_res = setregset(pid, &saved_regs);
-    let poke_res = ptrace_poketext(pid, scratch_pc, saved_word);
-    reg_res?;
-    poke_res?;
     Ok(())
 }
 
@@ -1109,10 +1196,16 @@ unsafe fn execute_remote_isb(pid: libc::pid_t, scratch_pc: u64) -> Result<()> {
 /// Called only from `install_trampoline`'s error paths after the 16-byte
 /// trampoline POKE sequence has begun. Restores the original prologue by
 /// decoding `saved_prologue` as two little-endian `u64` words and issuing
-/// two `PTRACE_POKEDATA` writes. Errors are logged via `eprintln!` and
-/// never returned — the caller is already propagating the original cause
-/// and a second error would only obscure it.
-fn revert_trampoline(pid: libc::pid_t, target_fn: u64, saved_prologue: &[u8; 16]) {
+/// two `PTRACE_POKEDATA` writes, then re-syncs the i-cache (L1) so a core
+/// cannot keep running the half-written trampoline still cached against the
+/// just-restored prologue — the same resync `install_trampoline` runs after a
+/// successful write. Errors are logged via `eprintln!` and never returned —
+/// the caller is already propagating the original cause and a second error
+/// would only obscure it.
+///
+/// Caller holds the `RemoteAttach` on `pid` (tracee stopped); `scratch_pc` is
+/// the cached libc.text slot the install used for its own i-cache sync.
+fn revert_trampoline(pid: libc::pid_t, target_fn: u64, scratch_pc: u64, saved_prologue: &[u8; 16]) {
     let lo = u64::from_le_bytes([
         saved_prologue[0],
         saved_prologue[1],
@@ -1138,6 +1231,16 @@ fn revert_trampoline(pid: libc::pid_t, target_fn: u64, saved_prologue: &[u8; 16]
     }
     if let Err(e) = ptrace_poketext(pid, target_fn + 8, hi) {
         eprintln!("resetprop: revert_trampoline hi word failed: {e}");
+    }
+    // L1: the writes above restore the prologue bytes, but a core may still
+    // hold the half-written trampoline in its i-cache; resync so it re-fetches
+    // the restored prologue. Best-effort — the caller propagates the original
+    // failure.
+    // SAFETY: `pid` is ptrace-stopped under the caller's RemoteAttach (this fn
+    // runs only on `install_trampoline`'s in-attach error path); `scratch_pc`
+    // is the libc.text slot the install used for its own membarrier/ISB sync.
+    if let Err(e) = unsafe { execute_remote_isb(pid, scratch_pc) } {
+        eprintln!("resetprop: revert_trampoline i-cache resync failed: {e}");
     }
 }
 
@@ -1203,15 +1306,43 @@ fn verify_trampoline_readback(word_lo: u64, word_hi: u64, readback: &[u8; 16]) -
 /// before the error propagates, so the tracee is not left running a
 /// half-written trampoline.
 pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
+    let attach = seal::arena::RemoteAttach::new(handle.pid)
+        .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: attach: {e}")))?;
+
+    match install_trampoline_locked(&attach, handle) {
+        Ok(()) => attach
+            .detach()
+            .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: detach: {e}"))),
+        Err(e) => {
+            // `install_trampoline_locked` already reverted the partial write
+            // under this attach window; detach and surface the original cause.
+            if let Err(detach_err) = attach.detach() {
+                eprintln!("resetprop: detach after install error failed: {detach_err}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Trampoline-install body under a caller-held [`RemoteAttach`] (audit M5).
+///
+/// Writes the 16-byte trampoline and runs the i-cache sync, reverts the partial
+/// write on any post-write failure (the caller's attach window stays live for
+/// the revert), then flips `handle.trampoline_installed`. The attach/detach is
+/// the caller's: [`install_trampoline`] opens one for the standalone path;
+/// [`install_and_seal_first`] shares one window across the whole first seal so
+/// PID 1 is stopped once, not three times.
+fn install_trampoline_locked(
+    attach: &seal::arena::RemoteAttach,
+    handle: &mut HookHandle,
+) -> Result<()> {
+    let pid = attach.pid();
+
     // Step 1: compute the trampoline's branch target. The 140-byte hook body
     // already lives at `hook_page + HOOK_BODY_OFFSET`; `install_init_hook`
     // mapped it from init's memfd PROT_R|X, so no runtime body write is
     // required here.
     let hook_body_vaddr = handle.hook_page + HOOK_BODY_OFFSET;
-
-    // Step 2: acquire attach RAII guard.
-    let attach = seal::arena::RemoteAttach::new(handle.pid)
-        .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: attach: {e}")))?;
 
     // Steps 3-5 run under the attach. A failure after the trampoline write
     // has begun must revert the trampoline before the error unwinds. Using
@@ -1234,10 +1365,10 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
         // /proc/1/task tid), so no sibling executes while these words land.
         let word_lo = (encoder::LDR_X16_PC8 as u64) | ((encoder::BR_X16 as u64) << 32);
         let word_hi = hook_body_vaddr;
-        ptrace_poketext(handle.pid, handle.target_fn, word_lo).map_err(|e| {
+        ptrace_poketext(pid, handle.target_fn, word_lo).map_err(|e| {
             Error::HookInstallFailed(format!("install_trampoline: poke tramp lo: {e}"))
         })?;
-        ptrace_poketext(handle.pid, handle.target_fn + 8, word_hi).map_err(|e| {
+        ptrace_poketext(pid, handle.target_fn + 8, word_hi).map_err(|e| {
             Error::HookInstallFailed(format!("install_trampoline: poke tramp hi: {e}"))
         })?;
 
@@ -1253,7 +1384,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
         // needs read permission only, and the tracee is ptrace-stopped via
         // `attach` so the read cannot race a concurrent write.
         let mut readback = [0u8; 16];
-        unsafe { read_remote(handle.pid, handle.target_fn, &mut readback) }.map_err(|e| {
+        unsafe { read_remote(pid, handle.target_fn, &mut readback) }.map_err(|e| {
             Error::HookInstallFailed(format!("install_trampoline: trampoline read-back: {e}"))
         })?;
         verify_trampoline_readback(word_lo, word_hi, &readback)?;
@@ -1280,7 +1411,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
 
         let register_ret = unsafe {
             remote_syscall_via_poke(
-                handle.pid,
+                pid,
                 handle.scratch_pc,
                 NR_MEMBARRIER,
                 [
@@ -1301,7 +1432,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
             // SAFETY: same invariants as the register call above — `attach`
             // holds the tracee stopped; `handle.scratch_pc` is the cached
             // libc.text slot.
-            return unsafe { execute_remote_isb(handle.pid, handle.scratch_pc) };
+            return unsafe { execute_remote_isb(pid, handle.scratch_pc) };
         }
         if register_ret != 0 {
             return Err(Error::HookInstallFailed(format!(
@@ -1315,7 +1446,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
         // the cmd) is treated as a hard failure.
         let sync_ret = unsafe {
             remote_syscall_via_poke(
-                handle.pid,
+                pid,
                 handle.scratch_pc,
                 NR_MEMBARRIER,
                 [MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0, 0, 0, 0, 0],
@@ -1327,7 +1458,7 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
 
         if sync_ret == einval_neg {
             // SAFETY: same invariants as the register call above.
-            return unsafe { execute_remote_isb(handle.pid, handle.scratch_pc) };
+            return unsafe { execute_remote_isb(pid, handle.scratch_pc) };
         }
         if sync_ret != 0 {
             return Err(Error::HookInstallFailed(format!(
@@ -1338,21 +1469,13 @@ pub fn install_trampoline(handle: &mut HookHandle) -> Result<()> {
     })();
 
     if let Err(e) = trampoline_result {
-        revert_trampoline(handle.pid, handle.target_fn, &handle.saved_prologue);
-        if let Err(detach_err) = attach.detach() {
-            eprintln!("resetprop: detach after install error failed: {detach_err}");
-        }
+        // Revert under the caller's still-live attach window; the caller detaches.
+        revert_trampoline(pid, handle.target_fn, handle.scratch_pc, &handle.saved_prologue);
         return Err(e);
     }
 
-    // Step 6: flip typestate so Drop skips the munmap.
+    // Flip typestate so Drop skips the munmap.
     handle.trampoline_installed = true;
-
-    // Step 7: explicit detach surfaces any failure here at the install site.
-    attach
-        .detach()
-        .map_err(|e| Error::HookInstallFailed(format!("install_trampoline: detach: {e}")))?;
-
     Ok(())
 }
 
@@ -1455,8 +1578,31 @@ pub fn seal_prop(handle: &mut HookHandle, name: &str) -> Result<()> {
     let attach = seal::arena::RemoteAttach::new(handle.pid)
         .map_err(|e| Error::HookInstallFailed(format!("seal_prop: attach: {e}")))?;
 
-    // L2 (lock-list write-ordering race) is closed here by T15: `RemoteAttach`
-    // now freezes init's whole thread group, so no init thread reads this lock
+    seal_prop_locked(&attach, handle, name)?;
+
+    attach
+        .detach()
+        .map_err(|e| Error::HookInstallFailed(format!("seal_prop: detach: {e}")))?;
+
+    Ok(())
+}
+
+/// Append `name` to the lock list under a caller-held [`RemoteAttach`] (M5).
+///
+/// The interior-NUL rejection, attach, and detach live in the caller
+/// ([`seal_prop`] for the standalone path, [`install_and_seal_first`] for the
+/// folded first seal), so `name` is assumed already validated. The tracer-side
+/// `lock_list_len` bump stays inside this body, before the caller detaches, so
+/// the handle never lies to the next append.
+fn seal_prop_locked(
+    attach: &seal::arena::RemoteAttach,
+    handle: &mut HookHandle,
+    name: &str,
+) -> Result<()> {
+    let pid = attach.pid();
+
+    // L2 (lock-list write-ordering race) is closed by T15: `RemoteAttach`
+    // freezes init's whole thread group, so no init thread reads this lock
     // list during the read-modify-write below. seal_prop's byte ordering
     // therefore needs no lock-free rewrite.
     let mut buffer = vec![0u8; LOCK_LIST_CAPACITY as usize];
@@ -1466,7 +1612,7 @@ pub fn seal_prop(handle: &mut HookHandle, name: &str) -> Result<()> {
     // `LOCK_LIST_CAPACITY` bytes at offset 0 lie inside the 4 KiB page.
     // Tracee is ptrace-stopped via `attach`, so no concurrent mutation
     // races the read.
-    unsafe { read_remote(handle.pid, handle.lock_list_page, &mut buffer) }
+    unsafe { read_remote(pid, handle.lock_list_page, &mut buffer) }
         .map_err(|e| Error::HookInstallFailed(format!("seal_prop: read_remote: {e}")))?;
 
     let new_len = lock_list_append_bytes(
@@ -1492,25 +1638,20 @@ pub fn seal_prop(handle: &mut HookHandle, name: &str) -> Result<()> {
     // page (`write_end <= LOCK_LIST_CAPACITY`).
     unsafe {
         write_remote(
-            handle.pid,
+            pid,
             handle.lock_list_page + write_start as u64,
             &buffer[write_start..write_end],
         )
     }
     .map_err(|e| Error::HookInstallFailed(format!("seal_prop: write_remote: {e}")))?;
 
-    // Counter-before-detach: once `write_remote` succeeds, the tracee
-    // observes the extended list. Bumping `handle.lock_list_len` before
+    // Counter-before-detach: once `write_remote` succeeds, the tracee observes
+    // the extended list. Bumping `handle.lock_list_len` before the caller's
     // `attach.detach()` keeps the tracer's view and the tracee's view
-    // consistent — a panic or signal interrupting the tracer between
-    // detach and the counter bump would otherwise leave the handle
-    // lying to the next `seal_prop` and producing an off-by-entry
-    // overwrite. Addresses Gate 2 round-1 critic MAJOR 3.
+    // consistent — a panic or signal between detach and the counter bump would
+    // otherwise leave the handle lying to the next `seal_prop` and producing an
+    // off-by-entry overwrite. Addresses Gate 2 round-1 critic MAJOR 3.
     handle.lock_list_len = new_len;
-
-    attach
-        .detach()
-        .map_err(|e| Error::HookInstallFailed(format!("seal_prop: detach: {e}")))?;
 
     Ok(())
 }
@@ -1596,6 +1737,7 @@ mod tests {
             libc_end: 0x7000_0010_0000,
             scratch_pc: 0x7000_0000_1000,
             trampoline_installed: false,
+            kmsg_fds: vec![3, 8],
         };
         assert_eq!(h.pid, 42);
         assert_eq!(h.hook_page, 0xdeadbeef_cafebabe);
@@ -1607,6 +1749,7 @@ mod tests {
         assert_eq!(h.libc_end, 0x7000_0010_0000);
         assert_eq!(h.scratch_pc, 0x7000_0000_1000);
         assert!(!h.trampoline_installed);
+        assert_eq!(h.kmsg_fds, vec![3, 8]);
     }
 
     /// Exercises `is_libc_row` against the tricky cases called out in the
@@ -2140,6 +2283,7 @@ mod tests {
             libc_end: 0,
             scratch_pc: 0,
             trampoline_installed: false,
+            kmsg_fds: Vec::new(),
         }
     }
 

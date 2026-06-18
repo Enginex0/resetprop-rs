@@ -75,6 +75,30 @@ pub fn get_syscall_return(regs: &UserPtRegs) -> i64 {
     regs.eax as i32 as i64
 }
 
+/// Read the syscall number at a syscall-entry stop. As on x86-64 the kernel
+/// clobbers `eax` to `-ENOSYS` on entry and keeps the real number in
+/// `orig_eax`, so the snoop reads `orig_eax`.
+#[inline]
+pub fn syscall_nr(regs: &UserPtRegs) -> u64 {
+    regs.orig_eax as u64
+}
+
+/// Read syscall argument `n` (`0..6` → `ebx, ecx, edx, esi, edi, ebp`) at a
+/// syscall-entry stop.
+#[inline]
+pub fn nth_syscall_arg(regs: &UserPtRegs, n: usize) -> u64 {
+    let arg = match n {
+        0 => regs.ebx,
+        1 => regs.ecx,
+        2 => regs.edx,
+        3 => regs.esi,
+        4 => regs.edi,
+        5 => regs.ebp,
+        _ => panic!("syscall arg index {n} out of range (0..6)"),
+    };
+    arg as u64
+}
+
 /// Point the program counter (`eip`) at `pc` (truncated to the 32-bit
 /// register width) without touching the syscall registers. Used by the
 /// trampoline i-cache-sync path, which resumes the tracee at a staged

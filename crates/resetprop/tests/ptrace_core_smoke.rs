@@ -1,12 +1,13 @@
-//! Integration smoke test for the T4 remote_syscall injector.
+//! Integration smoke test for the consolidated `remote_syscall_via_poke`
+//! injector.
 //!
 //! Forks a child that installs an anonymous RWX scratch page and
 //! enters `libc::pause()`, then the parent seizes + interrupts the
-//! child and round-trips `remote_syscall(NR_GETPID, [0; 6])`. Asserts
+//! child and round-trips `remote_syscall_via_poke(NR_GETPID, [0; 6])`. Asserts
 //! the returned `x0` equals the child's PID.
 //!
 //! Architecture gate: the entire file is gated behind
-//! `#[cfg(target_arch = "aarch64")]` because `remote_syscall` stages the
+//! `#[cfg(target_arch = "aarch64")]` because `remote_syscall_via_poke` stages the
 //! ARM64 byte sequence `svc #0 ; brk #0`, expects the AArch64 syscall
 //! calling convention (`x8` = syscall number, `x0..x5` = args), and reads
 //! results through a 272-byte `UserPtRegs` whose layout is aarch64-only
@@ -18,7 +19,7 @@
 //!
 //! Preconditions (aarch64 hosts only):
 //!   - /proc/sys/kernel/yama/ptrace_scope <= 1, OR CAP_SYS_PTRACE.
-//!   - Linux with process_vm_readv/writev (kernel 3.2+).
+//!   - Linux ptrace PEEK/POKEDATA (universally available).
 //!
 //! Runner invocation (the test is #[ignore]'d by default):
 //!   cargo test -p resetprop --test ptrace_core_smoke -- \
@@ -30,7 +31,9 @@
 #![cfg(target_arch = "aarch64")]
 
 use resetprop::seal::ptrace::PTRACE_EVENT_STOP;
-use resetprop::seal::{ptrace_detach, ptrace_interrupt, ptrace_seize, remote_syscall, wait_stop};
+use resetprop::seal::{
+    ptrace_detach, ptrace_interrupt, ptrace_seize, remote_syscall_via_poke, wait_stop,
+};
 
 /// AArch64 syscall number for `getpid()`; local to this test so the syscall
 /// table does not leak onto the `resetprop::seal::ptrace` public surface.
@@ -151,8 +154,8 @@ fn remote_getpid_returns_child_pid() {
     // (event byte == PTRACE_EVENT_STOP == 128). wait_stop verifies
     // WIFSTOPPED && WSTOPSIG == SIGTRAP && event == expected_event — so the
     // expected_event argument is how the caller selects which stop kind is
-    // legal at this point. remote_syscall passes 0 internally to pin its
-    // own waitpid to brk-traps only.
+    // legal at this point. remote_syscall_via_poke passes 0 internally to pin
+    // its own waitpid to brk-traps only.
     ptrace_seize(guard.pid()).expect("ptrace_seize");
     ptrace_interrupt(guard.pid()).expect("ptrace_interrupt");
     wait_stop(guard.pid(), PTRACE_EVENT_STOP).expect("wait_stop (initial SEIZE stop)");
@@ -165,8 +168,8 @@ fn remote_getpid_returns_child_pid() {
     // names an RWX page with 4096 bytes of room — far more than the 8 bytes
     // the injector stages at `scratch_pc`. The child is single-threaded and
     // blocked in pause(), so no other thread races on those 8 bytes.
-    let ret = unsafe { remote_syscall(guard.pid(), scratch_pc, NR_GETPID, [0; 6]) }
-        .expect("remote_syscall");
+    let ret = unsafe { remote_syscall_via_poke(guard.pid(), scratch_pc, NR_GETPID, [0; 6]) }
+        .expect("remote_syscall_via_poke");
 
     assert_eq!(
         ret, child_pid as i64,
