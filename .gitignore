@@ -20,3 +20,8 @@ vectors.db-shm
 vectors.db-wal
 logs_llm/
 __pycache__/
+
+# internal planning artifacts: keep local, off the remote
+.mold/
+bucket/
+phases/seal/
