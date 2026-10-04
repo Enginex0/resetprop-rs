@@ -368,6 +368,18 @@ impl<'a> PropInfo<'a> {
             return Err(Error::ValueTooLong { len: value.len() });
         }
 
+        let old_len = {
+            let mut len = 0usize;
+            let max = self.area.len() - abs;
+            unsafe {
+                let ptr = self.area.base().add(abs);
+                while len < max && *ptr.add(len) != 0 {
+                    len += 1;
+                }
+            }
+            len
+        };
+
         unsafe {
             let ptr = self.area.base().add(abs);
             std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
@@ -377,6 +389,10 @@ impl<'a> PropInfo<'a> {
         let new_serial = (serial & 0x00FFFFFF) | (LONG_VALUE_SERIAL_LEN << 24) | LONG_FLAG;
         std::sync::atomic::fence(Ordering::Release);
         self.serial_atomic().store(new_serial, Ordering::Release);
+
+        if value.len() < old_len {
+            self.area.compact()?;
+        }
 
         Ok(())
     }

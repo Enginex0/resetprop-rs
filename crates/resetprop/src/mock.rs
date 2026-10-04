@@ -557,6 +557,29 @@ mod tests {
     }
 
     #[test]
+    fn set_quiet_shrinking_long_value_compacts_arena() {
+        let mock = MockArea::new();
+        let area = mock.open();
+
+        let old = "a".repeat(92);
+        let new = "b".repeat(86);
+        area.set("ro.build.fingerprint", &old).unwrap();
+        let before = area.arena_stats().bytes_used;
+
+        area.set_quiet("ro.build.fingerprint", &new).unwrap();
+
+        assert_eq!(area.get("ro.build.fingerprint").unwrap(), new);
+        assert!(
+            area.arena_stats().bytes_used < before,
+            "shrinking a long value should reclaim its trailing allocation gap"
+        );
+        assert!(
+            !area.compact().unwrap(),
+            "quiet long-value shrink should leave no hole to compact"
+        );
+    }
+
+    #[test]
     fn hexpatch_duplicate_length_segments() {
         let mock = MockArea::new();
         let area = mock.open();
